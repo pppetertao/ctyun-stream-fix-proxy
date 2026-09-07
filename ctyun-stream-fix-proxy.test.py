@@ -1,0 +1,873 @@
+#!/usr/bin/env python3
+"""Tests for ctyun-stream-fix-proxy.py（纯 stdlib，Python >= 3.9）。
+
+起 stdlib 假上游（127.0.0.1:0 随机端口），经 CTYUN_UPSTREAM_BASE / CTYUN_LISTEN_PORT
+两个测试 seam 把代理指向假上游，断言:
+  ①毒流输出不含 data:null  ②以 data: [DONE] 结尾  ③输出精确等于 SSE_A+SSE_B+SSE_DONE 逐字节
+  ④/plain（body 含 data:null 毒行变体、Content-Type 非 SSE）经代理字节一致且 Content-Length
+    不变——覆盖"仅 SSE 分支剥行、非 SSE 原样透传"分支
+  ⑤对照组 poison=False filtered=0 且与直连一致
+"""
+
+import http.client
+import importlib.util
+import json
+import os
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import unittest
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+PROXY_SCRIPT = os.path.join(HERE, "ctyun-stream-fix-proxy.py")
+
+SSE_A = b'data: {"choices":[{"delta":{"content":"A"}}]}\n\n'
+SSE_B = b'data: {"choices":[{"delta":{"content":"B"}}]}\n\n'
+SSE_POISON = b"data:null\n\n"
+SSE_DONE = b"data: [DONE]\n\n"
+
+FAKE_SERVERS = []
+_PROCS = []  # start_proxy 产物的注册表（atexit 兜底清理，防测试中断遗留孤儿）
+
+
+class FakeUpstreamHandler(BaseHTTPRequestHandler):
+    poison = False
+    tag = "/plain"  # /plain 响应携带的路径标记，供"上游热切换后路由命中"断言区分
+    big = False     # True → 1.2MB 大 SSE 流，供 client-abort 测试把代理写缓冲打穿
+    fail_500 = False  # True → do_POST 回 500 JSON（上游 5xx 透传计数测试用）
+
+    def do_POST(self) -> None:
+        length = int(self.headers.get("Content-Length") or 0)
+        if length > 0:
+            self.rfile.read(length)
+        if self.fail_500:
+            body = b'{"error":"upstream exploded"}'
+            self.send_response(500)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            self.close_connection = True
+            return
+        if self.big:
+            self._respond_big_sse()
+            return
+        body = SSE_A + SSE_B
+        if self.poison:
+            body += SSE_POISON
+        body += SSE_DONE
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except ConnectionError:
+            # 吞掉的是 client-abort 测试里代理线程 EPIPE 死掉后不再读上游、本假上游
+            # 写出端随之 Broken pipe 的预期路径：测试假上游无需留痕，无其他路径可达。
+            pass
+        self.close_connection = True
+
+    def _respond_big_sse(self) -> None:
+        # 分块慢速流（~64KB/20ms）：一次性大 write 会被环回内核缓冲整体吞掉，
+        # 代理感知不到 RST；慢速写保证客户端断开后代理必然在后续块上撞 EPIPE。
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+        chunk = b'data: {"chunk":true}\n\n' * 4000
+        try:
+            for _ in range(60):
+                self.wfile.write(chunk)
+                self.wfile.flush()
+                time.sleep(0.02)
+        except ConnectionError:
+            # 同上：客户端断开后写出的预期路径，测试假上游无需留痕。
+            pass
+        self.close_connection = True
+
+    def do_GET(self) -> None:
+        body = ('data:null\n{"ok":true,"path":"%s"}' % self.tag).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args: object) -> None:
+        pass
+
+
+def make_fake_upstream(poison: bool, tag: str = "/plain", big: bool = False,
+                       fail_500: bool = False) -> int:
+    handler = type("FakeUpstreamHandler", (FakeUpstreamHandler,),
+                   {"poison": poison, "tag": tag, "big": big, "fail_500": fail_500})
+    server = HTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    FAKE_SERVERS.append(server)
+    return server.server_address[1]
+
+
+def stop_fake_upstreams() -> None:
+    for server in FAKE_SERVERS:
+        server.shutdown()
+        server.server_close()
+    del FAKE_SERVERS[:]
+
+
+def _drain_pipe(pipe, buf: list) -> None:
+    # 吞掉的是 pipe 读取中的 OSError（子进程退出后读端关闭等）：drain 是防"管道满
+    # 阻塞子进程 stderr write"的 best-effort，读端异常即终止，无恢复路径。
+    try:
+        for chunk in iter(pipe.readline, b""):
+            buf.append(chunk)
+    except OSError:
+        return
+
+
+def stderr_text(proc) -> str:
+    """drain buffer 的文本视图（运行期持续收集，替代 terminate 后一次性 pipe.read）。"""
+    return b"".join(proc.stderr_buf).decode("utf-8", "replace")
+
+
+def kill_registered(timeout: float = 2.0) -> list:
+    """递进清理全部注册过的代理子进程（terminate → wait → kill）；返回被强杀的 pid。"""
+    force_killed = []
+    for proc in _PROCS:
+        if proc.poll() is not None:
+            continue
+        proc.terminate()
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                # SIGKILL 已发出，内核回收只是调度时序问题，无其他路径可达。
+                pass
+            force_killed.append(proc.pid)
+    del _PROCS[:]
+    return force_killed
+
+
+def free_port() -> int:
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    return port
+
+
+def wait_port(port: int, timeout: float = 5.0) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                return
+        except OSError:
+            time.sleep(0.05)
+    raise AssertionError("port %d not listening within %.1fs" % (port, timeout))
+
+
+def start_proxy(upstream_port: int, proxy_port: int, extra_env: dict = None,
+                seed_persist: dict = None) -> subprocess.Popen:
+    env = dict(os.environ)
+    env["CTYUN_UPSTREAM_BASE"] = "http://127.0.0.1:%d" % upstream_port
+    env["CTYUN_LISTEN_PORT"] = str(proxy_port)
+    # admin/persist seam：与真实 7921 端口、真实持久化文件（~/.local/etc/）完全隔离
+    env["CTYUN_ADMIN_HOST"] = "127.0.0.1"
+    admin_port = free_port()
+    env["CTYUN_ADMIN_PORT"] = str(admin_port)
+    persist_dir = tempfile.mkdtemp(prefix="ctyun-proxy-test-")
+    env["CTYUN_PERSIST_PATH"] = os.path.join(persist_dir, "settings.json")
+    if extra_env:
+        env.update(extra_env)
+    if seed_persist is not None:
+        # 在进程启动前预写持久化文件（计数续算测试用）
+        with open(env["CTYUN_PERSIST_PATH"], "w", encoding="utf-8") as fh:
+            json.dump(seed_persist, fh)
+    proc = subprocess.Popen(
+        [sys.executable, PROXY_SCRIPT],
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    proc.stdout_buf = []
+    proc.stderr_buf = []
+    for pipe, buf in ((proc.stdout, proc.stdout_buf), (proc.stderr, proc.stderr_buf)):
+        threading.Thread(target=_drain_pipe, args=(pipe, buf), daemon=True).start()
+    _PROCS.append(proc)
+    wait_port(proxy_port)
+    wait_port(admin_port)
+    proc.proxy_port = proxy_port
+    proc.admin_port = admin_port
+    proc.persist_dir = persist_dir
+    return proc
+
+
+def post_sse(port: int) -> bytes:
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+    payload = b'{"model":"deepseek-v4-pro-0813-oc","stream":true,"messages":[]}'
+    conn.request("POST", "/v1/chat/completions", body=payload,
+                 headers={"Content-Type": "application/json"})
+    resp = conn.getresponse()
+    status = resp.status
+    data = resp.read()
+    conn.close()
+    assert status == 200, "expected SSE 200, got %d" % status
+    return data
+
+
+def get_plain(port: int):
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    conn.request("GET", "/plain")
+    resp = conn.getresponse()
+    status = resp.status
+    data = resp.read()
+    resp_len = resp.getheader("Content-Length")
+    conn.close()
+    assert status == 200, "expected /plain 200, got %d" % status
+    return data, resp_len
+
+
+class ProxyLifecycleTestCase(unittest.TestCase):
+    def setUp(self) -> None:
+        self.assertTrue(os.path.exists(PROXY_SCRIPT),
+                        "proxy script missing: %s（TDD 红相：先建代理后重跑）" % PROXY_SCRIPT)
+
+    def run_scenario(self, poison: bool):
+        upstream_port = make_fake_upstream(poison)
+        proxy_port = free_port()
+        proc = start_proxy(upstream_port, proxy_port)
+        try:
+            sse_via_proxy = post_sse(proxy_port)
+            plain_via_proxy, plain_len = get_plain(proxy_port)
+            plain_direct, plain_direct_len = get_plain(upstream_port)
+            sse_direct = post_sse(upstream_port)
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+            stderr = stderr_text(proc)
+            shutil.rmtree(proc.persist_dir, ignore_errors=True)
+            stop_fake_upstreams()
+        return {
+            "sse_via_proxy": sse_via_proxy,
+            "sse_direct": sse_direct,
+            "plain_via_proxy": plain_via_proxy,
+            "plain_len": plain_len,
+            "plain_direct": plain_direct,
+            "plain_direct_len": plain_direct_len,
+            "stderr": stderr,
+        }
+
+
+class PoisonStreamTest(ProxyLifecycleTestCase):
+    def test_poison_line_removed_and_stream_intact(self) -> None:
+        r = self.run_scenario(poison=True)
+        self.assertNotIn(b"data:null", r["sse_via_proxy"])
+        self.assertNotIn(b"data: null", r["sse_via_proxy"])
+        self.assertTrue(r["sse_via_proxy"].rstrip().endswith(b"data: [DONE]"),
+                        "stream must end with data: [DONE], got tail: %r"
+                        % r["sse_via_proxy"][-40:])
+        self.assertEqual(r["sse_via_proxy"], SSE_A + SSE_B + SSE_DONE,
+                         "SSE output must be byte-exact SSE_A+SSE_B+SSE_DONE after "
+                         "filtering (adjacent-byte damage forbidden), got: %r"
+                         % r["sse_via_proxy"])
+        self.assertIn("filtered=1", r["stderr"],
+                      "poison scenario must log filtered=1, stderr:\n" + r["stderr"])
+
+
+class PassThroughTest(ProxyLifecycleTestCase):
+    def test_control_stream_and_plain_passthrough(self) -> None:
+        r = self.run_scenario(poison=False)
+        self.assertEqual(r["sse_via_proxy"], r["sse_direct"])
+        self.assertIn("filtered=0", r["stderr"],
+                      "clean stream must log filtered=0, stderr:\n" + r["stderr"])
+        self.assertEqual(r["plain_via_proxy"], r["plain_direct"])
+        self.assertEqual(r["plain_len"], r["plain_direct_len"])
+
+
+def load_proxy_module():
+    """in-process 载入代理模块做纯函数单测（模块顶层只定义/读 env，无副作用）。"""
+    spec = importlib.util.spec_from_file_location("ctyun_stream_fix_proxy", PROXY_SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def admin_get(port: int, path: str):
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    conn.request("GET", path)
+    resp = conn.getresponse()
+    out = (resp.status, resp.read(), resp.getheader("Content-Type"))
+    conn.close()
+    return out
+
+
+def admin_post(port: int, path: str, body: bytes, headers: dict = None):
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    hdrs = {"Content-Type": "application/json"}
+    if headers:
+        hdrs.update(headers)
+    conn.request("POST", path, body=body, headers=hdrs)
+    resp = conn.getresponse()
+    out = (resp.status, resp.read())
+    conn.close()
+    return out
+
+
+class ProxyDashboardUnitTest(unittest.TestCase):
+    """纯函数单测：in-process 载入模块，不经 socket。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.mod = load_proxy_module()
+
+    def test_valid_upstream_url(self) -> None:
+        f = self.mod.valid_upstream_url
+        self.assertTrue(f("https://eaichat.ctyun.cn/ai/platform/v2/cp"))
+        self.assertTrue(f("http://127.0.0.1:8000"))
+        self.assertFalse(f("ftp://example.com/x"))
+        self.assertFalse(f("https://"))
+        self.assertFalse(f(""))
+        self.assertFalse(f("not a url"))
+
+    def test_resolve_upstream_base_precedence(self) -> None:
+        mod = self.mod
+        tmp = tempfile.mkdtemp(prefix="ctyun-proxy-unit-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        good = os.path.join(tmp, "good.json")
+        mod.persist_upstream("http://127.0.0.1:9999", good)
+        self.assertEqual(mod.resolve_upstream_base("http://env:1", good),
+                         ("http://env:1", "env"))
+        self.assertEqual(mod.resolve_upstream_base("", good),
+                         ("http://127.0.0.1:9999", "file"))
+        bad = os.path.join(tmp, "bad.json")
+        with open(bad, "w", encoding="utf-8") as fh:
+            fh.write("{corrupt json")
+        self.assertEqual(mod.resolve_upstream_base("", bad),
+                         (mod.DEFAULT_UPSTREAM_BASE, "default"))
+        self.assertEqual(mod.resolve_upstream_base("", os.path.join(tmp, "missing.json")),
+                         (mod.DEFAULT_UPSTREAM_BASE, "default"))
+        invalid = os.path.join(tmp, "invalid.json")
+        with open(invalid, "w", encoding="utf-8") as fh:
+            json.dump({"upstream_base": "ftp://nope"}, fh)
+        self.assertEqual(mod.resolve_upstream_base("", invalid),
+                         (mod.DEFAULT_UPSTREAM_BASE, "default"))
+
+    def test_write_allowed_matrix(self) -> None:
+        f = self.mod.write_allowed
+        self.assertTrue(f("127.0.0.1", "", ""))
+        self.assertTrue(f("::1", "", ""))
+        self.assertFalse(f("192.168.1.5", "", ""))
+        self.assertFalse(f("192.168.1.5", "", "tok"))
+        self.assertFalse(f("192.168.1.5", "tok", ""))
+        self.assertTrue(f("192.168.1.5", "tok", "tok"))
+        self.assertFalse(f("192.168.1.5", "wrong", "tok"))
+
+    def test_extract_model(self) -> None:
+        f = self.mod.extract_model
+        self.assertEqual(f(b'{"model":"deepseek-v4-pro-0813-oc","stream":true}'),
+                         "deepseek-v4-pro-0813-oc")
+        self.assertIsNone(f(b'{"messages":[]}'))
+        self.assertIsNone(f(b"not json"))
+        self.assertIsNone(f(b""))
+        self.assertIsNone(f(b"[1,2,3]"))
+        self.assertIsNone(f(b'{"model":123}'))
+        self.assertIsNone(f(b'{"model":""}'))
+
+    def test_stats_persist_roundtrip_and_defaults(self) -> None:
+        mod = self.mod
+        tmp = tempfile.mkdtemp(prefix="ctyun-proxy-unit2-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        path = os.path.join(tmp, "settings.json")
+        self.assertEqual(mod.load_stats_counters(path),
+                         {"requests_total": 0, "filtered_total": 0, "errors_total": 0})
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("{corrupt")
+        self.assertEqual(mod.load_stats_counters(path),
+                         {"requests_total": 0, "filtered_total": 0, "errors_total": 0})
+        mod._record_request("POST", "/x", 200, 1.0, 2)
+        mod.save_stats_counters(path)
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        self.assertIn("upstream_base", data)
+        # 断言与内存态一致（模块级计数被同类其他测试累积，不能断绝对值）
+        expected = mod.STATS["filtered_total"]
+        self.assertEqual(data["stats"]["filtered_total"], expected)
+        self.assertEqual(mod.load_stats_counters(path)["filtered_total"], expected)
+        legacy = os.path.join(tmp, "legacy.json")
+        with open(legacy, "w", encoding="utf-8") as fh:
+            json.dump({"upstream_base": "http://x"}, fh)
+        self.assertEqual(mod.load_stats_counters(legacy)["requests_total"], 0)
+
+    def test_by_model_accumulation_and_cap(self) -> None:
+        mod = self.mod
+        mod._record_request("POST", "/c", 200, 1.0, 1, model="m-a")
+        self.assertGreaterEqual(mod.STATS["by_model"]["m-a"]["requests"], 1)
+        for i in range(40):
+            mod._record_request("POST", "/c", 200, 1.0, 0, model="m-%02d" % i)
+        self.assertLessEqual(len(mod.STATS["by_model"]), 32)
+        self.assertNotIn("m-39", mod.STATS["by_model"])
+
+    def test_stats_snapshot_shape(self) -> None:
+        mod = self.mod
+        mod._record_request("POST", "/x", 200, 12.0, 1)
+        mod._record_poison_preview(b"data:null")
+        snap = mod.stats_snapshot()
+        for key in ("requests_total", "filtered_total", "errors_total", "active",
+                    "uptime_s", "upstream_base", "upstream_source",
+                    "recent", "poison_previews"):
+            self.assertIn(key, snap)
+        self.assertIsInstance(snap["uptime_s"], int)
+        self.assertIsInstance(snap["recent"], list)
+        self.assertIsInstance(snap["poison_previews"], list)
+        self.assertGreaterEqual(snap["filtered_total"], 1)
+        self.assertGreaterEqual(snap["recent"][-1]["filtered"], 1)
+        self.assertIn("data:null", snap["poison_previews"][-1]["preview"])
+
+    def test_daily_bucket_accumulation_and_dual_error_semantics(self) -> None:
+        mod = self.mod
+        today = mod.today_key()
+        bucket = mod.STATS["daily"].setdefault(
+            today, {"requests": 0, "filtered": 0, "errors_proxy": 0, "errors_upstream": 0})
+        base = dict(bucket)
+        err_base = mod.STATS["errors_total"]
+        mod._record_request("POST", "/d1", 200, 1.0, 2)
+        mod._record_request("POST", "/d2", 502, 1.0, 0, error=True)
+        mod._record_request("POST", "/d3", 500, 1.0, 0)
+        mod._record_request("POST", "/d4", 499, 1.0, 0)
+        self.assertEqual(bucket["requests"], base["requests"] + 4)
+        self.assertEqual(bucket["filtered"], base["filtered"] + 2)
+        self.assertEqual(bucket["errors_proxy"], base["errors_proxy"] + 1,
+                         "error=True (proxy-made 502) must land in errors_proxy only")
+        self.assertEqual(bucket["errors_upstream"], base["errors_upstream"] + 1,
+                         "upstream 500 passthrough must land in errors_upstream only")
+        self.assertEqual(mod.STATS["errors_total"], err_base + 1,
+                         "errors_total semantics unchanged (proxy errors only)")
+        self.assertEqual(bucket["errors_upstream"], base["errors_upstream"] + 1,
+                         "499 aborted must not inflate errors_upstream")
+
+    def test_daily_bucket_spans_days(self) -> None:
+        mod = self.mod
+        today = mod.today_key()
+        orig = mod.today_key
+        try:
+            mod.today_key = lambda: "2026-01-02"
+            mod._record_request("POST", "/span", 200, 1.0, 1)
+        finally:
+            mod.today_key = orig
+        self.assertIn("2026-01-02", mod.STATS["daily"])
+        self.assertIn(today, mod.STATS["daily"])
+        self.assertIsNot(mod.STATS["daily"]["2026-01-02"], mod.STATS["daily"][today])
+
+    def test_daily_persist_roundtrip_legacy_and_corrupt(self) -> None:
+        mod = self.mod
+        tmp = tempfile.mkdtemp(prefix="ctyun-proxy-unit3-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        path = os.path.join(tmp, "settings.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"upstream_base": "http://x",
+                       "stats": {"requests_total": 1}}, fh)
+        self.assertEqual(mod.load_daily_buckets(path), {},
+                         "legacy file without daily key must yield {}")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"stats": {"daily": "not-a-dict"}}, fh)
+        self.assertEqual(mod.load_daily_buckets(path), {})
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"stats": {"daily": {
+                "2026-01-01": "bad",
+                "2026-01-02": {"requests": 5, "filtered": 1,
+                               "errors_proxy": 0, "errors_upstream": 2}}}}, fh)
+        buckets = mod.load_daily_buckets(path)
+        self.assertNotIn("2026-01-01", buckets, "non-dict bucket must be skipped")
+        self.assertEqual(buckets["2026-01-02"]["requests"], 5)
+        self.assertEqual(buckets["2026-01-02"]["errors_upstream"], 2)
+
+    def test_daily_prune_on_save(self) -> None:
+        mod = self.mod
+        tmp = tempfile.mkdtemp(prefix="ctyun-proxy-unit4-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        path = os.path.join(tmp, "settings.json")
+        orig_daily = mod.STATS["daily"]
+        mod.STATS["daily"] = {}
+        try:
+            for i in range(95):
+                mod.STATS["daily"]["2026-%02d-%02d" % (1 + i // 28, 1 + i % 28)] = {
+                    "requests": i, "filtered": 0,
+                    "errors_proxy": 0, "errors_upstream": 0}
+            mod.save_stats_counters(path)
+        finally:
+            mod.STATS["daily"] = orig_daily
+        with open(path, encoding="utf-8") as fh:
+            saved = json.load(fh)["stats"]["daily"]
+        self.assertLessEqual(len(saved), 90, "prune must cap buckets at 90 days")
+        self.assertIn("2026-04-11", saved, "most recent bucket must survive prune")
+
+    def test_stats_snapshot_daily_is_copy(self) -> None:
+        mod = self.mod
+        snap = mod.stats_snapshot()
+        self.assertIn("daily", snap)
+        snap["daily"]["mutation-test"] = {"requests": 1, "filtered": 0,
+                                          "errors_proxy": 0, "errors_upstream": 0}
+        self.assertNotIn("mutation-test", mod.STATS["daily"],
+                         "snapshot must hand out copies, not internal refs")
+
+    def test_safe_log_stderr_normal_and_broken(self) -> None:
+        mod = self.mod
+        captured = []
+
+        class Collect:
+            def write(self, s):
+                captured.append(s)
+                return len(s)
+
+            def flush(self):
+                pass
+
+        class Broken:
+            def write(self, s):
+                raise BrokenPipeError("pipe closed")
+
+            def flush(self):
+                pass
+
+        orig = sys.stderr
+        try:
+            sys.stderr = Collect()
+            mod._safe_log_stderr("hello-safe-log")
+            self.assertIn("hello-safe-log", "".join(captured))
+            sys.stderr = Broken()
+            mod._safe_log_stderr("must-not-raise")  # 不抛 = 通过
+        finally:
+            sys.stderr = orig
+
+    def test_stderr_text_joins_buffer(self) -> None:
+        class FakeProc:
+            stderr_buf = [b"REQ a\n", b"REQ b\n"]
+        self.assertEqual(stderr_text(FakeProc()), "REQ a\nREQ b\n")
+
+    def test_kill_registered_progressive_and_idempotent(self) -> None:
+        tmod = sys.modules[__name__]
+
+        class FakeProc:
+            def __init__(self, survives_term):
+                self.pid = 424242
+                self._alive = True
+                self._survives_term = survives_term
+                self.terminated = False
+                self.killed = False
+
+            def poll(self):
+                return None if self._alive else 0
+
+            def terminate(self):
+                self.terminated = True
+
+            def kill(self):
+                self.killed = True
+
+            def wait(self, timeout=None):
+                if self.killed or (self.terminated and not self._survives_term):
+                    self._alive = False
+                    return 0
+                raise subprocess.TimeoutExpired("fake", timeout)
+
+        tmod._PROCS[:] = [FakeProc(False), FakeProc(True)]
+        killed = tmod.kill_registered(timeout=0.1)
+        self.assertEqual(killed, [424242],
+                         "proc surviving SIGTERM must be reported as force-killed")
+        self.assertEqual(len(tmod._PROCS), 0, "registry must be cleared")
+        self.assertEqual(tmod.kill_registered(), [], "second call is a no-op")
+
+
+class AdminIntegrationTest(unittest.TestCase):
+    """admin/dashboard 子进程集成测试（真实 socket，端口与持久化均走 seam）。"""
+
+    def setUp(self) -> None:
+        self.upstream_port = make_fake_upstream(False)
+        self.proxy_port = free_port()
+        self.proc = start_proxy(self.upstream_port, self.proxy_port)
+
+    def tearDown(self) -> None:
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_fake_upstreams()
+
+    def test_dashboard_and_stats_served(self) -> None:
+        status, body, ctype = admin_get(self.proc.admin_port, "/")
+        self.assertEqual(status, 200)
+        self.assertTrue(ctype and ctype.startswith("text/html"),
+                        "dashboard must be text/html, got %r" % ctype)
+        self.assertTrue(body.startswith(b"<!doctype html"), body[:60])
+        self.assertIn("/api/stats", body.decode("utf-8"))
+        status, body, ctype = admin_get(self.proc.admin_port, "/api/stats")
+        self.assertEqual(status, 200)
+        self.assertTrue(ctype and ctype.startswith("application/json"))
+        snap = json.loads(body.decode("utf-8"))
+        for key in ("requests_total", "filtered_total", "errors_total", "active",
+                    "uptime_s", "upstream_base", "upstream_source",
+                    "recent", "poison_previews"):
+            self.assertIn(key, snap)
+        self.assertEqual(snap["upstream_base"],
+                         "http://127.0.0.1:%d" % self.upstream_port)
+        self.assertEqual(snap["upstream_source"], "env")
+        post_sse(self.proxy_port)
+        _, body, _ = admin_get(self.proc.admin_port, "/api/stats")
+        snap = json.loads(body.decode("utf-8"))
+        self.assertGreaterEqual(snap["requests_total"], 1)
+        self.assertGreaterEqual(len(snap["recent"]), 1)
+
+    def test_config_get_reports_env_source(self) -> None:
+        status, body, ctype = admin_get(self.proc.admin_port, "/api/config")
+        self.assertEqual(status, 200)
+        self.assertTrue(ctype and ctype.startswith("application/json"))
+        cfg = json.loads(body.decode("utf-8"))
+        self.assertEqual(cfg["upstream_base"],
+                         "http://127.0.0.1:%d" % self.upstream_port)
+        self.assertEqual(cfg["source"], "env")
+
+    def test_config_post_swaps_upstream_and_persists(self) -> None:
+        upstream2_port = make_fake_upstream(False, tag="/second-upstream")
+        status, body = admin_post(
+            self.proc.admin_port, "/api/config",
+            json.dumps({"upstream_base": "http://127.0.0.1:%d" % upstream2_port}).encode("utf-8"))
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body.decode("utf-8"))["ok"], True)
+        data, _ = get_plain(self.proxy_port)
+        self.assertIn(b"/second-upstream", data,
+                      "after swap /plain must hit second upstream, got %r" % data)
+        status, body, _ = admin_get(self.proc.admin_port, "/api/config")
+        cfg = json.loads(body.decode("utf-8"))
+        self.assertEqual(cfg["upstream_base"], "http://127.0.0.1:%d" % upstream2_port)
+        self.assertEqual(cfg["source"], "api")
+        with open(os.path.join(self.proc.persist_dir, "settings.json"),
+                  encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh)["upstream_base"],
+                             "http://127.0.0.1:%d" % upstream2_port)
+
+    def test_config_post_rejects_bad_input(self) -> None:
+        status, _ = admin_post(
+            self.proc.admin_port, "/api/config",
+            json.dumps({"upstream_base": "ftp://nope"}).encode("utf-8"))
+        self.assertEqual(status, 400)
+        status, _ = admin_post(self.proc.admin_port, "/api/config", b"not json")
+        self.assertEqual(status, 400)
+
+    def test_dashboard_html_full_page(self) -> None:
+        status, body, ctype = admin_get(self.proc.admin_port, "/")
+        self.assertEqual(status, 200)
+        html = body.decode("utf-8")
+        self.assertIn("保存上游端点", html)
+        self.assertIn("剥行流带", html)
+        self.assertIn("剥行累计", html)
+        self.assertIn('name="viewport"', html)
+        self.assertIn("prefers-reduced-motion", html)
+        self.assertIn("focus-visible", html)
+        # 毒行预览来自上游原始字节：动态数据禁走 innerHTML，必须 textContent
+        self.assertIn("textContent", html)
+        self.assertNotIn("innerHTML", html)
+        # v1.1：sparkline 剥行红柱叠加 / 按模型卡 / 模型列 / 计数持久化文案
+        self.assertIn("var(--err)", html)
+        self.assertIn("按模型", html)
+        self.assertIn("<th>模型</th>", html)
+        self.assertIn("跨重启保留", html)
+        # favicon + 标题配套 meta
+        self.assertIn('rel="icon"', html)
+        self.assertIn("theme-color", html)
+        # v1.2：按天统计卡（日期表 + 双口径错误列）
+        self.assertIn("按天统计", html)
+        self.assertIn("<th>上游5xx</th>", html)
+        self.assertIn('id="daily-body"', html)
+        # v1.3：按模型口径标注（自上次重启起累计，重启清零）
+        self.assertIn("自上次重启起累计", html)
+        # v1.3：跨天日期分组（纯前端逻辑，静态断言锁定存在性，目检兜底见 Task 3）
+        self.assertIn("fmtDate", html)
+        self.assertIn("date-row", html)
+
+    def test_favicon_served(self) -> None:
+        status, body, ctype = admin_get(self.proc.admin_port, "/favicon.ico")
+        self.assertEqual(status, 200)
+        self.assertTrue(ctype and ctype.startswith("image/x-icon"),
+                        "favicon must be image/x-icon, got %r" % ctype)
+        self.assertTrue(body.startswith(b"\x00\x00\x01\x00"),
+                        "body must start with ICO magic, got %r" % body[:6])
+        self.assertGreater(len(body), 100)
+
+    def test_recent_entries_carry_model(self) -> None:
+        post_sse(self.proxy_port)
+        _, body, _ = admin_get(self.proc.admin_port, "/api/stats")
+        snap = json.loads(body.decode("utf-8"))
+        self.assertTrue(snap["recent"])
+        self.assertEqual(snap["recent"][-1]["model"], "deepseek-v4-pro-0813-oc")
+        self.assertIn("deepseek-v4-pro-0813-oc", snap["by_model"])
+        self.assertGreaterEqual(
+            snap["by_model"]["deepseek-v4-pro-0813-oc"]["requests"], 1)
+
+    def test_stats_counters_resume_from_persist(self) -> None:
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        self.proc = start_proxy(
+            self.upstream_port, free_port(),
+            seed_persist={"upstream_base": "http://127.0.0.1:%d" % self.upstream_port,
+                          "stats": {"requests_total": 7, "filtered_total": 3,
+                                    "errors_total": 1}})
+        _, body, _ = admin_get(self.proc.admin_port, "/api/stats")
+        snap = json.loads(body.decode("utf-8"))
+        self.assertEqual(snap["requests_total"], 7)
+        self.assertEqual(snap["filtered_total"], 3)
+        self.assertEqual(snap["errors_total"], 1)
+        post_sse(self.proc.proxy_port)  # 重启后的新代理端口
+        _, body, _ = admin_get(self.proc.admin_port, "/api/stats")
+        self.assertEqual(json.loads(body.decode("utf-8"))["requests_total"], 8)
+    def test_sigterm_persists_counters(self) -> None:
+        post_sse(self.proxy_port)
+        self.proc.terminate()  # SIGTERM → handler 落盘
+        self.proc.wait(timeout=5)
+        with open(os.path.join(self.proc.persist_dir, "settings.json"),
+                  encoding="utf-8") as fh:
+            data = json.load(fh)
+        self.assertGreaterEqual(data["stats"]["requests_total"], 1)
+        self.assertIn("upstream_base", data)
+
+    def test_req_log_line_has_ts_and_model(self) -> None:
+        post_sse(self.proxy_port)
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr = stderr_text(self.proc)
+        m = re.search(r"^REQ POST /v1/chat/completions -> \d+ dur=\d+\.\ds "
+                      r"result=\S+ filtered=\d+ "
+                      r"model=deepseek-v4-pro-0813-oc "
+                      r"ts=(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{4})$",
+                      stderr, re.M)
+        self.assertIsNotNone(m, "REQ 行必须带 model= 与 ts= 字段，stderr:\n" + stderr)
+        time.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S%z")  # %z 回析：防平台差异静默退化
+
+    def test_client_abort_is_quiet_and_not_error(self) -> None:
+        upstream_port = make_fake_upstream(False, big=True)
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        self.proc = start_proxy(upstream_port, free_port(),
+                                extra_env={"CTYUN_SEND_TIMEOUT": "1"})
+        conn = http.client.HTTPConnection("127.0.0.1", self.proc.proxy_port, timeout=10)
+        payload = b'{"model":"deepseek-v4-pro-0813-oc","stream":true,"messages":[]}'
+        conn.request("POST", "/v1/chat/completions", body=payload,
+                     headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        resp.read(64)
+        conn.close()  # 带未读数据关闭 → 内核回 RST → 代理后续写 EPIPE
+        deadline = time.time() + 5
+        saw499 = False
+        snap = {}
+        while time.time() < deadline:
+            _, body, _ = admin_get(self.proc.admin_port, "/api/stats")
+            snap = json.loads(body.decode("utf-8"))
+            if any(r["status"] == 499 for r in snap["recent"]):
+                saw499 = True
+                break
+            time.sleep(0.2)
+        self.assertTrue(saw499, "aborted request must be recorded with status 499")
+        self.assertEqual(snap["errors_total"], 0,
+                         "client abort must not count into errors_total")
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr = stderr_text(self.proc)
+        self.assertIn("result=aborted", stderr)
+        self.assertIn("model=-", stderr)  # 499 abort 不传 model → 占位符 -
+        self.assertNotIn("Traceback", stderr,
+                         "client abort must not produce handle_error traceback")
+
+    def test_config_post_localhost_allowed_even_with_token_env(self) -> None:
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_fake_upstreams()
+        upstream_port = make_fake_upstream(False)
+        self.proc = start_proxy(self.upstream_port, free_port(),
+                                extra_env={"CTYUN_ADMIN_TOKEN": "sekret"})
+        # token 已设：本机来源仍走白名单，无需 X-Admin-Token 头
+        status, body = admin_post(
+            self.proc.admin_port, "/api/config",
+            json.dumps({"upstream_base": "http://127.0.0.1:%d" % upstream_port}).encode("utf-8"))
+        self.assertEqual(status, 200)
+
+    def test_daily_bucket_via_sse_and_persist(self) -> None:
+        today = time.strftime("%Y-%m-%d")
+        post_sse(self.proxy_port)
+        _, body, _ = admin_get(self.proc.admin_port, "/api/stats")
+        snap = json.loads(body.decode("utf-8"))
+        self.assertIn(today, snap["daily"])
+        self.assertGreaterEqual(snap["daily"][today]["requests"], 1)
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        with open(os.path.join(self.proc.persist_dir, "settings.json"),
+                  encoding="utf-8") as fh:
+            saved = json.load(fh)["stats"]["daily"]
+        self.assertGreaterEqual(saved[today]["requests"], 1,
+                                "daily buckets must persist on SIGTERM")
+
+    def test_upstream_500_counts_into_daily_errors_upstream(self) -> None:
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_fake_upstreams()
+        bad_port = make_fake_upstream(False, fail_500=True)
+        self.proc = start_proxy(bad_port, free_port())
+        conn = http.client.HTTPConnection("127.0.0.1", self.proc.proxy_port, timeout=10)
+        conn.request("POST", "/v1/chat/completions", body=b'{"model":"m"}',
+                     headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        self.assertEqual(resp.status, 500)
+        resp.read()
+        conn.close()
+        today = time.strftime("%Y-%m-%d")
+        _, body, _ = admin_get(self.proc.admin_port, "/api/stats")
+        snap = json.loads(body.decode("utf-8"))
+        self.assertGreaterEqual(snap["daily"][today]["errors_upstream"], 1)
+        self.assertEqual(snap["errors_total"], 0,
+                         "upstream 5xx passthrough must not touch errors_total")
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        with open(os.path.join(self.proc.persist_dir, "settings.json"),
+                  encoding="utf-8") as fh:
+            saved = json.load(fh)["stats"]["daily"]
+        self.assertGreaterEqual(saved[today]["errors_upstream"], 1)
+
+    def test_daily_buckets_resume_from_persist(self) -> None:
+        self.proc.terminate()
+        # 系统忙时 SIGTERM 落盘 + server_close 偶发超过 5s（实测两连挂、复刻秒退），
+        # 放宽到 10s 只吸收慢、不掩盖死锁
+        self.proc.wait(timeout=10)
+        stderr_text(self.proc)
+        self.proc = start_proxy(
+            self.upstream_port, free_port(),
+            seed_persist={"upstream_base": "http://127.0.0.1:%d" % self.upstream_port,
+                          "stats": {"requests_total": 7, "filtered_total": 3,
+                                    "errors_total": 1,
+                                    "daily": {"2026-01-01": {
+                                        "requests": 5, "filtered": 1,
+                                        "errors_proxy": 0, "errors_upstream": 2}}}})
+        _, body, _ = admin_get(self.proc.admin_port, "/api/stats")
+        snap = json.loads(body.decode("utf-8"))
+        self.assertEqual(snap["daily"]["2026-01-01"]["requests"], 5)
+        self.assertEqual(snap["daily"]["2026-01-01"]["errors_upstream"], 2)
+
+
+if __name__ == "__main__":
+    import atexit
+    atexit.register(kill_registered)
+    # 默认 SIGTERM 直接终止不跑 atexit：转成解释器关闭路径，兜底清理才可执行
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
+    unittest.main(verbosity=2)
