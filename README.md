@@ -79,4 +79,4 @@ launchctl kickstart -k gui/$UID/com.ctyun-stream-fix-proxy
 
 ## License
 
-未指定（默认保留所有权利）。
+[MIT](LICENSE)
