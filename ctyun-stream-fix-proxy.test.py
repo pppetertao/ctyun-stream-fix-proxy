@@ -479,6 +479,9 @@ class ProxyDashboardUnitTest(unittest.TestCase):
             mod._record_request("POST", "/c", 200, 1.0, 0, model="m-%02d" % i)
         self.assertLessEqual(len(mod.STATS["by_model"]), 32)
         self.assertNotIn("m-39", mod.STATS["by_model"])
+        # v2：daily_by_model 每日独立 cap（口径与 by_model 全局 cap 略异，见 spec Risks）
+        self.assertLessEqual(len(mod.STATS["daily_by_model"][mod.today_key()]), 32)
+        self.assertNotIn("m-39", mod.STATS["daily_by_model"][mod.today_key()])
 
     def test_stats_snapshot_shape(self) -> None:
         mod = self.mod
@@ -532,6 +535,28 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         self.assertIn(today, mod.STATS["daily"])
         self.assertIsNot(mod.STATS["daily"]["2026-01-02"], mod.STATS["daily"][today])
 
+    def test_daily_by_model_matrix_fallback(self) -> None:
+        mod = self.mod
+        today = mod.today_key()
+        mod._record_request("POST", "/dm", 200, 1.0, 1, model="m-a")
+        before = set(mod.STATS["daily_by_model"].get(today, {}))
+        mod._record_request("POST", "/dm", 200, 1.0, 0)  # model=None：只进 daily 总桶
+        self.assertEqual(set(mod.STATS["daily_by_model"].get(today, {})), before,
+                         "model=None requests must not enter daily_by_model")
+        mod._record_empty_retry("m-a")
+        dm_today = mod.STATS["daily_by_model"][today]
+        self.assertGreaterEqual(dm_today["m-a"]["requests"], 1)
+        self.assertGreaterEqual(dm_today["m-a"]["filtered"], 1)
+        self.assertGreaterEqual(dm_today["m-a"]["retries"], 1,
+                                "retry attribution must land in daily_by_model")
+        # 恒等式：daily 总桶 ≥ 分模型合计（差值 = 当日无 model 请求）
+        for k in ("requests", "retries"):
+            total = mod.STATS["daily"][today][k]
+            summed = sum(m[k] for m in dm_today.values())
+            self.assertGreaterEqual(total, summed,
+                                    "daily[%r][%r]=%d < Σ daily_by_model=%d"
+                                    % (today, k, total, summed))
+
     def test_daily_persist_roundtrip_legacy_and_corrupt(self) -> None:
         mod = self.mod
         tmp = tempfile.mkdtemp(prefix="ctyun-proxy-unit3-")
@@ -583,6 +608,17 @@ class ProxyDashboardUnitTest(unittest.TestCase):
                                           "errors_proxy": 0, "errors_upstream": 0}
         self.assertNotIn("mutation-test", mod.STATS["daily"],
                          "snapshot must hand out copies, not internal refs")
+        # v2：daily_by_model 双层深拷贝（外层日期 dict + 内层模型 entry）
+        mod.STATS["daily_by_model"].setdefault(mod.today_key(), {})["snap-m"] = {
+            "requests": 1, "filtered": 0, "retries": 0}
+        snap = mod.stats_snapshot()
+        self.assertIn("daily_by_model", snap)
+        snap["daily_by_model"]["mutation-test"] = {}
+        self.assertNotIn("mutation-test", mod.STATS["daily_by_model"])
+        snap["daily_by_model"][mod.today_key()]["snap-m"]["requests"] = 999
+        self.assertEqual(
+            mod.STATS["daily_by_model"][mod.today_key()]["snap-m"]["requests"], 1,
+            "inner model entries must be copies, not internal refs")
 
     def test_safe_log_stderr_normal_and_broken(self) -> None:
         mod = self.mod
@@ -777,6 +813,12 @@ class AdminIntegrationTest(unittest.TestCase):
         self.assertIn("deepseek-v4-pro-0813-oc", snap["by_model"])
         self.assertGreaterEqual(
             snap["by_model"]["deepseek-v4-pro-0813-oc"]["requests"], 1)
+        # v2：daily_by_model 集成（/api/stats 顶层键透出；retries 归因见单测 matrix_fallback）
+        today = time.strftime("%Y-%m-%d")
+        self.assertIn(today, snap["daily_by_model"])
+        self.assertGreaterEqual(
+            snap["daily_by_model"][today]["deepseek-v4-pro-0813-oc"]["requests"], 1,
+            "per-model daily matrix must record the SSE request")
 
     def test_stats_counters_resume_from_persist(self) -> None:
         self.proc.terminate()
