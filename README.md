@@ -13,10 +13,10 @@
 - **record 级剥行**：按空行切分 SSE record，毒 record 整弃，其余逐 record flush 转发；SSE 下游 close-delimited，非 SSE 请求原样透传
 - **双端口**：转发代理 `127.0.0.1:7920` + 同进程内嵌监控台 `0.0.0.0:7921`
 - **监控 dashboard**（浏览器运行台，深石板蓝+琥珀，零外部依赖，2s 轮询 `/api/stats`）：
-  - 实时统计：请求数 / 剥行累计 / 毒行率 / 活跃连接 / 错误数
+  - 实时统计：按所选时间段（近3天/近7天/本月/上月）聚合的请求数 / 剥行 / 毒行率 / 错误数；活跃连接恒实时
   - 「最近请求」最近 100 条（含模型列、耗时、剥行数；跨天时自动按日期分组显示）
   - 「剥行流带」最近 20 条毒 record 预览 + 累计 sparkline
-  - 「按天统计」最近 14 天（daily 分桶，双口径错误列）
+  - 「按天统计」「按天 × 模型」随所选时间段过滤日期（上月最多 31 行；daily 分桶，双口径错误列）
 - **网页热切上游**：`POST /api/config` 免重启切换上游 base URL（本机免鉴权；局域网访问需 `X-Admin-Token`）
 - **计数口径透明**：顶部「请求数」跨重启持久化；「按天统计」按本地日期分桶、重启续算
 - **launchd 常驻**：KeepAlive 自愈
@@ -56,7 +56,7 @@ launchctl kickstart -k gui/$UID/com.ctyun-stream-fix-proxy
 
 ## API
 
-- `GET /api/stats` — 全量统计 JSON（计数 / daily 分桶 / daily_by_model / recent 100 / 毒行流带）
+- `GET /api/stats` — 全量统计 JSON（计数 / daily 分桶 / daily_by_model / recent 100 / 毒行流带 / range_stats 四维度聚合 / range_bounds 四维度窗口闭区间；后两键为加性新增，旧消费者零破坏）
 - `GET /api/config` — 当前上游 base URL
 - `POST /api/config` `{"upstream_base": "..."}` — 热切上游（本机免鉴权，LAN 需 `X-Admin-Token`）
 
@@ -66,14 +66,15 @@ launchctl kickstart -k gui/$UID/com.ctyun-stream-fix-proxy
 /usr/bin/python3 ctyun-stream-fix-proxy.test.py
 ```
 
-32 个用例。**必须用 `/usr/bin/python3`**：Homebrew 的 Python 3.14 `http.server.HTTPServer` 构造会挂死（进程存活但不 LISTEN、零报错）。
+45 个用例。**必须用 `/usr/bin/python3`**：Homebrew 的 Python 3.14 `http.server.HTTPServer` 构造会挂死（进程存活但不 LISTEN、零报错）。
 
 ## 计数口径
 
 | 页面区块 | 口径 | 持久化 |
 |----------|------|--------|
-| 顶部「请求数 / 剥行 / 错误」 | 自首次运行累计 | 是（跨重启） |
-| 「按天统计」 | 按本地日期分桶 | 是（90 天 prune） |
+| 顶部「请求数 / 剥行 / 错误」 | 按所选时间段聚合（近3/近7天含今日滑动窗口；本月/上月自然月；错误=代理错误+上游5xx 合计） | 是（daily 桶跨重启） |
+| 「活跃连接」 | 实时 gauge，不随时间段变化 | 否 |
+| 「按天统计」「按天 × 模型」 | 随所选时间段过滤（最远回溯=上月+当月 ≤62 天 < 90 天 retention） | 主表是（90 天 prune）/ 副表否（重启清零） |
 | 「最近请求」「剥行流带」 | 最近 100 / 20 条内存窗口 | 否 |
 
 ## License
