@@ -789,6 +789,10 @@ class AdminIntegrationTest(unittest.TestCase):
         self.assertIn("按天统计", html)
         self.assertIn("<th>上游5xx</th>", html)
         self.assertIn('id="daily-body"', html)
+        # v2：按天表「重试」列（6 列）+ 按天×模型副表
+        self.assertIn("<th>重试</th>", html)
+        self.assertIn('colspan="6"', html)
+        self.assertIn('id="daily-model-body"', html)
         # v1.3：按模型口径标注（自上次重启起累计，重启清零）
         self.assertIn("自上次重启起累计", html)
         # v1.3：跨天日期分组（纯前端逻辑，静态断言锁定存在性，目检兜底见 Task 3）
