@@ -18,7 +18,7 @@
   - 「剥行流带」最近 20 条毒 record 预览 + 累计 sparkline
   - 「按天统计」最近 14 天（daily 分桶，双口径错误列）
 - **网页热切上游**：`POST /api/config` 免重启切换上游 base URL（本机免鉴权；局域网访问需 `X-Admin-Token`）
-- **计数口径透明**：顶部「请求数」跨重启持久化；「按模型」自进程启动累计、重启清零（页面有标注）；「按天统计」按本地日期分桶、重启续算
+- **计数口径透明**：顶部「请求数」跨重启持久化；「按天统计」按本地日期分桶、重启续算
 - **launchd 常驻**：KeepAlive 自愈
 
 ## 架构
@@ -56,7 +56,7 @@ launchctl kickstart -k gui/$UID/com.ctyun-stream-fix-proxy
 
 ## API
 
-- `GET /api/stats` — 全量统计 JSON（计数 / daily 分桶 / by_model / recent 100 / 毒行流带）
+- `GET /api/stats` — 全量统计 JSON（计数 / daily 分桶 / daily_by_model / recent 100 / 毒行流带）
 - `GET /api/config` — 当前上游 base URL
 - `POST /api/config` `{"upstream_base": "..."}` — 热切上游（本机免鉴权，LAN 需 `X-Admin-Token`）
 
@@ -73,7 +73,6 @@ launchctl kickstart -k gui/$UID/com.ctyun-stream-fix-proxy
 | 页面区块 | 口径 | 持久化 |
 |----------|------|--------|
 | 顶部「请求数 / 剥行 / 错误」 | 自首次运行累计 | 是（跨重启） |
-| 「按模型」 | 自进程启动累计，重启清零 | 否（内存） |
 | 「按天统计」 | 按本地日期分桶 | 是（90 天 prune） |
 | 「最近请求」「剥行流带」 | 最近 100 / 20 条内存窗口 | 否 |
 
