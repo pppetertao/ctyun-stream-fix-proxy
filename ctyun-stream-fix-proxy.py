@@ -752,8 +752,8 @@ footer .inner { color:var(--dim); font-size:12px; padding-top:4px; padding-botto
     <div class="card-title">按天 × 模型（内存累计，重启清零）</div>
     <div class="table-wrap">
     <table>
-      <thead><tr><th>日期</th><th>模型</th><th>请求</th><th>剥行</th><th>重试</th></tr></thead>
-      <tbody id="daily-model-body"><tr><td class="empty" colspan="5">读取中……</td></tr></tbody>
+      <thead><tr><th>日期</th><th>模型</th><th>请求</th><th>剥行</th><th>代理错误</th><th>上游5xx</th><th>重试</th></tr></thead>
+      <tbody id="daily-model-body"><tr><td class="empty" colspan="7">读取中……</td></tr></tbody>
     </table>
     </div>
   </section>
@@ -913,7 +913,7 @@ function renderDailyByModel(dbm) {
   if (days.length === 0) {
     var tr0 = el("tr");
     var td0 = el("td", "empty", "暂无按天 × 模型统计");
-    td0.colSpan = 5;
+    td0.colSpan = 7;
     tr0.appendChild(td0);
     body.appendChild(tr0);
     return;
@@ -926,11 +926,13 @@ function renderDailyByModel(dbm) {
     });
     for (var j = 0; j < names.length; j++) {
       var ent = models[names[j]];
-      var tr = el("tr", (ent.retries || 0) > 0 ? "hit" : "");
+      var tr = el("tr", ((ent.errors_proxy || 0) + (ent.errors_upstream || 0)) > 0 ? "hit" : "");
       tr.appendChild(el("td", "num", days[i]));
       tr.appendChild(el("td", "", names[j]));
       tr.appendChild(el("td", "num", String(ent.requests || 0)));
       tr.appendChild(el("td", "num", String(ent.filtered || 0)));
+      tr.appendChild(el("td", "num", String(ent.errors_proxy || 0)));
+      tr.appendChild(el("td", "num", String(ent.errors_upstream || 0)));
       tr.appendChild(el("td", "num", String(ent.retries || 0)));
       body.appendChild(tr);
     }

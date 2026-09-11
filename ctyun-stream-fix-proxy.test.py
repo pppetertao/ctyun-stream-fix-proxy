@@ -822,6 +822,13 @@ class AdminIntegrationTest(unittest.TestCase):
         self.assertIn("<th>重试</th>", html)
         self.assertIn('colspan="6"', html)
         self.assertIn('id="daily-model-body"', html)
+        # v3：按天×模型表 7 列与主表数值列对齐（代理错误/上游5xx）+ 错误行高亮
+        self.assertEqual(html.count("<th>代理错误</th>"), 2)
+        self.assertEqual(html.count("<th>上游5xx</th>"), 2)
+        self.assertIn('colspan="7"', html)
+        self.assertIn("String(ent.errors_proxy || 0)", html)
+        self.assertIn("String(ent.errors_upstream || 0)", html)
+        self.assertIn("(ent.errors_proxy || 0) + (ent.errors_upstream || 0)", html)
         # v2.1：按模型重启累计卡已整体移除，标题与口径标注锁定不复活
         self.assertNotIn("自上次重启起累计", html)
         self.assertNotIn("按模型", html)
