@@ -574,6 +574,18 @@ class ProxyDashboardUnitTest(unittest.TestCase):
             self.assertGreaterEqual(total, summed,
                                     "daily[%r][%r]=%d < Σ daily_by_model=%d"
                                     % (today, k, total, summed))
+        # v3：_record_empty_retry 的 dm entry 创建点（site-2）同样 5 字段——
+        # 用全新日期隔离（真实 today 的键位已被 cap 用例占满 32，新建会被 cap 拒绝）
+        orig_today = mod.today_key
+        try:
+            mod.today_key = lambda: "2026-01-03"
+            mod._record_empty_retry("m-retry-only")
+        finally:
+            mod.today_key = orig_today
+        self.assertEqual(
+            set(mod.STATS["daily_by_model"]["2026-01-03"]["m-retry-only"]),
+            {"requests", "filtered", "errors_proxy", "errors_upstream", "retries"},
+            "empty-retry creation site must keep dm entry shape in sync")
 
     def test_daily_persist_roundtrip_legacy_and_corrupt(self) -> None:
         mod = self.mod

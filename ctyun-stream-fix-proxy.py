@@ -324,8 +324,9 @@ def _record_poison_preview(raw: bytes) -> None:
 
 def _record_empty_retry(model=None) -> None:
     """空流重试计数：STATS 总量 + 当日桶 + daily_by_model。
-    entry/桶形状必须与 _record_request 同步含 retries 键（旧持久化桶经
-    load_daily_buckets 的 _DAILY_FIELDS 清洗已补键），否则 += 直接 KeyError。"""
+    entry/桶形状必须与 _record_request 同步：dm entry 同为 5 字段（本函数无
+    error/status 参数，errors_* 仅保形状不归因）；旧持久化桶经 load_daily_buckets
+    的 _DAILY_FIELDS 清洗已补键。形状不同步时 += 直接 KeyError。"""
     global _stats_dirty
     with STATS_LOCK:
         STATS["empty_retries_total"] += 1
@@ -333,7 +334,9 @@ def _record_empty_retry(model=None) -> None:
             day_models = STATS["daily_by_model"].setdefault(today_key(), {})
             entry_dm = day_models.get(model)
             if entry_dm is None and len(day_models) < BY_MODEL_CAP:
-                entry_dm = day_models[model] = {"requests": 0, "filtered": 0, "retries": 0}
+                entry_dm = day_models[model] = {"requests": 0, "filtered": 0,
+                                                "errors_proxy": 0,
+                                                "errors_upstream": 0, "retries": 0}
             if entry_dm is not None:  # 每日独立 cap：键数达上限后新模型不记录
                 entry_dm["retries"] += 1
         bucket = STATS["daily"].setdefault(
