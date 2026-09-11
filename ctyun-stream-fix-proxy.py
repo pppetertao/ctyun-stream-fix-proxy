@@ -218,7 +218,9 @@ def range_stats(daily: dict, today: str = None) -> dict:
 
 
 def _prune_daily(daily: dict) -> dict:
-    """按日期 key 降序保留最近 DAILY_RETENTION_DAYS 天（ISO 日期字符串排序即时间序）。"""
+    """按日期 key 降序保留最近 DAILY_RETENTION_DAYS 天（ISO 日期字符串排序即时间序）。
+    value 形状无关（平 dict 按 key prune），daily 与 daily_by_model 共用；
+    调用方须持 STATS_LOCK（对内存态调用时）。"""
     if len(daily) <= DAILY_RETENTION_DAYS:
         return daily
     for key in sorted(daily)[:-DAILY_RETENTION_DAYS]:
@@ -242,6 +244,7 @@ def save_stats_counters(path: str) -> None:
         counters = {k: STATS[k] for k in ("requests_total", "filtered_total", "errors_total",
                                           "empty_retries_total")}
         daily = {k: dict(v) for k, v in STATS["daily"].items()}
+        _prune_daily(STATS["daily_by_model"])  # 内存态原地 prune（副本 prune 修不了内存增长）
     _prune_daily(daily)
     with _CFG_LOCK:
         base = UPSTREAM_BASE

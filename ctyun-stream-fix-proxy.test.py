@@ -716,6 +716,76 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         self.assertLessEqual(len(saved), 90, "prune must cap buckets at 90 days")
         self.assertIn("2026-04-11", saved, "most recent bucket must survive prune")
 
+    def test_daily_by_model_prune_on_save(self) -> None:
+        mod = self.mod
+        tmp = tempfile.mkdtemp(prefix="ctyun-proxy-unit5-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        path = os.path.join(tmp, "settings.json")
+        orig_dbm = mod.STATS["daily_by_model"]
+        mod.STATS["daily_by_model"] = {}
+        try:
+            for i in range(95):
+                mod.STATS["daily_by_model"]["2026-%02d-%02d" % (1 + i // 28, 1 + i % 28)] = {
+                    "m1": {"requests": i, "filtered": 0,
+                           "errors_proxy": 0, "errors_upstream": 0, "retries": 0}}
+            today = mod.today_key()
+            mod.STATS["daily_by_model"][today] = {
+                "m1": {"requests": 95, "filtered": 0,
+                       "errors_proxy": 0, "errors_upstream": 0, "retries": 0}}
+            mod.save_stats_counters(path)
+            # 断言内存态：daily_by_model 不落盘，读回文件验证不到 prune
+            dbm = mod.STATS["daily_by_model"]
+            self.assertLessEqual(len(dbm), 90,
+                                 "in-memory daily_by_model must be pruned on save")
+            self.assertNotIn("2026-01-01", dbm,
+                             "oldest buckets must be pruned from memory")
+            self.assertIn(today, dbm, "today bucket must survive prune")
+            self.assertEqual(dbm["2026-04-11"]["m1"]["requests"], 94,
+                             "surviving inner entries must be untouched")
+        finally:
+            mod.STATS["daily_by_model"] = orig_dbm
+
+    def test_daily_by_model_prune_exact_boundary(self) -> None:
+        mod = self.mod
+        tmp = tempfile.mkdtemp(prefix="ctyun-proxy-unit5-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        path = os.path.join(tmp, "settings.json")
+        orig_dbm = mod.STATS["daily_by_model"]
+        mod.STATS["daily_by_model"] = {}
+        try:
+            for i in range(90):
+                mod.STATS["daily_by_model"]["2026-%02d-%02d" % (1 + i // 28, 1 + i % 28)] = {
+                    "m1": {"requests": i, "filtered": 0,
+                           "errors_proxy": 0, "errors_upstream": 0, "retries": 0}}
+            mod.save_stats_counters(path)
+            self.assertEqual(len(mod.STATS["daily_by_model"]), 90,
+                             "exactly 90 buckets must hit the <= early-return branch")
+            mod.STATS["daily_by_model"]["2026-12-31"] = {
+                "m1": {"requests": 90, "filtered": 0,
+                       "errors_proxy": 0, "errors_upstream": 0, "retries": 0}}
+            mod.save_stats_counters(path)
+            dbm = mod.STATS["daily_by_model"]
+            self.assertEqual(len(dbm), 90, "91 buckets must prune back to exactly 90")
+            self.assertNotIn("2026-01-01", dbm, "only the oldest bucket must be deleted")
+            self.assertIn("2026-01-02", dbm, "second-oldest bucket must survive")
+            self.assertIn("2026-12-31", dbm, "newest bucket must survive")
+        finally:
+            mod.STATS["daily_by_model"] = orig_dbm
+
+    def test_daily_by_model_prune_empty(self) -> None:
+        mod = self.mod
+        tmp = tempfile.mkdtemp(prefix="ctyun-proxy-unit5-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        path = os.path.join(tmp, "settings.json")
+        orig_dbm = mod.STATS["daily_by_model"]
+        mod.STATS["daily_by_model"] = {}
+        try:
+            mod.save_stats_counters(path)  # {} 不得抛异常
+            self.assertEqual(mod.STATS["daily_by_model"], {},
+                             "empty daily_by_model must stay empty after save")
+        finally:
+            mod.STATS["daily_by_model"] = orig_dbm
+
     def test_stats_snapshot_daily_is_copy(self) -> None:
         mod = self.mod
         snap = mod.stats_snapshot()
