@@ -771,7 +771,7 @@ class ProxyDashboardUnitTest(unittest.TestCase):
                 "m1": {"requests": 95, "filtered": 0,
                        "errors_proxy": 0, "errors_upstream": 0, "retries": 0}}
             mod.save_stats_counters(path)
-            # 断言内存态：daily_by_model 不落盘，读回文件验证不到 prune
+            # 内存态断言：prune 必须落到 STATS["daily_by_model"] 原对象
             dbm = mod.STATS["daily_by_model"]
             self.assertLessEqual(len(dbm), 90,
                                  "in-memory daily_by_model must be pruned on save")
@@ -782,6 +782,15 @@ class ProxyDashboardUnitTest(unittest.TestCase):
                              "surviving inner entries must be untouched")
         finally:
             mod.STATS["daily_by_model"] = orig_dbm
+        with open(path, encoding="utf-8") as fh:
+            saved = json.load(fh)["stats"]["daily_by_model"]
+        self.assertLessEqual(len(saved), 90,
+                             "file daily_by_model must be pruned to <=90 buckets")
+        self.assertNotIn("2026-01-01", saved,
+                         "oldest buckets must be pruned from the file")
+        self.assertIn(today, saved, "today bucket must survive prune in the file")
+        self.assertEqual(saved["2026-04-11"]["m1"]["requests"], 94,
+                         "surviving file entries must be untouched")
 
     def test_daily_by_model_prune_exact_boundary(self) -> None:
         mod = self.mod
@@ -798,6 +807,12 @@ class ProxyDashboardUnitTest(unittest.TestCase):
             mod.save_stats_counters(path)
             self.assertEqual(len(mod.STATS["daily_by_model"]), 90,
                              "exactly 90 buckets must hit the <= early-return branch")
+            with open(path, encoding="utf-8") as fh:
+                saved = json.load(fh)["stats"]["daily_by_model"]
+            self.assertEqual(len(saved), 90,
+                             "file must keep all 90 buckets when prune early-returns")
+            self.assertIn("2026-01-01", saved,
+                          "at exactly 90 buckets nothing must be pruned from the file")
             mod.STATS["daily_by_model"]["2026-12-31"] = {
                 "m1": {"requests": 90, "filtered": 0,
                        "errors_proxy": 0, "errors_upstream": 0, "retries": 0}}
@@ -807,6 +822,14 @@ class ProxyDashboardUnitTest(unittest.TestCase):
             self.assertNotIn("2026-01-01", dbm, "only the oldest bucket must be deleted")
             self.assertIn("2026-01-02", dbm, "second-oldest bucket must survive")
             self.assertIn("2026-12-31", dbm, "newest bucket must survive")
+            with open(path, encoding="utf-8") as fh:
+                saved = json.load(fh)["stats"]["daily_by_model"]
+            self.assertEqual(len(saved), 90,
+                             "file must prune back to exactly 90 buckets")
+            self.assertNotIn("2026-01-01", saved,
+                             "only the oldest bucket must be deleted from the file")
+            self.assertIn("2026-12-31", saved,
+                          "newest bucket must survive in the file")
         finally:
             mod.STATS["daily_by_model"] = orig_dbm
 
@@ -823,6 +846,10 @@ class ProxyDashboardUnitTest(unittest.TestCase):
                              "empty daily_by_model must stay empty after save")
         finally:
             mod.STATS["daily_by_model"] = orig_dbm
+        with open(path, encoding="utf-8") as fh:
+            saved = json.load(fh)["stats"]["daily_by_model"]
+        self.assertEqual(saved, {},
+                         "empty daily_by_model must persist as an empty dict")
 
     def test_stats_snapshot_daily_is_copy(self) -> None:
         mod = self.mod

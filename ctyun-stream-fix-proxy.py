@@ -246,6 +246,8 @@ def save_stats_counters(path: str) -> None:
         _prune_daily(STATS["daily"])           # 内存态原地 prune（副本 prune 修不了内存增长）
         _prune_daily(STATS["daily_by_model"])  # 内存态原地 prune（副本 prune 修不了内存增长）
         daily = {k: dict(v) for k, v in STATS["daily"].items()}  # prune 后拷贝：磁盘与内存一致
+        daily_by_model = {d: {m: dict(v) for m, v in models.items()}
+                          for d, models in STATS["daily_by_model"].items()}
     with _CFG_LOCK:
         base = UPSTREAM_BASE
     directory = os.path.dirname(path)
@@ -254,7 +256,8 @@ def save_stats_counters(path: str) -> None:
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump({"upstream_base": base,
-                   "stats": dict(counters, daily=daily)}, fh, ensure_ascii=False)
+                   "stats": dict(counters, daily=daily, daily_by_model=daily_by_model)},
+                  fh, ensure_ascii=False)
     os.replace(tmp, path)
 
 
