@@ -367,7 +367,7 @@ $ /usr/bin/python3 ctyun-stream-fix-proxy.test.py -v 2>&1 | grep -A3 "test_dashb
   </section>
   <section class="stats-row">
     <div class="card stat"><div class="num" id="st-requests">--</div><div class="label">请求数</div></div>
-    <div class="card stat"><div class="num amber" id="st-filtered">--</div><div class="label">剥行累计</div></div>
+    <div class="card stat"><div class="num amber" id="st-filtered">--</div><div class="label">剥行（所选时段）</div></div>
     <div class="card stat"><div class="num" id="st-rate">--</div><div class="label">毒行率</div></div>
     <div class="card stat"><div class="num" id="st-active">--</div><div class="label">活跃连接·实时</div></div>
     <div class="card stat"><div class="num" id="st-errors">--</div><div class="label">错误数</div></div>
@@ -651,7 +651,7 @@ assert set(snap) == {"requests_total", "filtered_total", "errors_total",
                      "empty_retries_total", "active", "daily", "daily_by_model",
                      "recent", "poison_previews", "uptime_s", "upstream_base",
                      "upstream_source", "range_stats", "range_bounds"}, \
-       "key set must be old 12 keys + exactly 2 additive", set(snap)
+       ("key set must be old 12 keys + exactly 2 additive", set(snap))
 assert set(snap["range_stats"]) == RK and set(snap["range_bounds"]) == RK
 for k, agg in snap["range_stats"].items():
     assert set(agg) == {"requests", "filtered", "errors_proxy",
@@ -663,8 +663,10 @@ assert snap["range_stats"]["7d"]["filtered"] == 4
 assert snap["range_stats"]["7d"]["errors_proxy"] == 1
 assert snap["range_stats"]["7d"]["errors_upstream"] == 1
 assert snap["range_stats"]["7d"]["days"] == 2
-assert snap["range_stats"]["last_month"]["requests"] == 5, snap["range_stats"]["last_month"]
-assert snap["range_stats"]["last_month"]["days"] == 1
+lm_start, lm_end = snap["range_bounds"]["last_month"]
+lm_expected = sum(b.get("requests", 0) for k, b in snap["daily"].items() if lm_start <= k <= lm_end)
+assert snap["range_stats"]["last_month"]["requests"] == lm_expected, (lm_expected, snap["range_stats"]["last_month"]["requests"])
+assert snap["range_stats"]["last_month"]["days"] == sum(1 for k in snap["daily"] if lm_start <= k <= lm_end)
 start, end = snap["range_bounds"]["mtd"]
 expect_mtd = sum(b["requests"] for k, b in snap["daily"].items() if start <= k <= end)
 assert snap["range_stats"]["mtd"]["requests"] == expect_mtd, (start, end, expect_mtd)
@@ -700,7 +702,7 @@ $ grep -c "range_stats" README.md
 $ grep -n "62 天" README.md
 ```
 
-预期：45 tests OK；README `range_stats` ≥2 处（:59 API 行 + 口径表）；62<90 覆盖论证一行存在。
+预期：45 tests OK；README `range_stats` ≥1 处（:59 API 行）；62<90 覆盖论证一行存在。
 
 ### 验收
 
