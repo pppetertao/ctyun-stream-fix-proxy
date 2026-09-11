@@ -4,3 +4,6 @@ __pycache__/
 # 运行时持久化（含本地状态，不入库）
 *.json
 ctyun-stream-fix-proxy.json
+
+# episode worktree（pipeline 产物，不入库）
+.worktrees/
