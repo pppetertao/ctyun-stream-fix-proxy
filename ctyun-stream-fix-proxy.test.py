@@ -886,7 +886,7 @@ class AdminIntegrationTest(unittest.TestCase):
         html = body.decode("utf-8")
         self.assertIn("保存上游端点", html)
         self.assertIn("剥行流带", html)
-        self.assertIn("剥行累计", html)
+        self.assertIn("剥行（所选时段）", html)
         self.assertIn('name="viewport"', html)
         self.assertIn("prefers-reduced-motion", html)
         self.assertIn("focus-visible", html)
@@ -921,6 +921,21 @@ class AdminIntegrationTest(unittest.TestCase):
         # v1.3：跨天日期分组（纯前端逻辑，静态断言锁定存在性，目检兜底见 Task 3）
         self.assertIn("fmtDate", html)
         self.assertIn("date-row", html)
+        # 时间维度切换：4 tab / 默认 7d / bounds 字符串过滤 / 零请求重渲染 / 新错误口径
+        self.assertEqual(html.count('class="range-tab"'), 4)
+        for rk in ("3d", "7d", "mtd", "last_month"):
+            self.assertIn('data-range="%s"' % rk, html)
+        self.assertIn("活跃连接·实时", html)
+        self.assertIn('var selectedRange = "7d"', html)
+        self.assertIn("range_bounds[selectedRange]", html)
+        self.assertIn("lastSnap = snap", html)
+        self.assertIn("rs.errors_proxy + rs.errors_upstream", html)
+        self.assertIn("renderRangeTabs", html)
+        self.assertIn('id="daily-title-range"', html)
+        self.assertIn('id="daily-model-title-range"', html)
+        self.assertNotIn("slice(0, 14)", html)
+        self.assertNotIn("最近 14 天", html)
+        self.assertNotIn("与顶部错误数同口径", html)
 
     def test_favicon_served(self) -> None:
         status, body, ctype = admin_get(self.proc.admin_port, "/favicon.ico")

@@ -746,6 +746,11 @@ button:hover { filter:brightness(1.08); }
 .stat .num { font-size:30px; font-weight:600; font-variant-numeric:tabular-nums; }
 .stat .num.amber { color:var(--amber); }
 .stat .label { color:var(--dim); font-size:12px; }
+.range-tabs { display:flex; gap:8px; flex-wrap:wrap; }
+.range-tab { font-weight:400; font-size:12.5px; background:transparent; color:var(--dim);
+  border:1px solid var(--line); border-radius:99px; padding:4px 14px; }
+.range-tab:hover { filter:none; color:var(--text); }
+.range-tab.active { background:var(--amber); color:var(--ink); border-color:var(--amber); font-weight:700; }
 svg#spark { width:100%; height:64px; display:block; }
 .strip { display:flex; gap:8px; overflow-x:auto; padding-bottom:4px; }
 .chip-poison { flex:0 0 auto; border:1px solid var(--amber); border-left:4px solid var(--amber);
@@ -786,11 +791,17 @@ footer .inner { color:var(--dim); font-size:12px; padding-top:4px; padding-botto
     </form>
     <p class="msg" id="upstream-msg" role="status"></p>
   </section>
+  <section class="card range-tabs" role="tablist" aria-label="统计时间维度">
+    <button type="button" class="range-tab" role="tab" data-range="3d">近3天</button>
+    <button type="button" class="range-tab" role="tab" data-range="7d">近7天</button>
+    <button type="button" class="range-tab" role="tab" data-range="mtd">本月</button>
+    <button type="button" class="range-tab" role="tab" data-range="last_month">上月</button>
+  </section>
   <section class="stats-row">
     <div class="card stat"><div class="num" id="st-requests">--</div><div class="label">请求数</div></div>
-    <div class="card stat"><div class="num amber" id="st-filtered">--</div><div class="label">剥行累计</div></div>
+    <div class="card stat"><div class="num amber" id="st-filtered">--</div><div class="label">剥行（所选时段）</div></div>
     <div class="card stat"><div class="num" id="st-rate">--</div><div class="label">毒行率</div></div>
-    <div class="card stat"><div class="num" id="st-active">--</div><div class="label">活跃连接</div></div>
+    <div class="card stat"><div class="num" id="st-active">--</div><div class="label">活跃连接·实时</div></div>
     <div class="card stat"><div class="num" id="st-errors">--</div><div class="label">错误数</div></div>
   </section>
   <section class="card">
@@ -798,7 +809,7 @@ footer .inner { color:var(--dim); font-size:12px; padding-top:4px; padding-botto
     <svg id="spark" viewBox="0 0 600 64" preserveAspectRatio="none" role="img" aria-label="最近 10 分钟请求柱状图"></svg>
   </section>
   <section class="card">
-    <div class="card-title">按天统计（最近 14 天，新在上）</div>
+    <div class="card-title">按天统计（<span id="daily-title-range">近7天</span>，新在上）</div>
     <div class="table-wrap">
     <table>
       <thead><tr><th>日期</th><th>请求</th><th>剥行</th><th>代理错误</th><th>上游5xx</th><th>重试</th></tr></thead>
@@ -807,7 +818,7 @@ footer .inner { color:var(--dim); font-size:12px; padding-top:4px; padding-botto
     </div>
   </section>
   <section class="card">
-    <div class="card-title">按天 × 模型（内存累计，重启清零）</div>
+    <div class="card-title">按天 × 模型（<span id="daily-model-title-range">近7天</span>，内存累计，重启清零）</div>
     <div class="table-wrap">
     <table>
       <thead><tr><th>日期</th><th>模型</th><th>请求</th><th>剥行</th><th>代理错误</th><th>上游5xx</th><th>重试</th></tr></thead>
@@ -830,11 +841,14 @@ footer .inner { color:var(--dim); font-size:12px; padding-top:4px; padding-botto
   </section>
 </main>
 <footer><div class="inner">
-  累计与按天计数跨重启保留（每 60s 落盘，持久化于 ~/.local/etc/ctyun-stream-fix-proxy.json）；
+  顶部统计卡按所选时间段聚合（近3/近7天为含今日的滑动窗口，今日为部分数据；本月/上月为自然月，本地时区）；
+  错误数=该时段内「代理错误+上游5xx」合计；活跃连接恒为实时值，不随时间段变化；
+  累计与按天计数跨重启保留（每 60s 落盘，持久化于 ~/.local/etc/ctyun-stream-fix-proxy.json，
+  日桶保留 90 天，覆盖上月+当月最远 62 天回溯）；
   按天×模型计数自进程启动累计，不持久化（重启清零）；
   按天主表含无 model 请求，各行数值 ≥「按天 × 模型」副表合计，差值即当日无 model 请求；
-  最近请求/剥行流带为内存数据；「代理错误」=代理自身错误（与顶部错误数同口径），
-  「上游5xx」=上游透传 status≥500（499 中断两边都不计）。页面每 2s 轮询 /api/stats；非本机修改上游需 X-Admin-Token。
+  最近请求/剥行流带为内存数据；「代理错误」=代理自身错误，「上游5xx」=上游透传 status≥500
+  （499 中断两边都不计）。页面每 2s 轮询 /api/stats，切换时间段用缓存零请求重渲染；非本机修改上游需 X-Admin-Token。
 </div></footer>
 <script>
 "use strict";
@@ -846,6 +860,9 @@ function el(tag, cls, text) {
   return n;
 }
 var SOURCE_LABEL = { env: "环境变量", file: "持久化文件", api: "网页设置", default: "内置默认" };
+var RANGE_LABELS = { "3d": "近3天", "7d": "近7天", "mtd": "本月", "last_month": "上月" };
+var selectedRange = "7d";  // 刷新不记忆（无 localStorage），默认近7天
+var lastSnap = null;       // poll 缓存：tab 点击零请求重渲染
 
 function fmtTime(ts) {
   return new Date(ts * 1000).toLocaleTimeString("zh-CN", { hour12: false });
@@ -875,12 +892,15 @@ function setConn(ok, errText) {
   }
 }
 function renderStats(snap) {
-  $("st-requests").textContent = snap.requests_total;
-  $("st-filtered").textContent = snap.filtered_total;
-  $("st-rate").textContent = snap.requests_total > 0
-    ? ((snap.filtered_total / snap.requests_total) * 100).toFixed(1) + "%" : "—";
+  var rs = snap.range_stats && snap.range_stats[selectedRange];
+  if (rs) {
+    $("st-requests").textContent = rs.requests;
+    $("st-filtered").textContent = rs.filtered;
+    $("st-rate").textContent = rs.requests > 0
+      ? ((rs.filtered / rs.requests) * 100).toFixed(1) + "%" : "—";
+    $("st-errors").textContent = rs.errors_proxy + rs.errors_upstream;
+  }
   $("st-active").textContent = snap.active;
-  $("st-errors").textContent = snap.errors_total;
   $("uptime").textContent = "运行时长 " + fmtUptime(snap.uptime_s);
   var base = $("upstream-base");
   base.textContent = snap.upstream_base;
@@ -943,7 +963,10 @@ function renderPoison(list) {
 function renderDaily(daily) {
   var body = $("daily-body");
   body.textContent = "";
-  var keys = Object.keys(daily).sort().reverse().slice(0, 14);
+  var bounds = lastSnap && lastSnap.range_bounds && lastSnap.range_bounds[selectedRange];
+  var keys = Object.keys(daily).sort().reverse().filter(function (k) {
+    return !bounds || (bounds[0] <= k && k <= bounds[1]);
+  });
   if (keys.length === 0) {
     var tr0 = el("tr");
     var td0 = el("td", "empty", "暂无按天统计");
@@ -967,7 +990,10 @@ function renderDaily(daily) {
 function renderDailyByModel(dbm) {
   var body = $("daily-model-body");
   body.textContent = "";
-  var days = Object.keys(dbm).sort().reverse().slice(0, 14);
+  var bounds = lastSnap && lastSnap.range_bounds && lastSnap.range_bounds[selectedRange];
+  var days = Object.keys(dbm).sort().reverse().filter(function (k) {
+    return !bounds || (bounds[0] <= k && k <= bounds[1]);
+  });
   if (days.length === 0) {
     var tr0 = el("tr");
     var td0 = el("td", "empty", "暂无按天 × 模型统计");
@@ -994,6 +1020,25 @@ function renderDailyByModel(dbm) {
       tr.appendChild(el("td", "num", String(ent.retries || 0)));
       body.appendChild(tr);
     }
+  }
+}
+function renderRangeTabs() {
+  var tabs = document.querySelectorAll(".range-tab");
+  for (var i = 0; i < tabs.length; i++) {
+    var on = tabs[i].getAttribute("data-range") === selectedRange;
+    tabs[i].classList.toggle("active", on);
+    tabs[i].setAttribute("aria-selected", on ? "true" : "false");
+  }
+}
+function applyRange() {
+  renderRangeTabs();
+  var label = RANGE_LABELS[selectedRange] || selectedRange;
+  $("daily-title-range").textContent = label;
+  $("daily-model-title-range").textContent = label;
+  if (lastSnap) {
+    renderStats(lastSnap);
+    renderDaily(lastSnap.daily || {});
+    renderDailyByModel(lastSnap.daily_by_model || {});
   }
 }
 function renderSpark(recent) {
@@ -1052,6 +1097,7 @@ function poll() {
       return resp.json();
     })
     .then(function (snap) {
+      lastSnap = snap;
       renderStats(snap);
       renderRecent(snap.recent || []);
       renderPoison(snap.poison_previews || []);
@@ -1097,6 +1143,15 @@ $("upstream-form").addEventListener("submit", function (e) {
     msg.textContent = "保存失败：" + String(err) + " —— 确认能访问管理接口 /api/config。";
   });
 });
+document.querySelector(".range-tabs").addEventListener("click", function (e) {
+  var btn = e.target && e.target.closest ? e.target.closest(".range-tab") : null;
+  if (!btn) return;
+  var key = btn.getAttribute("data-range");
+  if (!key || key === selectedRange) return;
+  selectedRange = key;
+  applyRange();  // 零请求重渲染：直接消费 lastSnap 缓存
+});
+applyRange();
 poll();
 setInterval(poll, 2000);
 </script>
