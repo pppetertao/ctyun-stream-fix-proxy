@@ -44,6 +44,52 @@ FLUSH_INTERVAL_S = 60
 BY_MODEL_CAP = 32
 DAILY_RETENTION_DAYS = 90  # daily 分桶滚动保留天数（save 时 prune）
 POISON_RE = re.compile(rb"^data:\s*null\s*$")
+DONE_RE = re.compile(rb"^data:\s*\[DONE\]\s*$")
+EMPTY_RETRY_MAX = int(os.environ.get("CTYUN_EMPTY_RETRY", "1"))  # env seam，惯例同 SEND_TIMEOUT_S
+
+
+def sse_data_line_kind(line: bytes) -> str:
+    """SSE data 行归类："done" / "content" / "noise"。判定序：
+    非 data: 前缀（注释行/event:/id:）→ noise；[DONE] → done；
+    JSON 解析失败 → content（fail-open：宁可不重试，不误判合法流）；
+    dict + choices 非空 list 时：delta.content 非空 str / delta.tool_calls 真值 /
+    choice.finish_reason 非 None 任一 → content；其余（reasoning-only、空 delta、
+    choices 为空的 usage 帧、data:null、非 dict JSON）→ noise。"""
+    stripped = line.rstrip(b"\r\n")
+    if not stripped.startswith(b"data:"):
+        return "noise"
+    if DONE_RE.match(stripped):
+        return "done"
+    try:
+        data = json.loads(stripped[5:].strip().decode("utf-8", "replace"))
+    except ValueError:
+        return "content"
+    if not isinstance(data, dict):
+        return "noise"
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return "noise"
+    choice = choices[0] if isinstance(choices[0], dict) else {}
+    delta = choice.get("delta")
+    delta = delta if isinstance(delta, dict) else {}
+    content = delta.get("content")
+    if isinstance(content, str) and content:
+        return "content"
+    if delta.get("tool_calls"):
+        return "content"
+    if choice.get("finish_reason") is not None:
+        return "content"
+    return "noise"
+
+
+class _EmptyStream(Exception):
+    """priming EOF 仍无 content/[DONE]：携带 filtered 计数与已滤毒缓冲行。"""
+    def __init__(self, filtered: int, lines: list):
+        super().__init__("empty upstream sse stream")
+        self.filtered = filtered
+        self.lines = lines
+
+
 HOP_HEADERS = {"connection", "keep-alive", "proxy-connection",
                "te", "trailer", "transfer-encoding", "upgrade"}
 STRIP_HEADERS = HOP_HEADERS | {"host", "content-length", "accept-encoding"}
@@ -51,6 +97,7 @@ STRIP_HEADERS = HOP_HEADERS | {"host", "content-length", "accept-encoding"}
 _CFG_LOCK = threading.Lock()
 STATS_LOCK = threading.Lock()
 STATS = {"requests_total": 0, "filtered_total": 0, "errors_total": 0,
+         "empty_retries_total": 0,
          "active": 0, "by_model": {}, "daily": {}}
 _stats_dirty = False  # STATS_LOCK 保护：计数落盘脏标记（SIGTERM/60s 脏刷消费）
 STARTED_AT = time.time()
@@ -137,7 +184,8 @@ def _safe_log_stderr(msg: str) -> None:
 def save_stats_counters(path: str) -> None:
     """把累计计数、按天分桶与当前上游端点全量写入持久化文件（SIGTERM / set_upstream_base 共用）。"""
     with STATS_LOCK:
-        counters = {k: STATS[k] for k in ("requests_total", "filtered_total", "errors_total")}
+        counters = {k: STATS[k] for k in ("requests_total", "filtered_total", "errors_total",
+                                          "empty_retries_total")}
         daily = {k: dict(v) for k, v in STATS["daily"].items()}
     _prune_daily(daily)
     with _CFG_LOCK:
@@ -164,16 +212,16 @@ def _load_persist_file(path: str) -> dict:
 
 
 def load_stats_counters(path: str) -> dict:
-    """从持久化文件读累计计数；缺文件/损坏/legacy 无 stats 键 → 三零值。"""
+    """从持久化文件读累计计数；缺文件/损坏/legacy 无 stats 键 → 各键零值。"""
     stats = _load_persist_file(path).get("stats")
     out = {}
-    for key in ("requests_total", "filtered_total", "errors_total"):
+    for key in ("requests_total", "filtered_total", "errors_total", "empty_retries_total"):
         value = stats.get(key) if isinstance(stats, dict) else None
         out[key] = value if isinstance(value, int) and value >= 0 else 0
     return out
 
 
-_DAILY_FIELDS = ("requests", "filtered", "errors_proxy", "errors_upstream")
+_DAILY_FIELDS = ("requests", "filtered", "errors_proxy", "errors_upstream", "retries")
 
 
 def load_daily_buckets(path: str) -> dict:
@@ -241,13 +289,13 @@ def _record_request(method: str, path: str, status: int, dur_ms: float,
             by_model = STATS["by_model"]
             entry = by_model.get(model)
             if entry is None and len(by_model) < BY_MODEL_CAP:
-                entry = by_model[model] = {"requests": 0, "filtered": 0}
+                entry = by_model[model] = {"requests": 0, "filtered": 0, "retries": 0}
             if entry is not None:  # 键数达上限后新模型不记录，防内存膨胀
                 entry["requests"] += 1
                 entry["filtered"] += filtered
         bucket = STATS["daily"].setdefault(
             today_key(), {"requests": 0, "filtered": 0,
-                          "errors_proxy": 0, "errors_upstream": 0})
+                          "errors_proxy": 0, "errors_upstream": 0, "retries": 0})
         bucket["requests"] += 1
         bucket["filtered"] += filtered
         if error:
@@ -266,6 +314,27 @@ def _record_poison_preview(raw: bytes) -> None:
         preview = preview[:200]
     with STATS_LOCK:
         POISON_PREVIEWS.append({"ts": time.time(), "preview": preview})
+
+
+def _record_empty_retry(model=None) -> None:
+    """空流重试计数：STATS 总量 + by_model retries 维度 + 当日桶。
+    entry/桶形状必须与 _record_request 同步含 retries 键（旧持久化桶经
+    load_daily_buckets 的 _DAILY_FIELDS 清洗已补键），否则 += 直接 KeyError。"""
+    global _stats_dirty
+    with STATS_LOCK:
+        STATS["empty_retries_total"] += 1
+        if model:
+            by_model = STATS["by_model"]
+            entry = by_model.get(model)
+            if entry is None and len(by_model) < BY_MODEL_CAP:
+                entry = by_model[model] = {"requests": 0, "filtered": 0, "retries": 0}
+            if entry is not None:  # 键数达上限后新模型不记录，防内存膨胀
+                entry["retries"] += 1
+        bucket = STATS["daily"].setdefault(
+            today_key(), {"requests": 0, "filtered": 0,
+                          "errors_proxy": 0, "errors_upstream": 0, "retries": 0})
+        bucket["retries"] += 1
+        _stats_dirty = True
 
 
 def stats_snapshot() -> dict:
@@ -341,17 +410,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 fwd_headers[lk] = value
         fwd_headers["accept-encoding"] = "identity"
 
-        parsed = urllib.parse.urlparse(UPSTREAM_BASE)
-        upstream_path = parsed.path.rstrip("/") + self.path
         try:
-            if parsed.scheme == "https":
-                conn = http.client.HTTPSConnection(
-                    parsed.hostname, parsed.port, timeout=UPSTREAM_TIMEOUT)
-            else:
-                conn = http.client.HTTPConnection(
-                    parsed.hostname, parsed.port, timeout=UPSTREAM_TIMEOUT)
-            conn.request(self.command, upstream_path, body=body, headers=fwd_headers)
-            resp = conn.getresponse()
+            conn, resp = self._open_upstream(self.command, self.path, body, fwd_headers)
         except (OSError, http.client.HTTPException) as exc:
             self._reply_502(exc)
             self._log(started, 502, "error", 0, model=model)
@@ -363,8 +423,25 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         content_type = (resp.getheader("Content-Type") or "").lower()
         result = "ok" if resp.status < 400 else "upstream-err"
         if "text/event-stream" in content_type:
-            filtered = self._relay_sse(resp)
-            self._log(started, resp.status, result, filtered, model=model)
+            retried = 0
+            try:
+                filtered = self._relay_sse(resp, final=(EMPTY_RETRY_MAX < 1))
+            except _EmptyStream as exc:
+                filtered = exc.filtered  # attempt-1 已滤毒缓冲随重试丢弃，filtered 只计交付流
+                retried = 1
+                _record_empty_retry(model)
+                conn.close()
+                try:
+                    conn, resp = self._open_upstream(self.command, self.path, body, fwd_headers)
+                except (OSError, http.client.HTTPException) as retry_exc:
+                    self._reply_502(retry_exc)  # 客户端尚未收到字节，502 语义与既有路径一致
+                    self._log(started, 502, "error", 0, model=model, retried=1)
+                    _record_request(self.command, self.path, 502,
+                                    (time.time() - started) * 1000, 0, model=model, error=True)
+                    return
+                filtered = self._relay_sse(resp, final=True)
+            result = "ok" if resp.status < 400 else "upstream-err"  # 重试后按实际 resp 重算
+            self._log(started, resp.status, result, filtered, model=model, retried=retried)
             _record_request(self.command, self.path, resp.status,
                             (time.time() - started) * 1000, filtered, model=model)
         else:
@@ -374,7 +451,19 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                             (time.time() - started) * 1000, 0, model=model)
         conn.close()
 
-    def _relay_sse(self, resp: http.client.HTTPResponse) -> int:
+    def _open_upstream(self, method: str, path: str, body, fwd_headers: dict):
+        parsed = urllib.parse.urlparse(UPSTREAM_BASE)
+        upstream_path = parsed.path.rstrip("/") + path
+        if parsed.scheme == "https":
+            conn = http.client.HTTPSConnection(
+                parsed.hostname, parsed.port, timeout=UPSTREAM_TIMEOUT)
+        else:
+            conn = http.client.HTTPConnection(
+                parsed.hostname, parsed.port, timeout=UPSTREAM_TIMEOUT)
+        conn.request(method, upstream_path, body=body, headers=fwd_headers)
+        return conn, conn.getresponse()
+
+    def _send_sse_headers(self, resp) -> None:
         self.send_response(resp.status)
         for name, value in resp.getheaders():
             if name.lower() in ("content-length", "transfer-encoding", "connection"):
@@ -383,19 +472,34 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.end_headers()
         self.close_connection = True
+
+    def _relay_sse(self, resp: http.client.HTTPResponse, final: bool) -> int:
         old_timeout = self.connection.gettimeout()
         self.connection.settimeout(SEND_TIMEOUT_S)
         try:
             filtered = 0
             pending = []      # 当前 SSE record 的行缓冲（不含终结空行）
             poisoned = False  # 当前 record 内是否命中毒行
+            primed = []       # priming 阶段已滤毒缓冲的完整 record 行（含终结空行）
+            priming = True    # True = 客户端尚未收到任何字节
             while True:
                 line = resp.readline()
                 if line in (b"\n", b"\r\n", b""):
                     # b"\n"/b"\r\n" = record 终结；b"" = EOF（残留 record 同规则收尾）
+                    kinds = [sse_data_line_kind(buf_line) for buf_line in pending]
                     if poisoned:
-                        filtered += 1  # 整 record（含终结空行）丢弃，不损伤相邻字节
+                        filtered += 1  # 整 record（含终结空行）丢弃，不损伤相邻字节（priming 期不进 primed）
                         _record_poison_preview(b"".join(pending))
+                    elif priming:
+                        primed.extend(pending)
+                        if line:
+                            primed.append(line)
+                        if "content" in kinds or "done" in kinds:
+                            # 首个信号 record：补发头 + 整段前缀，转 streaming
+                            self._send_sse_headers(resp)
+                            self.wfile.write(b"".join(primed))
+                            self.wfile.flush()
+                            priming = False
                     else:
                         for buf_line in pending:
                             self.wfile.write(buf_line)
@@ -405,6 +509,13 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     pending = []
                     poisoned = False
                     if line == b"":
+                        if priming:  # EOF 仍 priming = 空流（零 record / reasoning-only 断流）
+                            if final:  # 按现状语义收尾：缓冲原样下发（含合法 [DONE] 零内容流）
+                                self._send_sse_headers(resp)
+                                self.wfile.write(b"".join(primed))
+                                self.wfile.flush()
+                            else:
+                                raise _EmptyStream(filtered, primed)
                         break
                 else:
                     if POISON_RE.match(line.rstrip(b"\r\n")):
@@ -441,10 +552,12 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(payload)
         self.close_connection = True
 
-    def _log(self, started: float, status: int, result: str, filtered: int, model=None) -> None:
-        _safe_log_stderr("REQ %s %s -> %d dur=%.1fs result=%s filtered=%d model=%s ts=%s"
+    def _log(self, started: float, status: int, result: str, filtered: int, model=None,
+             retried: int = 0) -> None:
+        _safe_log_stderr("REQ %s %s -> %d dur=%.1fs result=%s filtered=%d "
+                         "model=%s retried=%d ts=%s"
                          % (self.command, self.path, status, time.time() - started,
-                            result, filtered, model or "-",
+                            result, filtered, model or "-", retried,
                             time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime())))
 
 
@@ -926,6 +1039,7 @@ def main() -> None:
         STATS["requests_total"] = counters["requests_total"]
         STATS["filtered_total"] = counters["filtered_total"]
         STATS["errors_total"] = counters["errors_total"]
+        STATS["empty_retries_total"] = counters["empty_retries_total"]
         STATS["daily"] = daily
         _stats_dirty = False
 
