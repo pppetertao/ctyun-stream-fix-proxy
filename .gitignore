@@ -7,3 +7,6 @@ ctyun-stream-fix-proxy.json
 
 # episode worktree（pipeline 产物，不入库）
 .worktrees/
+
+# pipeline ledger/brief（episode 产物，不入库）
+.superpowers/
