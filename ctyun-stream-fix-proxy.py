@@ -755,8 +755,17 @@ footer .inner { color:var(--dim); font-size:12px; padding-top:4px; padding-botto
     <div class="card-title">按天统计（最近 14 天，新在上）</div>
     <div class="table-wrap">
     <table>
-      <thead><tr><th>日期</th><th>请求</th><th>剥行</th><th>代理错误</th><th>上游5xx</th></tr></thead>
-      <tbody id="daily-body"><tr><td class="empty" colspan="5">读取中……</td></tr></tbody>
+      <thead><tr><th>日期</th><th>请求</th><th>剥行</th><th>代理错误</th><th>上游5xx</th><th>重试</th></tr></thead>
+      <tbody id="daily-body"><tr><td class="empty" colspan="6">读取中……</td></tr></tbody>
+    </table>
+    </div>
+  </section>
+  <section class="card">
+    <div class="card-title">按天 × 模型（内存累计，重启清零）</div>
+    <div class="table-wrap">
+    <table>
+      <thead><tr><th>日期</th><th>模型</th><th>请求</th><th>剥行</th><th>重试</th></tr></thead>
+      <tbody id="daily-model-body"><tr><td class="empty" colspan="5">读取中……</td></tr></tbody>
     </table>
     </div>
   </section>
@@ -776,7 +785,8 @@ footer .inner { color:var(--dim); font-size:12px; padding-top:4px; padding-botto
 </main>
 <footer><div class="inner">
   累计与按天计数跨重启保留（每 60s 落盘，持久化于 ~/.local/etc/ctyun-stream-fix-proxy.json）；
-  按模型计数自进程启动累计，不持久化（重启清零）；
+  按模型与按天×模型计数自进程启动累计，不持久化（重启清零）；
+  按天主表含无 model 请求，各行数值 ≥「按天 × 模型」副表合计，差值即当日无 model 请求；
   最近请求/剥行流带为内存数据；「代理错误」=代理自身错误（与顶部错误数同口径），
   「上游5xx」=上游透传 status≥500（499 中断两边都不计）。页面每 2s 轮询 /api/stats；非本机修改上游需 X-Admin-Token。
 </div></footer>
@@ -909,7 +919,7 @@ function renderDaily(daily) {
   if (keys.length === 0) {
     var tr0 = el("tr");
     var td0 = el("td", "empty", "暂无按天统计");
-    td0.colSpan = 5;
+    td0.colSpan = 6;
     tr0.appendChild(td0);
     body.appendChild(tr0);
     return;
@@ -922,7 +932,38 @@ function renderDaily(daily) {
     tr.appendChild(el("td", "num", String(b.filtered)));
     tr.appendChild(el("td", "num", String(b.errors_proxy)));
     tr.appendChild(el("td", "num", String(b.errors_upstream)));
+    tr.appendChild(el("td", "num", String(b.retries || 0)));
     body.appendChild(tr);
+  }
+}
+function renderDailyByModel(dbm) {
+  var body = $("daily-model-body");
+  body.textContent = "";
+  var days = Object.keys(dbm).sort().reverse().slice(0, 14);
+  if (days.length === 0) {
+    var tr0 = el("tr");
+    var td0 = el("td", "empty", "暂无按天 × 模型统计");
+    td0.colSpan = 5;
+    tr0.appendChild(td0);
+    body.appendChild(tr0);
+    return;
+  }
+  for (var i = 0; i < days.length; i++) {
+    var models = dbm[days[i]];
+    var names = Object.keys(models);
+    names.sort(function (a, b) {
+      return (models[b].requests || 0) - (models[a].requests || 0);
+    });
+    for (var j = 0; j < names.length; j++) {
+      var ent = models[names[j]];
+      var tr = el("tr", (ent.retries || 0) > 0 ? "hit" : "");
+      tr.appendChild(el("td", "num", days[i]));
+      tr.appendChild(el("td", "", names[j]));
+      tr.appendChild(el("td", "num", String(ent.requests || 0)));
+      tr.appendChild(el("td", "num", String(ent.filtered || 0)));
+      tr.appendChild(el("td", "num", String(ent.retries || 0)));
+      body.appendChild(tr);
+    }
   }
 }
 function renderSpark(recent) {
@@ -986,6 +1027,7 @@ function poll() {
       renderModelChips(snap.by_model || {});
       renderPoison(snap.poison_previews || []);
       renderDaily(snap.daily || {});
+      renderDailyByModel(snap.daily_by_model || {});
       renderSpark(snap.recent || []);
       setConn(true);
     })
