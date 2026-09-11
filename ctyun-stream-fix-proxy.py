@@ -289,10 +289,16 @@ def _record_request(method: str, path: str, status: int, dur_ms: float,
             day_models = STATS["daily_by_model"].setdefault(today_key(), {})
             entry_dm = day_models.get(model)
             if entry_dm is None and len(day_models) < BY_MODEL_CAP:
-                entry_dm = day_models[model] = {"requests": 0, "filtered": 0, "retries": 0}
+                entry_dm = day_models[model] = {"requests": 0, "filtered": 0,
+                                                "errors_proxy": 0,
+                                                "errors_upstream": 0, "retries": 0}
             if entry_dm is not None:  # 每日独立 cap：键数达上限后新模型不记录
                 entry_dm["requests"] += 1
                 entry_dm["filtered"] += filtered
+                if error:
+                    entry_dm["errors_proxy"] += 1
+                elif status >= 500:
+                    entry_dm["errors_upstream"] += 1
         bucket = STATS["daily"].setdefault(
             today_key(), {"requests": 0, "filtered": 0,
                           "errors_proxy": 0, "errors_upstream": 0, "retries": 0})

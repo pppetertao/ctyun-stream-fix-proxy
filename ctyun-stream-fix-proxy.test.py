@@ -549,6 +549,24 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         self.assertGreaterEqual(dm_today["m-a"]["filtered"], 1)
         self.assertGreaterEqual(dm_today["m-a"]["retries"], 1,
                                 "retry attribution must land in daily_by_model")
+        # v3：dm entry 恒 5 字段 + 错误归因与 daily 总桶同口径（error→proxy，5xx→upstream）
+        self.assertEqual(
+            set(dm_today["m-a"]),
+            {"requests", "filtered", "errors_proxy", "errors_upstream", "retries"},
+            "dm entry shape must stay in sync across both creation sites")
+        mod._record_request("POST", "/dm", 502, 1.0, 0, model="m-a", error=True)
+        self.assertEqual(dm_today["m-a"]["errors_proxy"], 1,
+                         "error=True (proxy-made 502) must land in dm errors_proxy")
+        mod._record_request("POST", "/dm", 500, 1.0, 0, model="m-a")
+        self.assertEqual(dm_today["m-a"]["errors_upstream"], 1,
+                         "upstream 500 passthrough must land in dm errors_upstream")
+        before_499 = set(dm_today)
+        mod._record_request("POST", "/dm", 499, 1.0, 0)  # 499 中断 model=None
+        self.assertEqual(set(mod.STATS["daily_by_model"][today]), before_499,
+                         "499 aborted (model=None) must not enter daily_by_model")
+        self.assertEqual(dm_today["m-a"]["errors_proxy"], 1,
+                         "499 must inflate neither dm error column")
+        self.assertEqual(dm_today["m-a"]["errors_upstream"], 1)
         # 恒等式：daily 总桶 ≥ 分模型合计（差值 = 当日无 model 请求）
         for k in ("requests", "retries"):
             total = mod.STATS["daily"][today][k]
