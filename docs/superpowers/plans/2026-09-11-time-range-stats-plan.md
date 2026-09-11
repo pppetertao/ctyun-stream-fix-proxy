@@ -313,8 +313,8 @@ $ /usr/bin/python3 ctyun-stream-fix-proxy.test.py 2>&1 | tail -4
 - 主表标题 :743 `按天统计（最近 14 天，新在上）`（grep 全文件唯一）；副表标题 :752
 - footer :774-780（旧句"与顶部错误数同口径" grep 全文件唯一，:778）
 - JS：`var SOURCE_LABEL = ...`（:790）之后；`renderStats` :819-831；`renderDaily` :885-908（:888 `slice(0, 14)`）；`renderDailyByModel` :909-940（:912 `slice(0, 14)`）；`poll()` then 块 :996-1004；`poll();\nsetInterval(poll, 2000);` :1042-1043
-- 测试：`ctyun-stream-fix-proxy.test.py` `test_dashboard_html_full_page` 内 `self.assertIn("date-row", html)`（:837，方法末行）之后插入断言
-- 已确认：`slice(0, 14)` 全文件恰 2 处（:888/:912）；`最近 14 天` 在 .py 恰 1 处（:743）；测试文件无 "与顶部错误数同口径"/"最近 14 天" 断言
+- 测试：`ctyun-stream-fix-proxy.test.py` `test_dashboard_html_full_page` 内 `self.assertIn("date-row", html)`（:837，方法末行）之后插入断言；既有 `self.assertIn("剥行累计", html)`（:803）随生产 label 改名同步改写（见步骤 1 既有断言改写）
+- 已确认：`slice(0, 14)` 全文件恰 2 处（:888/:912）；`最近 14 天` 在 .py 恰 1 处（:743）；测试文件无 "与顶部错误数同口径"/"最近 14 天" 断言；`剥行累计` 在测试文件恰 1 处（:803）
 
 ### 步骤 1：测试代码先行（红）
 
@@ -338,7 +338,23 @@ $ /usr/bin/python3 ctyun-stream-fix-proxy.test.py 2>&1 | tail -4
         self.assertNotIn("与顶部错误数同口径", html)
 ```
 
-跑红（预期多条 assertIn 失败 / count=0）：
+既有断言改写（:803，同 commit——生产 label 改「剥行（所选时段）」后旧断言必红；OLD 三行上下文实测全文件各恰 1 处）：
+
+OLD:
+```python
+        self.assertIn("剥行流带", html)
+        self.assertIn("剥行累计", html)
+        self.assertIn('name="viewport"', html)
+```
+
+NEW:
+```python
+        self.assertIn("剥行流带", html)
+        self.assertIn("剥行（所选时段）", html)
+        self.assertIn('name="viewport"', html)
+```
+
+跑红（预期多条 assertIn 失败 / count=0，含改写后的 :803 断言——此时 HTML label 仍是旧文案）：
 
 ```
 $ /usr/bin/python3 ctyun-stream-fix-proxy.test.py -v 2>&1 | grep -A3 "test_dashboard_html_full_page"
@@ -566,7 +582,7 @@ setInterval(poll, 2000);
 $ /usr/bin/python3 ctyun-stream-fix-proxy.test.py 2>&1 | tail -4
 ```
 
-预期：`Ran 45 tests ... OK`，exit 0。重点零回归：`test_dashboard_html_full_page`（含新增 v4 断言块全过）、`test_recent_entries_carry_model`（`assertNotIn("by_model")` 不受影响）、既有 `colspan="6"`/`colspan="7"`/`按天统计`/`按天 × 模型` 断言仍命中。
+预期：`Ran 45 tests ... OK`，exit 0（:803 为既有断言字面改写，不增删用例，计数不变）。重点零回归：`test_dashboard_html_full_page`（含新增 v4 断言块全过、改写后 :803 断言命中新 label「剥行（所选时段）」）、`test_recent_entries_carry_model`（`assertNotIn("by_model")` 不受影响）、既有 `colspan="6"`/`colspan="7"`/`按天统计`/`按天 × 模型` 断言仍命中。
 
 ### 验收
 
