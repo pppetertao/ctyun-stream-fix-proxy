@@ -859,6 +859,12 @@ class AdminIntegrationTest(unittest.TestCase):
         self.assertGreaterEqual(
             snap["daily_by_model"][today]["deepseek-v4-pro-0813-oc"]["requests"], 1,
             "per-model daily matrix must record the SSE request")
+        # v3：dm entry 5 键经 /api/stats 透出（纯新增键，旧客户端只读 3 键不受影响）
+        dm_entry = snap["daily_by_model"][today]["deepseek-v4-pro-0813-oc"]
+        for key in ("requests", "filtered", "errors_proxy", "errors_upstream", "retries"):
+            self.assertIn(key, dm_entry)
+            self.assertIsInstance(dm_entry[key], int)
+            self.assertGreaterEqual(dm_entry[key], 0)
 
     def test_stats_counters_resume_from_persist(self) -> None:
         self.proc.terminate()
