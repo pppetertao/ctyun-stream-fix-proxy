@@ -98,7 +98,7 @@ _CFG_LOCK = threading.Lock()
 STATS_LOCK = threading.Lock()
 STATS = {"requests_total": 0, "filtered_total": 0, "errors_total": 0,
          "empty_retries_total": 0,
-         "active": 0, "by_model": {}, "daily": {}, "daily_by_model": {}}
+         "active": 0, "daily": {}, "daily_by_model": {}}
 _stats_dirty = False  # STATS_LOCK 保护：计数落盘脏标记（SIGTERM/60s 脏刷消费）
 STARTED_AT = time.time()
 RECENT_REQUESTS = collections.deque(maxlen=100)  # {"ts","method","path","status","dur_ms","filtered","model"}
@@ -286,13 +286,6 @@ def _record_request(method: str, path: str, status: int, dur_ms: float,
             STATS["errors_total"] += 1
         STATS["filtered_total"] += filtered
         if model:
-            by_model = STATS["by_model"]
-            entry = by_model.get(model)
-            if entry is None and len(by_model) < BY_MODEL_CAP:
-                entry = by_model[model] = {"requests": 0, "filtered": 0, "retries": 0}
-            if entry is not None:  # 键数达上限后新模型不记录，防内存膨胀
-                entry["requests"] += 1
-                entry["filtered"] += filtered
             day_models = STATS["daily_by_model"].setdefault(today_key(), {})
             entry_dm = day_models.get(model)
             if entry_dm is None and len(day_models) < BY_MODEL_CAP:
@@ -324,19 +317,13 @@ def _record_poison_preview(raw: bytes) -> None:
 
 
 def _record_empty_retry(model=None) -> None:
-    """空流重试计数：STATS 总量 + by_model retries 维度 + 当日桶 + daily_by_model。
+    """空流重试计数：STATS 总量 + 当日桶 + daily_by_model。
     entry/桶形状必须与 _record_request 同步含 retries 键（旧持久化桶经
     load_daily_buckets 的 _DAILY_FIELDS 清洗已补键），否则 += 直接 KeyError。"""
     global _stats_dirty
     with STATS_LOCK:
         STATS["empty_retries_total"] += 1
         if model:
-            by_model = STATS["by_model"]
-            entry = by_model.get(model)
-            if entry is None and len(by_model) < BY_MODEL_CAP:
-                entry = by_model[model] = {"requests": 0, "filtered": 0, "retries": 0}
-            if entry is not None:  # 键数达上限后新模型不记录，防内存膨胀
-                entry["retries"] += 1
             day_models = STATS["daily_by_model"].setdefault(today_key(), {})
             entry_dm = day_models.get(model)
             if entry_dm is None and len(day_models) < BY_MODEL_CAP:
@@ -353,7 +340,6 @@ def _record_empty_retry(model=None) -> None:
 def stats_snapshot() -> dict:
     with STATS_LOCK:
         snap = dict(STATS)
-        snap["by_model"] = {k: dict(v) for k, v in STATS["by_model"].items()}
         snap["daily"] = {k: dict(v) for k, v in STATS["daily"].items()}
         snap["daily_by_model"] = {
             d: {m: dict(v) for m, v in models.items()}
@@ -699,9 +685,6 @@ svg#spark { width:100%; height:64px; display:block; }
   border-radius:4px; padding:2px 8px; color:var(--amber); font-size:12px;
   text-decoration:line-through; white-space:nowrap; }
     .chip-poison .t { color:var(--dim); text-decoration:none; margin-right:6px; }
-.chip-model { flex:0 0 auto; border:1px solid var(--line); border-radius:4px;
-  padding:2px 8px; font-size:12px; white-space:nowrap; color:var(--text); }
-.chip-model .n { color:var(--amber); font-weight:700; }
 .empty { color:var(--dim); }
 .table-wrap { overflow-x:auto; }
 table { width:100%; border-collapse:collapse; font-size:13px; }
@@ -748,10 +731,6 @@ footer .inner { color:var(--dim); font-size:12px; padding-top:4px; padding-botto
     <svg id="spark" viewBox="0 0 600 64" preserveAspectRatio="none" role="img" aria-label="最近 10 分钟请求柱状图"></svg>
   </section>
   <section class="card">
-    <div class="card-title">按模型<span class="chip">自上次重启起累计，重启清零</span></div>
-    <div class="strip" id="model-chips"><span class="empty">暂无按模型统计</span></div>
-  </section>
-  <section class="card">
     <div class="card-title">按天统计（最近 14 天，新在上）</div>
     <div class="table-wrap">
     <table>
@@ -785,7 +764,7 @@ footer .inner { color:var(--dim); font-size:12px; padding-top:4px; padding-botto
 </main>
 <footer><div class="inner">
   累计与按天计数跨重启保留（每 60s 落盘，持久化于 ~/.local/etc/ctyun-stream-fix-proxy.json）；
-  按模型与按天×模型计数自进程启动累计，不持久化（重启清零）；
+  按天×模型计数自进程启动累计，不持久化（重启清零）；
   按天主表含无 model 请求，各行数值 ≥「按天 × 模型」副表合计，差值即当日无 model 请求；
   最近请求/剥行流带为内存数据；「代理错误」=代理自身错误（与顶部错误数同口径），
   「上游5xx」=上游透传 status≥500（499 中断两边都不计）。页面每 2s 轮询 /api/stats；非本机修改上游需 X-Admin-Token。
@@ -877,24 +856,6 @@ function renderRecent(list) {
     td0.colSpan = 7;
     tr0.appendChild(td0);
     body.appendChild(tr0);
-  }
-}
-function renderModelChips(byModel) {
-  var wrap = $("model-chips");
-  wrap.textContent = "";
-  var names = Object.keys(byModel);
-  if (names.length === 0) {
-    wrap.appendChild(el("span", "empty", "暂无按模型统计"));
-    return;
-  }
-  names.sort(function (a, b) { return byModel[b].requests - byModel[a].requests; });
-  for (var i = 0; i < names.length; i++) {
-    var m = byModel[names[i]];
-    var chip = el("span", "chip-model");
-    chip.appendChild(el("span", "", names[i] + " "));
-    chip.appendChild(el("span", "", m.requests + " 请求"));
-    if (m.filtered > 0) chip.appendChild(el("span", "n", " · " + m.filtered + " 剥行"));
-    wrap.appendChild(chip);
   }
 }
 function renderPoison(list) {
@@ -1024,7 +985,6 @@ function poll() {
     .then(function (snap) {
       renderStats(snap);
       renderRecent(snap.recent || []);
-      renderModelChips(snap.by_model || {});
       renderPoison(snap.poison_previews || []);
       renderDaily(snap.daily || {});
       renderDailyByModel(snap.daily_by_model || {});
