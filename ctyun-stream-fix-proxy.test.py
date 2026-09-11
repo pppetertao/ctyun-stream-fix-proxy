@@ -471,15 +471,10 @@ class ProxyDashboardUnitTest(unittest.TestCase):
             json.dump({"upstream_base": "http://x"}, fh)
         self.assertEqual(mod.load_stats_counters(legacy)["requests_total"], 0)
 
-    def test_by_model_accumulation_and_cap(self) -> None:
+    def test_daily_by_model_cap(self) -> None:
         mod = self.mod
-        mod._record_request("POST", "/c", 200, 1.0, 1, model="m-a")
-        self.assertGreaterEqual(mod.STATS["by_model"]["m-a"]["requests"], 1)
         for i in range(40):
             mod._record_request("POST", "/c", 200, 1.0, 0, model="m-%02d" % i)
-        self.assertLessEqual(len(mod.STATS["by_model"]), 32)
-        self.assertNotIn("m-39", mod.STATS["by_model"])
-        # v2：daily_by_model 每日独立 cap（口径与 by_model 全局 cap 略异，见 spec Risks）
         self.assertLessEqual(len(mod.STATS["daily_by_model"][mod.today_key()]), 32)
         self.assertNotIn("m-39", mod.STATS["daily_by_model"][mod.today_key()])
 
@@ -504,7 +499,8 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         mod = self.mod
         today = mod.today_key()
         bucket = mod.STATS["daily"].setdefault(
-            today, {"requests": 0, "filtered": 0, "errors_proxy": 0, "errors_upstream": 0})
+            today, {"requests": 0, "filtered": 0, "errors_proxy": 0,
+                    "errors_upstream": 0, "retries": 0})
         base = dict(bucket)
         err_base = mod.STATS["errors_total"]
         mod._record_request("POST", "/d1", 200, 1.0, 2)
@@ -538,6 +534,10 @@ class ProxyDashboardUnitTest(unittest.TestCase):
     def test_daily_by_model_matrix_fallback(self) -> None:
         mod = self.mod
         today = mod.today_key()
+        # 清当日桶自洽化：setUpClass 共享 mod，cap 测试可能已把当日 daily_by_model
+        # 填满 32 键，m-a 会被每日 cap 挡掉（旧序靠先跑测试放入 m-a 的跨测试
+        # 隐式耦合，改名后暴露）。
+        mod.STATS["daily_by_model"][today] = {}
         mod._record_request("POST", "/dm", 200, 1.0, 1, model="m-a")
         before = set(mod.STATS["daily_by_model"].get(today, {}))
         mod._record_request("POST", "/dm", 200, 1.0, 0)  # model=None：只进 daily 总桶
@@ -777,9 +777,8 @@ class AdminIntegrationTest(unittest.TestCase):
         # 毒行预览来自上游原始字节：动态数据禁走 innerHTML，必须 textContent
         self.assertIn("textContent", html)
         self.assertNotIn("innerHTML", html)
-        # v1.1：sparkline 剥行红柱叠加 / 按模型卡 / 模型列 / 计数持久化文案
+        # v1.1：sparkline 剥行红柱叠加 / 模型列 / 计数持久化文案
         self.assertIn("var(--err)", html)
-        self.assertIn("按模型", html)
         self.assertIn("<th>模型</th>", html)
         self.assertIn("跨重启保留", html)
         # favicon + 标题配套 meta
@@ -793,8 +792,9 @@ class AdminIntegrationTest(unittest.TestCase):
         self.assertIn("<th>重试</th>", html)
         self.assertIn('colspan="6"', html)
         self.assertIn('id="daily-model-body"', html)
-        # v1.3：按模型口径标注（自上次重启起累计，重启清零）
-        self.assertIn("自上次重启起累计", html)
+        # v2.1：按模型重启累计卡已整体移除，标题与口径标注锁定不复活
+        self.assertNotIn("自上次重启起累计", html)
+        self.assertNotIn("按模型", html)
         # v1.3：跨天日期分组（纯前端逻辑，静态断言锁定存在性，目检兜底见 Task 3）
         self.assertIn("fmtDate", html)
         self.assertIn("date-row", html)
@@ -814,9 +814,8 @@ class AdminIntegrationTest(unittest.TestCase):
         snap = json.loads(body.decode("utf-8"))
         self.assertTrue(snap["recent"])
         self.assertEqual(snap["recent"][-1]["model"], "deepseek-v4-pro-0813-oc")
-        self.assertIn("deepseek-v4-pro-0813-oc", snap["by_model"])
-        self.assertGreaterEqual(
-            snap["by_model"]["deepseek-v4-pro-0813-oc"]["requests"], 1)
+        self.assertNotIn("by_model", snap,
+                         "by_model must be removed from /api/stats snapshot")
         # v2：daily_by_model 集成（/api/stats 顶层键透出；retries 归因见单测 matrix_fallback）
         today = time.strftime("%Y-%m-%d")
         self.assertIn(today, snap["daily_by_model"])
@@ -1085,22 +1084,6 @@ class AdminIntegrationTest(unittest.TestCase):
         self.assertEqual(len(calls2), 2)
         _, body, _ = admin_get(self.proc.admin_port, "/api/stats")
         self.assertEqual(json.loads(body.decode("utf-8"))["empty_retries_total"], 6)
-
-    def test_by_model_retries_dimension(self) -> None:
-        upstream_port, calls = make_scripted_upstream()
-        self.proc.terminate()
-        self.proc.wait(timeout=5)
-        stderr_text(self.proc)
-        self.proc = start_proxy(upstream_port, free_port())
-        post_sse(self.proc.proxy_port)
-        self.assertEqual(len(calls), 2)
-        _, body, _ = admin_get(self.proc.admin_port, "/api/stats")
-        snap = json.loads(body.decode("utf-8"))
-        entry = snap["by_model"]["deepseek-v4-pro-0813-oc"]
-        self.assertGreaterEqual(entry["retries"], 1)
-        self.assertEqual(entry["requests"], 1,
-                         "retry must not double-count model requests")
-        self.assertGreaterEqual(snap["empty_retries_total"], 1)
 
 
 if __name__ == "__main__":
