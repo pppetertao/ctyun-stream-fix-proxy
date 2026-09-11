@@ -243,9 +243,9 @@ def save_stats_counters(path: str) -> None:
     with STATS_LOCK:
         counters = {k: STATS[k] for k in ("requests_total", "filtered_total", "errors_total",
                                           "empty_retries_total")}
-        daily = {k: dict(v) for k, v in STATS["daily"].items()}
+        _prune_daily(STATS["daily"])           # 内存态原地 prune（副本 prune 修不了内存增长）
         _prune_daily(STATS["daily_by_model"])  # 内存态原地 prune（副本 prune 修不了内存增长）
-    _prune_daily(daily)
+        daily = {k: dict(v) for k, v in STATS["daily"].items()}  # prune 后拷贝：磁盘与内存一致
     with _CFG_LOCK:
         base = UPSTREAM_BASE
     directory = os.path.dirname(path)
