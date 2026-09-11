@@ -696,6 +696,81 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         self.assertEqual(buckets["2026-01-02"]["requests"], 5)
         self.assertEqual(buckets["2026-01-02"]["errors_upstream"], 2)
 
+    def test_daily_by_model_persist_roundtrip(self) -> None:
+        mod = self.mod
+        tmp = tempfile.mkdtemp(prefix="ctyun-proxy-unit7-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        path = os.path.join(tmp, "settings.json")
+        orig_dbm = mod.STATS["daily_by_model"]
+        try:
+            # 用例 1：save→load roundtrip 全等（main() 重启恢复路径的等价操作序列）
+            matrix = {
+                "2026-01-02": {
+                    "m1": {"requests": 3, "filtered": 5, "errors_proxy": 1,
+                           "errors_upstream": 2, "retries": 0},
+                    "m2": {"requests": 7, "filtered": 0, "errors_proxy": 0,
+                           "errors_upstream": 0, "retries": 4}},
+                "2026-01-05": {
+                    "m1": {"requests": 1, "filtered": 0, "errors_proxy": 0,
+                           "errors_upstream": 0, "retries": 0}}}
+            mod.STATS["daily_by_model"] = matrix
+            mod.save_stats_counters(path)
+            self.assertEqual(mod.load_daily_by_model_buckets(path), matrix,
+                             "save->load roundtrip must restore the matrix verbatim")
+        finally:
+            mod.STATS["daily_by_model"] = orig_dbm
+        # 用例 2：legacy 文件无 daily_by_model 键 → {}
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"upstream_base": "http://x",
+                       "stats": {"requests_total": 1}}, fh)
+        self.assertEqual(mod.load_daily_by_model_buckets(path), {},
+                         "legacy file without daily_by_model key must yield {}")
+        # 用例 3：损坏结构逐项容错（顶层非 dict / 日期桶非 dict / entry 非 dict / 坏字段→0）
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"stats": {"daily_by_model": "not-a-dict"}}, fh)
+        self.assertEqual(mod.load_daily_by_model_buckets(path), {},
+                         "non-dict daily_by_model must yield {}")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"stats": {"daily_by_model": {
+                "2026-01-01": "bad",
+                "2026-01-02": {"m1": "bad",
+                               "m2": {"requests": 5, "filtered": -1,
+                                      "errors_proxy": "x",
+                                      "errors_upstream": 2}}}}}, fh)
+        self.assertEqual(mod.load_daily_by_model_buckets(path),
+                         {"2026-01-02": {"m2": {"requests": 5, "filtered": 0,
+                                                "errors_proxy": 0,
+                                                "errors_upstream": 2, "retries": 0}}},
+                         "non-dict bucket/entry must be skipped; bad fields coerced to 0")
+        # 用例 4：非 ISO 日期 key 跳过（round-trip 校验，版本无关）
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"stats": {"daily_by_model": {
+                "20260101": {"m1": {"requests": 1, "filtered": 0,
+                                    "errors_proxy": 0, "errors_upstream": 0, "retries": 0}},
+                "not-a-date": {"m1": {"requests": 1, "filtered": 0,
+                                      "errors_proxy": 0, "errors_upstream": 0, "retries": 0}},
+                "2026-01-03": {"m1": {"requests": 1}}}}}, fh)
+        dbm = mod.load_daily_by_model_buckets(path)
+        self.assertEqual(set(dbm), {"2026-01-03"},
+                         "non-ISO date keys must be skipped")
+        self.assertEqual(dbm["2026-01-03"]["m1"],
+                         {"requests": 1, "filtered": 0, "errors_proxy": 0,
+                          "errors_upstream": 0, "retries": 0},
+                         "missing fields must be filled with 0")
+        # 用例 5：单日 40 模型 → 读回恰 32（文件出现序前 32）
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"stats": {"daily_by_model": {"2026-01-04": {
+                "m%02d" % i: {"requests": i} for i in range(40)}}}}, fh)
+        dbm = mod.load_daily_by_model_buckets(path)
+        self.assertEqual(len(dbm["2026-01-04"]), 32,
+                         "model count must be capped at BY_MODEL_CAP on load")
+        self.assertIn("m31", dbm["2026-01-04"],
+                      "32nd model in file order must survive the cap")
+        self.assertNotIn("m32", dbm["2026-01-04"],
+                         "models beyond the cap must be dropped")
+        self.assertEqual(dbm["2026-01-04"]["m31"]["requests"], 31,
+                         "surviving entries must keep their values")
+
     def test_daily_prune_on_save(self) -> None:
         mod = self.mod
         tmp = tempfile.mkdtemp(prefix="ctyun-proxy-unit4-")

@@ -303,6 +303,37 @@ def load_daily_buckets(path: str) -> dict:
     return out
 
 
+def load_daily_by_model_buckets(path: str) -> dict:
+    """读日期→模型→_DAILY_FIELDS 矩阵；缺/损坏/legacy 无 daily_by_model 键 → {}。"""
+    stats = _load_persist_file(path).get("stats")
+    raw = stats.get("daily_by_model") if isinstance(stats, dict) else None
+    if not isinstance(raw, dict):
+        return {}
+    out = {}
+    for key, models in raw.items():
+        # 外层 ISO 日期容错：fromisoformat + round-trip（拒 "20260101"/"2026-1-1"
+        # 等非规范形；_prune_daily 依赖 ISO 字典序排序，坏 key 必须挡在内存外）
+        try:
+            d = datetime.date.fromisoformat(key)
+        except (ValueError, TypeError):
+            continue
+        if str(d) != key or not isinstance(models, dict):
+            continue
+        bucket = {}
+        for model, entry in models.items():
+            # 内层逐模型清洗 + BY_MODEL_CAP 截断：按文件出现序保留前 32，与运行时
+            # "len < BY_MODEL_CAP 才插新键"（_record_request/_record_empty_retry）语义对齐
+            if not isinstance(entry, dict) or len(bucket) >= BY_MODEL_CAP:
+                continue
+            clean = {}
+            for field in _DAILY_FIELDS:  # 同 load_daily_buckets 逐字段规则
+                value = entry.get(field)
+                clean[field] = value if isinstance(value, int) and value >= 0 else 0
+            bucket[model] = clean
+        out[key] = bucket
+    return out
+
+
 def flush_stats_if_dirty(path: str) -> None:
     global _stats_dirty
     with STATS_LOCK:
@@ -1183,12 +1214,14 @@ def main() -> None:
         os.environ.get("CTYUN_UPSTREAM_BASE"), PERSIST_PATH)
     counters = load_stats_counters(PERSIST_PATH)  # 累计计数跨重启续算
     daily = load_daily_buckets(PERSIST_PATH)      # 按天分桶跨重启续算
+    daily_by_model = load_daily_by_model_buckets(PERSIST_PATH)  # 按天×模型矩阵跨重启续算
     with STATS_LOCK:
         STATS["requests_total"] = counters["requests_total"]
         STATS["filtered_total"] = counters["filtered_total"]
         STATS["errors_total"] = counters["errors_total"]
         STATS["empty_retries_total"] = counters["empty_retries_total"]
         STATS["daily"] = daily
+        STATS["daily_by_model"] = daily_by_model
         _stats_dirty = False
 
     def _on_signal(signum, frame):
