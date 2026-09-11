@@ -855,7 +855,7 @@ footer .inner { color:var(--dim); font-size:12px; padding-top:4px; padding-botto
     </div>
   </section>
   <section class="card">
-    <div class="card-title">按天 × 模型（<span id="daily-model-title-range">近7天</span>，内存累计，重启清零）</div>
+    <div class="card-title">按天 × 模型（<span id="daily-model-title-range">近7天</span>，跨重启保留（每 60s 落盘））</div>
     <div class="table-wrap">
     <table>
       <thead><tr><th>日期</th><th>模型</th><th>请求</th><th>剥行</th><th>代理错误</th><th>上游5xx</th><th>重试</th></tr></thead>
@@ -882,7 +882,7 @@ footer .inner { color:var(--dim); font-size:12px; padding-top:4px; padding-botto
   错误数=该时段内「代理错误+上游5xx」合计；活跃连接恒为实时值，不随时间段变化；
   累计与按天计数跨重启保留（每 60s 落盘，持久化于 ~/.local/etc/ctyun-stream-fix-proxy.json，
   日桶保留 90 天，覆盖上月+当月最远 62 天回溯）；
-  按天×模型计数自进程启动累计，不持久化（重启清零）；
+  按天×模型计数同 daily 口径跨重启保留（90 天 prune，副表数值 ≤ 主表，差值=当日无 model 请求，见下行）；
   按天主表含无 model 请求，各行数值 ≥「按天 × 模型」副表合计，差值即当日无 model 请求；
   最近请求/剥行流带为内存数据；「代理错误」=代理自身错误，「上游5xx」=上游透传 status≥500
   （499 中断两边都不计）。页面每 2s 轮询 /api/stats，切换时间段用缓存零请求重渲染；非本机修改上游需 X-Admin-Token。

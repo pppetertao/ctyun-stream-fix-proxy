@@ -66,7 +66,7 @@ launchctl kickstart -k gui/$UID/com.ctyun-stream-fix-proxy
 /usr/bin/python3 ctyun-stream-fix-proxy.test.py
 ```
 
-45 个用例。**必须用 `/usr/bin/python3`**：Homebrew 的 Python 3.14 `http.server.HTTPServer` 构造会挂死（进程存活但不 LISTEN、零报错）。
+50 个用例。**必须用 `/usr/bin/python3`**：Homebrew 的 Python 3.14 `http.server.HTTPServer` 构造会挂死（进程存活但不 LISTEN、零报错）。
 
 ## 计数口径
 
@@ -74,7 +74,7 @@ launchctl kickstart -k gui/$UID/com.ctyun-stream-fix-proxy
 |----------|------|--------|
 | 顶部「请求数 / 剥行 / 错误」 | 按所选时间段聚合（近3/近7天含今日滑动窗口；本月/上月自然月；错误=代理错误+上游5xx 合计） | 是（daily 桶跨重启） |
 | 「活跃连接」 | 实时 gauge，不随时间段变化 | 否 |
-| 「按天统计」「按天 × 模型」 | 随所选时间段过滤（最远回溯=上月+当月 ≤62 天 < 90 天 retention） | 主表是（90 天 prune）/ 副表否（重启清零） |
+| 「按天统计」「按天 × 模型」 | 随所选时间段过滤（最远回溯=上月+当月 ≤62 天 < 90 天 retention） | 主表/副表均是（90 天 prune） |
 | 「最近请求」「剥行流带」 | 最近 100 / 20 条内存窗口 | 否 |
 
 ## License
