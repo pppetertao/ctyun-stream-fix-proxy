@@ -11,6 +11,7 @@ CTYUN_PERSIST_PATH / CTYUN_ADMIN_TOKEN 环境变量为测试与部署 seam。
 
 import base64
 import collections
+import datetime
 import hmac
 import http.client
 import http.server
@@ -43,6 +44,7 @@ POST_BODY_LIMIT = 8192
 FLUSH_INTERVAL_S = 60
 BY_MODEL_CAP = 32
 DAILY_RETENTION_DAYS = 90  # daily 分桶滚动保留天数（save 时 prune）
+RANGE_KEYS = ("3d", "7d", "mtd", "last_month")  # 时间维度 tab 键序（快照/dashboard 共用）
 POISON_RE = re.compile(rb"^data:\s*null\s*$")
 DONE_RE = re.compile(rb"^data:\s*\[DONE\]\s*$")
 EMPTY_RETRY_MAX = int(os.environ.get("CTYUN_EMPTY_RETRY", "1"))  # env seam，惯例同 SEND_TIMEOUT_S
@@ -160,6 +162,59 @@ def extract_model(body):
 def today_key() -> str:
     """当日日期桶 key（本地时区）；模块级函数便于测试 patch 模拟跨天。"""
     return time.strftime("%Y-%m-%d", time.localtime())
+
+
+def range_bounds(today: str, range_key: str) -> tuple:
+    """时间维度窗口 [start, end]（ISO 日期闭区间；时区口径由调用方传入的 today 决定）。
+
+    3d/7d = 含今日的滑动窗口；mtd = [当月1日, today]；last_month = 上个自然月整月。
+    ISO 日期字符串字典序即时间序（_prune_daily 同性质）。非法 range_key → ValueError。
+    """
+    d = datetime.date.fromisoformat(today)
+    if range_key == "3d":
+        start, end = d - datetime.timedelta(days=2), d
+    elif range_key == "7d":
+        start, end = d - datetime.timedelta(days=6), d
+    elif range_key == "mtd":
+        start, end = d.replace(day=1), d
+    elif range_key == "last_month":
+        last_month_end = d.replace(day=1) - datetime.timedelta(days=1)
+        start, end = last_month_end.replace(day=1), last_month_end
+    else:
+        raise ValueError("unknown range_key: %r" % (range_key,))
+    return (start.isoformat(), end.isoformat())
+
+
+def aggregate_daily_range(daily: dict, start: str, end: str) -> dict:
+    """窗口 [start, end]（含端点）内 daily 桶逐字段求和；缺字段按 0。
+
+    返回 6 键 dict：_DAILY_FIELDS 五字段 + days=命中桶数。
+    """
+    out = {field: 0 for field in _DAILY_FIELDS}
+    days = 0
+    for key, bucket in daily.items():
+        if not (start <= key <= end):
+            continue
+        days += 1
+        for field in _DAILY_FIELDS:
+            out[field] += bucket.get(field, 0)
+    out["days"] = days
+    return out
+
+
+def range_stats(daily: dict, today: str = None) -> dict:
+    """四个时间维度的聚合计划：{"stats": {key: aggregate}, "bounds": {key: [start, end]}}。
+
+    today 缺省 today_key()（测试可注入固定日期）；stats_snapshot 据此填充加性字段。
+    """
+    if today is None:
+        today = today_key()
+    stats, bounds = {}, {}
+    for range_key in RANGE_KEYS:
+        start, end = range_bounds(today, range_key)
+        stats[range_key] = aggregate_daily_range(daily, start, end)
+        bounds[range_key] = [start, end]
+    return {"stats": stats, "bounds": bounds}
 
 
 def _prune_daily(daily: dict) -> dict:

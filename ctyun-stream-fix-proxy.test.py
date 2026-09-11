@@ -495,6 +495,68 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         self.assertGreaterEqual(snap["recent"][-1]["filtered"], 1)
         self.assertIn("data:null", snap["poison_previews"][-1]["preview"])
 
+    def test_range_bounds_calendar_edges(self) -> None:
+        f = self.mod.range_bounds
+        # 月初切片：mtd 仅当日；上月=完整 2 月（2026 非闰年 28 天）
+        self.assertEqual(f("2026-03-01", "mtd"), ("2026-03-01", "2026-03-01"))
+        self.assertEqual(f("2026-03-01", "last_month"), ("2026-02-01", "2026-02-28"))
+        # 跨年：1 月初的上月 = 上年 12 月整月
+        self.assertEqual(f("2026-01-01", "last_month"), ("2025-12-01", "2025-12-31"))
+        # 闰日 today：mtd 含 02-29；闰年 2 月整月（2024 闰）
+        self.assertEqual(f("2024-02-29", "mtd"), ("2024-02-01", "2024-02-29"))
+        self.assertEqual(f("2024-03-31", "last_month"), ("2024-02-01", "2024-02-29"))
+        # 滑动窗口含今日
+        self.assertEqual(f("2026-03-01", "3d"), ("2026-02-27", "2026-03-01"))
+        self.assertEqual(f("2026-03-01", "7d"), ("2026-02-23", "2026-03-01"))
+        with self.assertRaises(ValueError):
+            f("2026-03-01", "30d")
+
+    def test_aggregate_daily_range_sums_and_days(self) -> None:
+        f = self.mod.aggregate_daily_range
+        daily = {
+            "2026-02-01": {"requests": 3, "filtered": 1, "errors_proxy": 0,
+                           "errors_upstream": 1, "retries": 0},
+            "2026-02-02": {"requests": 5},  # 缺字段桶：缺按 0
+            "2026-03-01": {"requests": 7, "filtered": 2, "errors_proxy": 1,
+                           "errors_upstream": 0, "retries": 4},  # 窗口外
+        }
+        out = f(daily, "2026-02-01", "2026-02-28")
+        self.assertEqual(out, {"requests": 8, "filtered": 1, "errors_proxy": 0,
+                               "errors_upstream": 1, "retries": 0, "days": 2})
+        # 空窗口：全 0 + days=0
+        self.assertEqual(f(daily, "2025-01-01", "2025-01-31"),
+                         {"requests": 0, "filtered": 0, "errors_proxy": 0,
+                          "errors_upstream": 0, "retries": 0, "days": 0})
+        # 端点闭合：start/end 当天都计入
+        self.assertEqual(f(daily, "2026-02-02", "2026-02-02")["days"], 1)
+        self.assertEqual(f(daily, "2026-02-02", "2026-02-02")["requests"], 5)
+
+    def test_range_stats_all_four_keys(self) -> None:
+        mod = self.mod
+        daily = {"2026-02-28": {"requests": 2, "filtered": 1, "errors_proxy": 0,
+                                "errors_upstream": 0, "retries": 0},
+                 "2026-03-01": {"requests": 4, "filtered": 0, "errors_proxy": 1,
+                                "errors_upstream": 0, "retries": 0}}
+        plan = mod.range_stats(daily, today="2026-03-01")
+        self.assertEqual(set(plan), {"stats", "bounds"})
+        self.assertEqual(set(plan["stats"]), set(mod.RANGE_KEYS),
+                         "range_stats must cover exactly the four RANGE_KEYS")
+        self.assertEqual(set(plan["bounds"]), set(mod.RANGE_KEYS))
+        for key in mod.RANGE_KEYS:
+            self.assertEqual(set(plan["stats"][key]),
+                             {"requests", "filtered", "errors_proxy",
+                              "errors_upstream", "retries", "days"})
+            self.assertEqual(len(plan["bounds"][key]), 2)
+        # 3d 窗口 = [02-27, 03-01]：两天桶都在窗内
+        self.assertEqual(plan["stats"]["3d"]["requests"], 6)
+        self.assertEqual(plan["stats"]["3d"]["days"], 2)
+        # mtd 窗口 = [03-01, 03-01]：仅当日桶
+        self.assertEqual(plan["stats"]["mtd"]["requests"], 4)
+        self.assertEqual(plan["stats"]["mtd"]["days"], 1)
+        # last_month = [02-01, 02-28]：仅 02-28 桶
+        self.assertEqual(plan["stats"]["last_month"]["requests"], 2)
+        self.assertEqual(plan["bounds"]["7d"], ["2026-02-23", "2026-03-01"])
+
     def test_daily_bucket_accumulation_and_dual_error_semantics(self) -> None:
         mod = self.mod
         today = mod.today_key()
