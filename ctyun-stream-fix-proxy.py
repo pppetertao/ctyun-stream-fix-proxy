@@ -98,7 +98,7 @@ _CFG_LOCK = threading.Lock()
 STATS_LOCK = threading.Lock()
 STATS = {"requests_total": 0, "filtered_total": 0, "errors_total": 0,
          "empty_retries_total": 0,
-         "active": 0, "by_model": {}, "daily": {}}
+         "active": 0, "by_model": {}, "daily": {}, "daily_by_model": {}}
 _stats_dirty = False  # STATS_LOCK 保护：计数落盘脏标记（SIGTERM/60s 脏刷消费）
 STARTED_AT = time.time()
 RECENT_REQUESTS = collections.deque(maxlen=100)  # {"ts","method","path","status","dur_ms","filtered","model"}
@@ -293,6 +293,13 @@ def _record_request(method: str, path: str, status: int, dur_ms: float,
             if entry is not None:  # 键数达上限后新模型不记录，防内存膨胀
                 entry["requests"] += 1
                 entry["filtered"] += filtered
+            day_models = STATS["daily_by_model"].setdefault(today_key(), {})
+            entry_dm = day_models.get(model)
+            if entry_dm is None and len(day_models) < BY_MODEL_CAP:
+                entry_dm = day_models[model] = {"requests": 0, "filtered": 0, "retries": 0}
+            if entry_dm is not None:  # 每日独立 cap：键数达上限后新模型不记录
+                entry_dm["requests"] += 1
+                entry_dm["filtered"] += filtered
         bucket = STATS["daily"].setdefault(
             today_key(), {"requests": 0, "filtered": 0,
                           "errors_proxy": 0, "errors_upstream": 0, "retries": 0})
@@ -317,7 +324,7 @@ def _record_poison_preview(raw: bytes) -> None:
 
 
 def _record_empty_retry(model=None) -> None:
-    """空流重试计数：STATS 总量 + by_model retries 维度 + 当日桶。
+    """空流重试计数：STATS 总量 + by_model retries 维度 + 当日桶 + daily_by_model。
     entry/桶形状必须与 _record_request 同步含 retries 键（旧持久化桶经
     load_daily_buckets 的 _DAILY_FIELDS 清洗已补键），否则 += 直接 KeyError。"""
     global _stats_dirty
@@ -330,6 +337,12 @@ def _record_empty_retry(model=None) -> None:
                 entry = by_model[model] = {"requests": 0, "filtered": 0, "retries": 0}
             if entry is not None:  # 键数达上限后新模型不记录，防内存膨胀
                 entry["retries"] += 1
+            day_models = STATS["daily_by_model"].setdefault(today_key(), {})
+            entry_dm = day_models.get(model)
+            if entry_dm is None and len(day_models) < BY_MODEL_CAP:
+                entry_dm = day_models[model] = {"requests": 0, "filtered": 0, "retries": 0}
+            if entry_dm is not None:  # 每日独立 cap：键数达上限后新模型不记录
+                entry_dm["retries"] += 1
         bucket = STATS["daily"].setdefault(
             today_key(), {"requests": 0, "filtered": 0,
                           "errors_proxy": 0, "errors_upstream": 0, "retries": 0})
@@ -342,6 +355,9 @@ def stats_snapshot() -> dict:
         snap = dict(STATS)
         snap["by_model"] = {k: dict(v) for k, v in STATS["by_model"].items()}
         snap["daily"] = {k: dict(v) for k, v in STATS["daily"].items()}
+        snap["daily_by_model"] = {
+            d: {m: dict(v) for m, v in models.items()}
+            for d, models in STATS["daily_by_model"].items()}
         snap["recent"] = list(RECENT_REQUESTS)
         snap["poison_previews"] = list(POISON_PREVIEWS)
     snap["uptime_s"] = int(time.time() - STARTED_AT)
