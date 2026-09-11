@@ -557,6 +557,30 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         self.assertEqual(plan["stats"]["last_month"]["requests"], 2)
         self.assertEqual(plan["bounds"]["7d"], ["2026-02-23", "2026-03-01"])
 
+    def test_stats_snapshot_includes_range_stats(self) -> None:
+        mod = self.mod
+        today = mod.today_key()
+        bucket = mod.STATS["daily"].setdefault(
+            today, {"requests": 0, "filtered": 0, "errors_proxy": 0,
+                    "errors_upstream": 0, "retries": 0})
+        base = dict(bucket)
+        mod._record_request("POST", "/rs", 200, 1.0, 1)
+        snap = mod.stats_snapshot()
+        self.assertEqual(bucket["requests"], base["requests"] + 1)
+        self.assertEqual(set(snap["range_stats"]), set(mod.RANGE_KEYS))
+        self.assertEqual(set(snap["range_bounds"]), set(mod.RANGE_KEYS))
+        # 当日桶落在含今日的窗口内：7d/mtd 的 requests 恰等于窗内桶求和（独立 oracle：
+        # 测试侧自行按 bounds 字符串过滤 snap["daily"] 求和，不复用被测聚合实现）
+        for key in ("7d", "mtd"):
+            start, end = snap["range_bounds"][key]
+            self.assertTrue(start <= today <= end,
+                            "%s window must include today" % key)
+            expected = sum(b.get("requests", 0)
+                           for k, b in snap["daily"].items() if start <= k <= end)
+            self.assertEqual(snap["range_stats"][key]["requests"], expected)
+            self.assertGreaterEqual(snap["range_stats"][key]["requests"],
+                                    base["requests"] + 1)
+
     def test_daily_bucket_accumulation_and_dual_error_semantics(self) -> None:
         mod = self.mod
         today = mod.today_key()

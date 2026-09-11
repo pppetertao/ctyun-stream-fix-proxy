@@ -413,6 +413,9 @@ def stats_snapshot() -> dict:
     snap["uptime_s"] = int(time.time() - STARTED_AT)
     snap["upstream_base"] = UPSTREAM_BASE
     snap["upstream_source"] = _upstream_source
+    plan = range_stats(snap["daily"])  # 锁外基于副本计算（4×≤31 桶求和 <1ms），不拉长持锁
+    snap["range_stats"] = plan["stats"]
+    snap["range_bounds"] = plan["bounds"]
     return snap
 
 
