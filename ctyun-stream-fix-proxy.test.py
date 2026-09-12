@@ -9,6 +9,7 @@
   ⑤对照组 poison=False filtered=0 且与直连一致
 """
 
+import collections
 import http.client
 import importlib.util
 import json
@@ -480,20 +481,33 @@ class ProxyDashboardUnitTest(unittest.TestCase):
 
     def test_stats_snapshot_shape(self) -> None:
         mod = self.mod
+        mod._record_request("POST", "/x-err", 502, 1.0, 0, error=True)
         mod._record_request("POST", "/x", 200, 12.0, 1)
         mod._record_poison_preview(b"data:null")
         snap = mod.stats_snapshot()
         for key in ("requests_total", "filtered_total", "errors_total",
                     "empty_retries_total", "active",
                     "uptime_s", "upstream_base", "upstream_source",
-                    "recent", "poison_previews"):
+                    "recent", "poison_previews", "events"):
             self.assertIn(key, snap)
         self.assertIsInstance(snap["uptime_s"], int)
         self.assertIsInstance(snap["recent"], list)
         self.assertIsInstance(snap["poison_previews"], list)
+        self.assertIsInstance(snap["events"], list)
         self.assertGreaterEqual(snap["filtered_total"], 1)
         self.assertGreaterEqual(snap["recent"][-1]["filtered"], 1)
         self.assertIn("data:null", snap["poison_previews"][-1]["preview"])
+        # events：error 请求必入流；元素含 ts/kind；oldest→newest 与 recent 同序
+        self.assertGreaterEqual(len(snap["events"]), 1)
+        for e in snap["events"]:
+            self.assertIn("ts", e)
+            self.assertIn("kind", e)
+        # 副本断言（对齐 test_stats_snapshot_daily_is_copy 模式）：
+        # 改 snap["events"] 不得影响模块级 EVENTS
+        n_before = len(mod.EVENTS)
+        snap["events"].append({"ts": 0, "kind": "proxy", "model": None, "status": 0})
+        self.assertEqual(len(mod.EVENTS), n_before,
+                         "snapshot events must be a copy, not the live deque")
 
     def test_range_bounds_calendar_edges(self) -> None:
         f = self.mod.range_bounds
@@ -672,6 +686,38 @@ class ProxyDashboardUnitTest(unittest.TestCase):
             set(mod.STATS["daily_by_model"]["2026-01-03"]["m-retry-only"]),
             {"requests", "filtered", "errors_proxy", "errors_upstream", "retries"},
             "empty-retry creation site must keep dm entry shape in sync")
+
+    def test_events_record_and_cap(self) -> None:
+        mod = self.mod
+        orig_events = mod.EVENTS
+        mod.EVENTS = collections.deque(maxlen=100)
+        try:
+            # 分类优先级与计数口径一致：error=True → proxy（status≥500 时 error 胜出）；
+            # 无 error 的 500/502 → upstream；_record_empty_retry → retry
+            mod._record_request("POST", "/e1", 502, 1.0, 0, error=True)
+            mod._record_request("POST", "/e2", 500, 1.0, 0)
+            mod._record_empty_retry("m-a")
+            snap = mod.stats_snapshot()
+            self.assertEqual([e["kind"] for e in snap["events"]],
+                             ["proxy", "upstream", "retry"])
+            self.assertEqual(snap["events"][0]["status"], 502)
+            self.assertIsNone(snap["events"][1]["model"])
+            self.assertEqual(snap["events"][2]["model"], "m-a")
+            self.assertIsNone(snap["events"][2]["status"])
+            for e in snap["events"]:
+                self.assertIn("ts", e)
+                self.assertIsInstance(e["ts"], float)
+            # cap：再记 120 条 → 恰留最新 100，最老（proxy/upstream）被丢
+            for _ in range(120):
+                mod._record_empty_retry()
+            snap = mod.stats_snapshot()
+            self.assertEqual(len(snap["events"]), 100)
+            self.assertEqual(len(mod.EVENTS), 100)
+            kinds = [e["kind"] for e in snap["events"]]
+            self.assertNotIn("proxy", kinds, "oldest events must be dropped by maxlen")
+            self.assertNotIn("upstream", kinds)
+        finally:
+            mod.EVENTS = orig_events
 
     def test_daily_persist_roundtrip_legacy_and_corrupt(self) -> None:
         mod = self.mod

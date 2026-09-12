@@ -105,6 +105,9 @@ _stats_dirty = False  # STATS_LOCK 保护：计数落盘脏标记（SIGTERM/60s 
 STARTED_AT = time.time()
 RECENT_REQUESTS = collections.deque(maxlen=100)  # {"ts","method","path","status","dur_ms","filtered","model"}
 POISON_PREVIEWS = collections.deque(maxlen=20)   # {"ts","preview"} 最近剥除的 record 预览
+EVENTS = collections.deque(maxlen=100)  # {"ts","kind":"proxy"|"upstream"|"retry","model","status"}
+# 单一全局事件流（kind 区分）而非按 (day,model,kind) 分环：per-key 环形几十个 deque
+# 持久化/清洗成本高，单流 maxlen=100 硬上界等价满足"每 key 有界"，tooltip 按需过滤。
 
 
 def valid_upstream_url(url: str) -> bool:
@@ -400,6 +403,11 @@ def _record_request(method: str, path: str, status: int, dur_ms: float,
             bucket["errors_proxy"] += 1
         elif status >= 500:
             bucket["errors_upstream"] += 1
+        if error or status >= 500:
+            # 分类优先级与计数一致（error 分支胜过 status>=500）：error=True → proxy，
+            # 其余 status>=500 → upstream；499 中断两边都不入流（同计数口径）。
+            EVENTS.append({"ts": time.time(), "kind": "proxy" if error else "upstream",
+                           "model": model, "status": status})
         RECENT_REQUESTS.append({"ts": time.time(), "method": method, "path": path,
                                 "status": status, "dur_ms": round(dur_ms, 1),
                                 "filtered": filtered, "model": model})
@@ -435,6 +443,7 @@ def _record_empty_retry(model=None) -> None:
             today_key(), {"requests": 0, "filtered": 0,
                           "errors_proxy": 0, "errors_upstream": 0, "retries": 0})
         bucket["retries"] += 1
+        EVENTS.append({"ts": time.time(), "kind": "retry", "model": model, "status": None})
         _stats_dirty = True
 
 
@@ -447,6 +456,7 @@ def stats_snapshot() -> dict:
             for d, models in STATS["daily_by_model"].items()}
         snap["recent"] = list(RECENT_REQUESTS)
         snap["poison_previews"] = list(POISON_PREVIEWS)
+        snap["events"] = [dict(e) for e in EVENTS]  # 逐条浅拷贝（对齐 daily 模式），oldest→newest
     snap["uptime_s"] = int(time.time() - STARTED_AT)
     snap["upstream_base"] = UPSTREAM_BASE
     snap["upstream_source"] = _upstream_source
