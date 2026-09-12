@@ -251,6 +251,7 @@ def save_stats_counters(path: str) -> None:
         daily = {k: dict(v) for k, v in STATS["daily"].items()}  # prune 后拷贝：磁盘与内存一致
         daily_by_model = {d: {m: dict(v) for m, v in models.items()}
                           for d, models in STATS["daily_by_model"].items()}
+        events = [dict(e) for e in EVENTS]  # 逐条浅拷贝：磁盘与内存一致（≤100 条）
     with _CFG_LOCK:
         base = UPSTREAM_BASE
     directory = os.path.dirname(path)
@@ -259,7 +260,8 @@ def save_stats_counters(path: str) -> None:
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump({"upstream_base": base,
-                   "stats": dict(counters, daily=daily, daily_by_model=daily_by_model)},
+                   "stats": dict(counters, daily=daily, daily_by_model=daily_by_model,
+                                 events=events)},
                   fh, ensure_ascii=False)
     os.replace(tmp, path)
 
@@ -335,6 +337,31 @@ def load_daily_by_model_buckets(path: str) -> dict:
             bucket[model] = clean
         out[key] = bucket
     return out
+
+
+def load_stats_events(path: str) -> list:
+    """读 stats.events（oldest→newest，≤100 条）；缺/损坏/legacy 无键 → []。"""
+    stats = _load_persist_file(path).get("stats")
+    raw = stats.get("events") if isinstance(stats, dict) else None
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        kind, ts = entry.get("kind"), entry.get("ts")
+        model, status = entry.get("model"), entry.get("status")
+        if kind not in ("proxy", "upstream", "retry"):
+            continue
+        if isinstance(ts, bool) or not isinstance(ts, (int, float)) or ts < 0:
+            continue
+        if model is not None and (not isinstance(model, str) or not model or len(model) > 200):
+            continue
+        if status is not None and (isinstance(status, bool) or not isinstance(status, int)
+                                   or not 100 <= status <= 599):
+            continue
+        out.append({"ts": ts, "kind": kind, "model": model, "status": status})
+    return out[-100:]  # 与 deque maxlen 对齐，只留最新
 
 
 def flush_stats_if_dirty(path: str) -> None:
@@ -1225,6 +1252,7 @@ def main() -> None:
     counters = load_stats_counters(PERSIST_PATH)  # 累计计数跨重启续算
     daily = load_daily_buckets(PERSIST_PATH)      # 按天分桶跨重启续算
     daily_by_model = load_daily_by_model_buckets(PERSIST_PATH)  # 按天×模型矩阵跨重启续算
+    events = load_stats_events(PERSIST_PATH)      # 错误/重试事件流跨重启续算
     with STATS_LOCK:
         STATS["requests_total"] = counters["requests_total"]
         STATS["filtered_total"] = counters["filtered_total"]
@@ -1232,6 +1260,8 @@ def main() -> None:
         STATS["empty_retries_total"] = counters["empty_retries_total"]
         STATS["daily"] = daily
         STATS["daily_by_model"] = daily_by_model
+        EVENTS.clear()
+        EVENTS.extend(events)  # 先 clear 后 extend：防 deque 残留叠加
         _stats_dirty = False
 
     def _on_signal(signum, frame):

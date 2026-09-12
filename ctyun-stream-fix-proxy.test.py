@@ -742,6 +742,56 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         self.assertEqual(buckets["2026-01-02"]["requests"], 5)
         self.assertEqual(buckets["2026-01-02"]["errors_upstream"], 2)
 
+    def test_events_persist_roundtrip(self) -> None:
+        mod = self.mod
+        tmp = tempfile.mkdtemp(prefix="ctyun-proxy-unit8-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        path = os.path.join(tmp, "settings.json")
+        orig_events = mod.EVENTS
+        try:
+            # 用例 1：save→load roundtrip 全等（oldest→newest 保序；main() 恢复路径的
+            # 等价操作序列）
+            mod.EVENTS = collections.deque([
+                {"ts": 1757654300.1, "kind": "proxy", "model": None, "status": 502},
+                {"ts": 1757654301.2, "kind": "upstream", "model": "m-1", "status": 500},
+                {"ts": 1757654302.3, "kind": "retry", "model": "m-2", "status": None}],
+                maxlen=100)
+            mod.save_stats_counters(path)
+            self.assertEqual(mod.load_stats_events(path), list(mod.EVENTS),
+                             "save->load roundtrip must restore events verbatim")
+        finally:
+            mod.EVENTS = orig_events
+        # 用例 2：legacy 文件无 events 键 → []
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"upstream_base": "http://x",
+                       "stats": {"requests_total": 1}}, fh)
+        self.assertEqual(mod.load_stats_events(path), [],
+                         "legacy file without events key must yield []")
+        # 用例 3：坏 entry 逐项跳过（kind 非法 / ts<0 / model 空 / model>200 /
+        # status 越界 / 非 dict entry）
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"stats": {"events": [
+                {"ts": 1.0, "kind": "bogus", "model": None, "status": None},
+                {"ts": -1.0, "kind": "retry", "model": None, "status": None},
+                {"ts": 2.0, "kind": "retry", "model": "", "status": None},
+                {"ts": 3.0, "kind": "retry", "model": "x" * 201, "status": None},
+                {"ts": 4.0, "kind": "proxy", "model": None, "status": 99},
+                {"ts": 5.0, "kind": "proxy", "model": None, "status": 600},
+                "not-a-dict",
+                {"ts": 6.0, "kind": "upstream", "model": "m-ok", "status": 503}]}}, fh)
+        self.assertEqual(mod.load_stats_events(path),
+                         [{"ts": 6.0, "kind": "upstream", "model": "m-ok", "status": 503}],
+                         "malformed entries must be skipped individually")
+        # 用例 4：150 条 → 读回最新 100（与 deque maxlen 对齐）
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"stats": {"events": [
+                {"ts": float(i), "kind": "retry", "model": None, "status": None}
+                for i in range(150)]}}, fh)
+        loaded = mod.load_stats_events(path)
+        self.assertEqual(len(loaded), 100)
+        self.assertEqual(loaded[0]["ts"], 50.0, "only the newest 100 must survive")
+        self.assertEqual(loaded[-1]["ts"], 149.0)
+
     def test_daily_by_model_persist_roundtrip(self) -> None:
         mod = self.mod
         tmp = tempfile.mkdtemp(prefix="ctyun-proxy-unit7-")
@@ -1377,6 +1427,21 @@ class AdminIntegrationTest(unittest.TestCase):
         snap = json.loads(body.decode("utf-8"))
         self.assertEqual(snap["daily"]["2026-01-01"]["requests"], 5)
         self.assertEqual(snap["daily"]["2026-01-01"]["errors_upstream"], 2)
+
+    def test_events_resume_from_persist(self) -> None:
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        seeded = [{"ts": 1757654300.5, "kind": "proxy", "model": None, "status": 502},
+                  {"ts": 1757654301.5, "kind": "retry", "model": "m-a", "status": None}]
+        self.proc = start_proxy(
+            self.upstream_port, free_port(),
+            seed_persist={"upstream_base": "http://127.0.0.1:%d" % self.upstream_port,
+                          "stats": {"requests_total": 1, "events": seeded}})
+        _, body, _ = admin_get(self.proc.admin_port, "/api/stats")
+        snap = json.loads(body.decode("utf-8"))
+        self.assertEqual(snap["events"], seeded,
+                         "main() must restore EVENTS from persist verbatim")
 
     def test_empty_stream_retried_and_second_attempt_relayed(self) -> None:
         upstream_port, calls = make_scripted_upstream()
