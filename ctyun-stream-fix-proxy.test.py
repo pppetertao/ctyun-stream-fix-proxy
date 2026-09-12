@@ -1042,6 +1042,16 @@ class ProxyDashboardUnitTest(unittest.TestCase):
             mod.STATS["daily_by_model"][mod.today_key()]["snap-m"]["requests"], 1,
             "inner model entries must be copies, not internal refs")
 
+    def test_dashboard_tooltip_skeleton(self) -> None:
+        html = self.mod.DASHBOARD_HTML.decode("utf-8")
+        self.assertIn('id="evt-tip"', html)
+        self.assertIn("position:fixed", html)
+        self.assertIn("markEvents", html)
+        self.assertIn("showEvtTip", html)
+        self.assertIn("hideEvtTip", html)
+        # model 名来自上游请求体：动态数据禁走 innerHTML，必须 textContent
+        self.assertNotIn("innerHTML", html)
+
     def test_safe_log_stderr_normal_and_broken(self) -> None:
         mod = self.mod
         captured = []

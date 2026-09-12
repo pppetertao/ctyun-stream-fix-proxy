@@ -833,6 +833,10 @@ svg#spark { width:100%; height:64px; display:block; }
     .chip-poison .t { color:var(--dim); text-decoration:none; margin-right:6px; }
 .empty { color:var(--dim); }
 .table-wrap { overflow-x:auto; }
+.evt-tip { position:fixed; z-index:9; display:none; max-width:340px; max-height:260px;
+  overflow-y:auto; background:var(--panel); border:1px solid var(--amber); border-radius:6px;
+  padding:6px 10px; font-size:12px; pointer-events:none;
+  box-shadow:0 4px 16px rgba(0,0,0,.5); }
 table { width:100%; border-collapse:collapse; font-size:13px; }
 th, td { text-align:left; padding:5px 8px; border-bottom:1px solid var(--line); white-space:nowrap; }
 th { color:var(--dim); font-weight:400; font-size:12px; }
@@ -924,6 +928,7 @@ footer .inner { color:var(--dim); font-size:12px; padding-top:4px; padding-botto
   最近请求/剥行流带为内存数据；「代理错误」=代理自身错误，「上游5xx」=上游透传 status≥500
   （499 中断两边都不计）。页面每 2s 轮询 /api/stats，切换时间段用缓存零请求重渲染；非本机修改上游需 X-Admin-Token。
 </div></footer>
+<div class="evt-tip" id="evt-tip"></div>
 <script>
 "use strict";
 var $ = function (id) { return document.getElementById(id); };
@@ -965,6 +970,85 @@ function setConn(ok, errText) {
       " —— 确认代理进程存活：launchctl kickstart -k gui/$UID/com.ctyun-stream-fix-proxy"));
   }
 }
+var EVT_KIND_LABELS = { proxy: "代理错误", upstream: "上游5xx", retry: "空流重试" };
+function evtFilter(kind, day, model) {
+  // 按 dataset 重新过滤 lastSnap.events：kind="errors" = proxy+upstream（顶部错误数
+  // 口径 = rs.errors_proxy + rs.errors_upstream）；day/model 给定时精确匹配。
+  var evts = (lastSnap && lastSnap.events) || [];
+  var bounds = lastSnap && lastSnap.range_bounds && lastSnap.range_bounds[selectedRange];
+  var out = [];
+  for (var i = 0; i < evts.length; i++) {
+    var e = evts[i];
+    if (kind === "errors") {
+      if (e.kind !== "proxy" && e.kind !== "upstream") continue;
+    } else if (e.kind !== kind) {
+      continue;
+    }
+    if (bounds && !(bounds[0] <= fmtDate(e.ts) && fmtDate(e.ts) <= bounds[1])) continue;
+    if (day && fmtDate(e.ts) !== day) continue;
+    if (model && e.model !== model) continue;
+    out.push(e);
+  }
+  return out;
+}
+function markEvents(n, kind, day, model) {
+  // 匹配数 >0 才设 data-evt：计数 0 → 无属性 → 无 tooltip（数字与明细同 key）
+  delete n.dataset.evt;
+  delete n.dataset.day;
+  delete n.dataset.model;
+  if (evtFilter(kind, day, model).length > 0) {
+    n.dataset.evt = kind;
+    if (day) n.dataset.day = day;
+    if (model) n.dataset.model = model;
+  }
+}
+function showEvtTip(target, x, y) {
+  var tip = $("evt-tip");
+  tip.textContent = "";
+  var evts = evtFilter(target.dataset.evt, target.dataset.day, target.dataset.model);
+  var rangeRow = !target.dataset.day;  // 顶部范围卡行（无 day）：时间含日期
+  if (evts.length === 0) {
+    tip.appendChild(el("div", "", "无记录"));
+  } else {
+    for (var i = evts.length - 1; i >= 0; i--) {  // 最新在上（renderRecent 模式）
+      var e = evts[i];
+      tip.appendChild(el("div", "",
+        (EVT_KIND_LABELS[e.kind] || e.kind) + " " +
+        (rangeRow ? fmtDate(e.ts) + " " + fmtTime(e.ts) : fmtTime(e.ts)) +
+        (e.model ? " · " + e.model : "") +
+        (e.status ? " · " + e.status : "")));
+    }
+    if (evts.length >= 100) {
+      tip.appendChild(el("div", "", "共 " + evts.length + " 次，仅保留最近 100 条事件记录"));
+    }
+  }
+  tip.style.display = "block";
+  tip.style.left = "0px";
+  tip.style.top = "0px";
+  var tw = tip.offsetWidth, th = tip.offsetHeight;
+  var left = x + 14, top = y + 14;
+  if (left + tw > window.innerWidth - 8) left = x - tw - 14;  // 视口边缘翻转
+  if (top + th > window.innerHeight - 8) top = y - th - 14;
+  tip.style.left = Math.max(8, left) + "px";
+  tip.style.top = Math.max(8, top) + "px";
+}
+function hideEvtTip() {
+  var tip = $("evt-tip");
+  tip.style.display = "none";
+  tip.textContent = "";
+}
+document.addEventListener("mouseover", function (e) {
+  var t = e.target && e.target.closest ? e.target.closest("[data-evt]") : null;
+  if (t) showEvtTip(t, e.clientX, e.clientY);
+});
+document.addEventListener("mousemove", function (e) {
+  var t = e.target && e.target.closest ? e.target.closest("[data-evt]") : null;
+  if (t) showEvtTip(t, e.clientX, e.clientY);
+});
+document.addEventListener("mouseout", function (e) {
+  var t = e.target && e.target.closest ? e.target.closest("[data-evt]") : null;
+  if (t) hideEvtTip();
+});
 function renderStats(snap) {
   var rs = snap.range_stats && snap.range_stats[selectedRange];
   if (rs) {
@@ -973,6 +1057,7 @@ function renderStats(snap) {
     $("st-rate").textContent = rs.requests > 0
       ? ((rs.filtered / rs.requests) * 100).toFixed(1) + "%" : "—";
     $("st-errors").textContent = rs.errors_proxy + rs.errors_upstream;
+    markEvents($("st-errors"), "errors", null, null);
   }
   $("st-active").textContent = snap.active;
   $("uptime").textContent = "运行时长 " + fmtUptime(snap.uptime_s);
@@ -1055,9 +1140,15 @@ function renderDaily(daily) {
     tr.appendChild(el("td", "num", keys[i]));
     tr.appendChild(el("td", "num", String(b.requests)));
     tr.appendChild(el("td", "num", String(b.filtered)));
-    tr.appendChild(el("td", "num", String(b.errors_proxy)));
-    tr.appendChild(el("td", "num", String(b.errors_upstream)));
-    tr.appendChild(el("td", "num", String(b.retries || 0)));
+    var tdEp = el("td", "num", String(b.errors_proxy));
+    var tdEu = el("td", "num", String(b.errors_upstream));
+    var tdRt = el("td", "num", String(b.retries || 0));
+    markEvents(tdEp, "proxy", keys[i], null);
+    markEvents(tdEu, "upstream", keys[i], null);
+    markEvents(tdRt, "retry", keys[i], null);
+    tr.appendChild(tdEp);
+    tr.appendChild(tdEu);
+    tr.appendChild(tdRt);
     body.appendChild(tr);
   }
 }
@@ -1089,9 +1180,15 @@ function renderDailyByModel(dbm) {
       tr.appendChild(el("td", "", names[j]));
       tr.appendChild(el("td", "num", String(ent.requests || 0)));
       tr.appendChild(el("td", "num", String(ent.filtered || 0)));
-      tr.appendChild(el("td", "num", String(ent.errors_proxy || 0)));
-      tr.appendChild(el("td", "num", String(ent.errors_upstream || 0)));
-      tr.appendChild(el("td", "num", String(ent.retries || 0)));
+      var tdEp = el("td", "num", String(ent.errors_proxy || 0));
+      var tdEu = el("td", "num", String(ent.errors_upstream || 0));
+      var tdRt = el("td", "num", String(ent.retries || 0));
+      markEvents(tdEp, "proxy", days[i], names[j]);
+      markEvents(tdEu, "upstream", days[i], names[j]);
+      markEvents(tdRt, "retry", days[i], names[j]);
+      tr.appendChild(tdEp);
+      tr.appendChild(tdEu);
+      tr.appendChild(tdRt);
       body.appendChild(tr);
     }
   }
@@ -1179,6 +1276,7 @@ function poll() {
       renderDailyByModel(snap.daily_by_model || {});
       renderSpark(snap.recent || []);
       setConn(true);
+      hideEvtTip();  // 重渲染后旧 tooltip 指向已换的 DOM，防悬空
     })
     .catch(function (err) {
       clearTimeout(timer);
