@@ -34,6 +34,9 @@ SSE_B = b'data: {"choices":[{"delta":{"content":"B"}}]}\n\n'
 SSE_POISON = b"data:null\n\n"
 SSE_DONE = b"data: [DONE]\n\n"
 SSE_REASONING = b'data: {"choices":[{"delta":{"reasoning_content":"th"}}]}\n\n'
+SSE_FINISH = b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+SSE_USAGE = b'data: {"id":"u","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}\n\n'
+SSE_FAULT_TAIL = SSE_REASONING + SSE_FINISH + SSE_DONE
 
 FAKE_SERVERS = []
 _PROCS = []  # start_proxy 产物的注册表（atexit 兜底清理，防测试中断遗留孤儿）
@@ -47,6 +50,8 @@ class FakeUpstreamHandler(BaseHTTPRequestHandler):
     empty_stream = False  # True → 每次 POST 回空流（reasoning 后 EOF，无 [DONE]）
     blank_stream = False  # True → 空流形态为零字节 body（200 + SSE 头 + 立即 EOF）
     body_override = None  # 非 None → 正常路径 body 用此值（priming 前缀/合法 DONE 场景）
+    fault_finish_first = False   # True → 首呼回 SSE_FAULT_TAIL 后断连，次呼正常 body
+    fault_finish_stream = False  # True → 每呼回故障尾段（SSE_FAULT_TAIL）
     calls = None          # 共享 list：非 None 时按调用序 append 计数；无 body_override 时首次回空流
 
     def do_POST(self) -> None:
@@ -64,6 +69,31 @@ class FakeUpstreamHandler(BaseHTTPRequestHandler):
             return
         if self.calls is not None:
             self.calls.append(1)
+        if self.fault_finish_first:
+            if self.calls is not None and len(self.calls) == 1:
+                # 首呼：故障尾段（reasoning + finish + [DONE]，无 content/usage）
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                try:
+                    self.wfile.write(SSE_FAULT_TAIL)
+                except ConnectionError:
+                    pass
+                self.close_connection = True
+                return
+            # 次呼（len(calls) > 1）fall through 到既有正常路径：
+            # body_override 非 None 用 override（用例 B/D），否则默认 SSE_A+SSE_B+SSE_DONE
+        if self.fault_finish_stream:
+            # 每呼回故障尾段（故意无限重试→第二次 final=True fail-open）
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            try:
+                self.wfile.write(SSE_FAULT_TAIL)
+            except ConnectionError:
+                pass
+            self.close_connection = True
+            return
         if self.empty_stream or (self.calls is not None and len(self.calls) == 1
                                  and self.body_override is None):
             # 空流签名：200 + SSE 头 + 少量 reasoning delta 后无 [DONE] 即 EOF
@@ -134,10 +164,14 @@ class FakeUpstreamHandler(BaseHTTPRequestHandler):
 def make_fake_upstream(poison: bool, tag: str = "/plain", big: bool = False,
                        fail_500: bool = False, empty_stream: bool = False,
                        blank_stream: bool = False, body_override=None,
+                       fault_finish_first: bool = False,
+                       fault_finish_stream: bool = False,
                        scripted: bool = False) -> int:
     attrs = {"poison": poison, "tag": tag, "big": big, "fail_500": fail_500,
              "empty_stream": empty_stream, "blank_stream": blank_stream,
-             "body_override": body_override}
+             "body_override": body_override,
+             "fault_finish_first": fault_finish_first,
+             "fault_finish_stream": fault_finish_stream}
     if scripted:
         attrs["calls"] = []
     handler = type("FakeUpstreamHandler", (FakeUpstreamHandler,), attrs)
@@ -149,7 +183,8 @@ def make_fake_upstream(poison: bool, tag: str = "/plain", big: bool = False,
 
 def make_scripted_upstream(**kwargs) -> tuple:
     """带调用计数的假上游：返回 (port, calls)；calls 按上游被请求次数 append。
-    kwargs 透传 empty_stream / blank_stream / body_override（勿传 scripted/poison）。"""
+    kwargs 透传 empty_stream / blank_stream / body_override /
+    fault_finish_first / fault_finish_stream（勿传 scripted/poison）。"""
     port = make_fake_upstream(False, scripted=True, **kwargs)
     return port, FAKE_SERVERS[-1].RequestHandlerClass.calls
 
@@ -429,7 +464,7 @@ class ProxyDashboardUnitTest(unittest.TestCase):
             f(b'data: {"choices":[{"delta":{"tool_calls":[{"id":"c1"}]},"index":0}]}\n'),
             "content")
         self.assertEqual(
-            f(b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n'), "content")
+            f(b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n'), "finish")
         self.assertEqual(
             f(b'data: {"choices":[{"delta":{"reasoning_content":"th"}}]}\n'), "noise")
         self.assertEqual(f(b"data: [DONE]\n"), "done")
@@ -444,6 +479,37 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         self.assertEqual(f(b"data: [1,2,3]\n"), "noise")
         self.assertEqual(f(b"data: {not-json\n"), "content",
                          "非 JSON data 行 fail-open 归 content（宁漏不误）")
+        # content + finish 同帧 → "content"（delta.content 优先）
+        self.assertEqual(
+            f(b'data: {"choices":[{"delta":{"content":"x"},"finish_reason":"stop"}]}\n'),
+            "content")
+        # tool_calls + finish 同帧 → "content"（delta.tool_calls 优先）
+        self.assertEqual(
+            f(b'data: {"choices":[{"delta":{"tool_calls":[{"id":"t1"}]},'
+              b'"finish_reason":"stop"}]}\n'), "content")
+
+    def test_sse_line_has_usage_matrix(self) -> None:
+        f = self.mod.sse_line_has_usage
+        # 真：独立 usage 帧（choices=[]）
+        self.assertTrue(f(b'data: {"id":"u","choices":[],'
+                          b'"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}\n'))
+        # 真：ride-on finish 帧（choices 有 finish + usage 顶层）
+        self.assertTrue(f(b'data: {"id":"x","choices":[{"delta":{},"finish_reason":"stop"}],'
+                          b'"usage":{"prompt_tokens":10,"completion_tokens":3,"total_tokens":13}}\n'))
+        # 假：空 usage {}
+        self.assertFalse(f(b'data: {"id":"e","choices":[],"usage":{}}\n'))
+        # 假：usage: null
+        self.assertFalse(f(b'data: {"id":"n","choices":[],"usage":null}\n'))
+        # 假：[DONE]
+        self.assertFalse(f(b"data: [DONE]\n"))
+        # 假：非 JSON
+        self.assertFalse(f(b"data: {not json\n"))
+        # 假：非 data 行
+        self.assertFalse(f(b": keep-alive\n"))
+        # 假：空 data
+        self.assertFalse(f(b"data:\n"))
+        # 假：usage 非 dict（如列表）
+        self.assertFalse(f(b'data: {"usage":[1,2,3],"choices":[]}\n'))
 
     def test_stats_persist_roundtrip_and_defaults(self) -> None:
         mod = self.mod
@@ -452,12 +518,14 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         path = os.path.join(tmp, "settings.json")
         self.assertEqual(mod.load_stats_counters(path),
                          {"requests_total": 0, "filtered_total": 0, "errors_total": 0,
-                          "empty_retries_total": 0, "eof_without_done_total": 0})
+                          "empty_retries_total": 0, "eof_without_done_total": 0,
+                          "finish_retries_total": 0})
         with open(path, "w", encoding="utf-8") as fh:
             fh.write("{corrupt")
         self.assertEqual(mod.load_stats_counters(path),
                          {"requests_total": 0, "filtered_total": 0, "errors_total": 0,
-                          "empty_retries_total": 0, "eof_without_done_total": 0})
+                          "empty_retries_total": 0, "eof_without_done_total": 0,
+                          "finish_retries_total": 0})
         mod._record_request("POST", "/x", 200, 1.0, 2)
         mod.save_stats_counters(path)
         with open(path, encoding="utf-8") as fh:
@@ -486,7 +554,9 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         mod._record_poison_preview(b"data:null")
         snap = mod.stats_snapshot()
         for key in ("requests_total", "filtered_total", "errors_total",
-                    "empty_retries_total", "eof_without_done_total", "active",
+                    "empty_retries_total", "eof_without_done_total",
+                    "finish_retries_total",
+                    "active",
                     "uptime_s", "upstream_base", "upstream_source",
                     "recent", "poison_previews", "events"):
             self.assertIn(key, snap)
@@ -1152,7 +1222,9 @@ class AdminIntegrationTest(unittest.TestCase):
         self.assertTrue(ctype and ctype.startswith("application/json"))
         snap = json.loads(body.decode("utf-8"))
         for key in ("requests_total", "filtered_total", "errors_total",
-                    "empty_retries_total", "eof_without_done_total", "active",
+                    "empty_retries_total", "eof_without_done_total",
+                    "finish_retries_total",
+                    "active",
                     "uptime_s", "upstream_base", "upstream_source",
                     "recent", "poison_previews"):
             self.assertIn(key, snap)
@@ -1327,9 +1399,10 @@ class AdminIntegrationTest(unittest.TestCase):
                       r"result=\S+ filtered=\d+ "
                       r"model=deepseek-v4-pro-0813-oc "
                       r"retried=\d+ "
+                      r"retry_reason=\S+ "
                       r"ts=(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{4})$",
                       stderr, re.M)
-        self.assertIsNotNone(m, "REQ 行必须带 model= 与 ts= 字段，stderr:\n" + stderr)
+        self.assertIsNotNone(m, "REQ 行必须带 model= / retry_reason= / ts= 字段，stderr:\n" + stderr)
         time.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S%z")  # %z 回析：防平台差异静默退化
 
     def test_client_abort_is_quiet_and_not_error(self) -> None:
@@ -1659,6 +1732,147 @@ class AdminIntegrationTest(unittest.TestCase):
         self.assertNotIn("eof-without-done", stderr,
                          "priming-stage EOF (empty stream fallback) must not be marked "
                          "eof-without-done, stderr:\n" + stderr)
+
+    def test_finish_with_usage_zero_content_legal_no_retry(self) -> None:
+        """finish + usage + [DONE] 零内容流：合法，不重试。"""
+        upstream_port, calls = make_scripted_upstream(
+            body_override=SSE_REASONING + SSE_FINISH + SSE_USAGE + SSE_DONE)
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        self.proc = start_proxy(upstream_port, free_port())
+        data = post_sse(self.proc.proxy_port)
+        self.assertEqual(len(calls), 1,
+                         "usage-bearing finish stream must not retry, calls=%d" % len(calls))
+        self.assertEqual(data, SSE_REASONING + SSE_FINISH + SSE_USAGE + SSE_DONE,
+                         "legal zero-content stream must relay byte-exact, got %r" % data)
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr = stderr_text(self.proc)
+        self.assertIn("result=ok", stderr,
+                      "legal stream must stay result=ok, stderr:\n" + stderr)
+
+    def test_finish_without_usage_retried_second_stream_relayed(self) -> None:
+        """finish 无 usage 故障形态：首呼 fault_finish_first 回故障尾段触发重试，
+        次呼回正常 content 流全量交付。"""
+        upstream_port, calls = make_scripted_upstream(
+            fault_finish_first=True, body_override=SSE_A + SSE_B + SSE_DONE)
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        self.proc = start_proxy(upstream_port, free_port())
+        data = post_sse(self.proc.proxy_port)
+        self.assertEqual(len(calls), 2,
+                         "finish fault must trigger exactly one retry, calls=%d" % len(calls))
+        self.assertEqual(data, SSE_A + SSE_B + SSE_DONE,
+                         "attempt-2 must relay byte-exact stream, got %r" % data)
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr = stderr_text(self.proc)
+        self.assertIn("retried=1", stderr,
+                      "REQ line must carry retried=1, stderr:\n" + stderr)
+        self.assertIn("retry_reason=finish-no-usage", stderr,
+                      "REQ line must carry retry_reason=finish-no-usage, stderr:\n" + stderr)
+
+    def test_double_finish_fault_falls_back_after_two_calls(self) -> None:
+        """双 finish 故障：fault_finish_stream 每呼回故障尾段 → calls==2 fallback。"""
+        upstream_port, calls = make_scripted_upstream(fault_finish_stream=True)
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        self.proc = start_proxy(upstream_port, free_port())
+        data = post_sse(self.proc.proxy_port)
+        self.assertEqual(len(calls), 2,
+                         "retry cap is 1: second fault finish ends the attempt, calls=%d"
+                         % len(calls))
+        self.assertEqual(data, SSE_FAULT_TAIL,
+                         "attempt-2 buffer must be delivered as-is, got %r" % data)
+
+    def test_finish_fault_counters_and_req_line(self) -> None:
+        """finish 故障计数器 + SIGTERM 落盘 + seed resume 续算。"""
+        upstream_port, calls = make_scripted_upstream(
+            fault_finish_first=True, body_override=SSE_A + SSE_B + SSE_DONE)
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        self.proc = start_proxy(upstream_port, free_port())
+        post_sse(self.proc.proxy_port)
+        self.assertEqual(len(calls), 2)
+        _, body, _ = admin_get(self.proc.admin_port, "/api/stats")
+        snap = json.loads(body.decode("utf-8"))
+        today = time.strftime("%Y-%m-%d")
+        self.assertGreaterEqual(snap["empty_retries_total"], 1)
+        self.assertGreaterEqual(snap["finish_retries_total"], 1,
+                                "finish fault must increment finish_retries_total")
+        self.assertGreaterEqual(snap["daily"][today]["retries"], 1)
+        self.assertGreaterEqual(
+            snap["daily_by_model"][today]["deepseek-v4-pro-0813-oc"]["retries"], 1)
+        self.proc.terminate()  # SIGTERM → handler 落盘
+        self.proc.wait(timeout=5)
+        with open(os.path.join(self.proc.persist_dir, "settings.json"),
+                  encoding="utf-8") as fh:
+            saved = json.load(fh)["stats"]
+        self.assertGreaterEqual(saved["finish_retries_total"], 1)
+        # seed resume：finish_retries_total 跨重启续算
+        upstream_port2, calls2 = make_scripted_upstream(
+            fault_finish_first=True, body_override=SSE_A + SSE_B + SSE_DONE)
+        self.proc = start_proxy(
+            upstream_port2, free_port(),
+            seed_persist={"upstream_base": "http://127.0.0.1:%d" % upstream_port2,
+                          "stats": {"finish_retries_total": 5}})
+        _, body, _ = admin_get(self.proc.admin_port, "/api/stats")
+        snap2 = json.loads(body.decode("utf-8"))
+        self.assertEqual(snap2["finish_retries_total"], 5,
+                         "seeded finish_retries_total must resume from persist")
+        post_sse(self.proc.proxy_port)
+        self.assertEqual(len(calls2), 2)
+        _, body, _ = admin_get(self.proc.admin_port, "/api/stats")
+        self.assertEqual(json.loads(body.decode("utf-8"))["finish_retries_total"], 6)
+
+    def test_finish_then_content_fails_open_no_retry(self) -> None:
+        """finish 后反常跟 content：fail-open 即刻 flush，不重试。"""
+        upstream_port, calls = make_scripted_upstream(
+            body_override=SSE_REASONING + SSE_FINISH + SSE_A + SSE_DONE)
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        self.proc = start_proxy(upstream_port, free_port())
+        data = post_sse(self.proc.proxy_port)
+        self.assertEqual(len(calls), 1,
+                         "finish-then-content must fail-open no retry, calls=%d" % len(calls))
+        self.assertEqual(data, SSE_REASONING + SSE_FINISH + SSE_A + SSE_DONE,
+                         "finish-then-content must relay byte-exact, got %r" % data)
+
+    def test_finish_fault_retry_zero_disables(self) -> None:
+        """CTYUN_EMPTY_RETRY=0：finish 故障不重试，原样下发。"""
+        upstream_port, calls = make_scripted_upstream(fault_finish_first=True)
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        self.proc = start_proxy(upstream_port, free_port(),
+                                extra_env={"CTYUN_EMPTY_RETRY": "0"})
+        data = post_sse(self.proc.proxy_port)
+        self.assertEqual(len(calls), 1,
+                         "CTYUN_EMPTY_RETRY=0 must disable retry, calls=%d" % len(calls))
+        self.assertEqual(data, SSE_FAULT_TAIL)
+
+    def test_finish_tail_over_cap_fails_open(self) -> None:
+        """finish 后尾段超 PRIMED_TAIL_CAP(256KB) → fail-open 即刻 flush。"""
+        # 构造 >256KB 尾段：11000 条噪音 data 行（26B/行 ≈ 286KB）无空行分隔，
+        # 与 [DONE] 行合成单 record 后一次性计入 hold_bytes 超限。
+        big_noise = b'data: {"comment":"noise"}\n' * 11000  # 286,000B > 262,144B
+        body = SSE_REASONING + SSE_FINISH + big_noise + SSE_DONE
+        upstream_port, calls = make_scripted_upstream(body_override=body)
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        self.proc = start_proxy(upstream_port, free_port())
+        data = post_sse(self.proc.proxy_port)
+        self.assertEqual(len(calls), 1,
+                         "finish tail over cap must fail-open no retry, calls=%d" % len(calls))
+        self.assertEqual(len(data), len(body),
+                         "fail-open must deliver all bytes, expected %d got %d"
+                         % (len(body), len(data)))
 
 
 if __name__ == "__main__":
