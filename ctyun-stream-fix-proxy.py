@@ -48,15 +48,16 @@ RANGE_KEYS = ("3d", "7d", "mtd", "last_month")  # 时间维度 tab 键序（快�
 POISON_RE = re.compile(rb"^data:\s*null\s*$")
 DONE_RE = re.compile(rb"^data:\s*\[DONE\]\s*$")
 EMPTY_RETRY_MAX = int(os.environ.get("CTYUN_EMPTY_RETRY", "1"))  # env seam，惯例同 SEND_TIMEOUT_S
+PRIMED_TAIL_CAP = 262144  # finish hold 尾段缓冲上限（超限 fail-open 防内存膨胀）
 
 
 def sse_data_line_kind(line: bytes) -> str:
-    """SSE data 行归类："done" / "content" / "noise"。判定序：
+    """SSE data 行归类："done" / "content" / "finish" / "noise"。判定序：
     非 data: 前缀（注释行/event:/id:）→ noise；[DONE] → done；
     JSON 解析失败 → content（fail-open：宁可不重试，不误判合法流）；
-    dict + choices 非空 list 时：delta.content 非空 str / delta.tool_calls 真值 /
-    choice.finish_reason 非 None 任一 → content；其余（reasoning-only、空 delta、
-    choices 为空的 usage 帧、data:null、非 dict JSON）→ noise。"""
+    dict + choices 非空 list 时：delta.content 非空 str / delta.tool_calls 真值 →
+    content；choice.finish_reason 非 None（且无前两者）→ finish；
+    其余（reasoning-only、空 delta、choices 为空的 usage 帧、data:null、非 dict JSON）→ noise。"""
     stripped = line.rstrip(b"\r\n")
     if not stripped.startswith(b"data:"):
         return "noise"
@@ -80,16 +81,33 @@ def sse_data_line_kind(line: bytes) -> str:
     if delta.get("tool_calls"):
         return "content"
     if choice.get("finish_reason") is not None:
-        return "content"
+        return "finish"
     return "noise"
+
+
+def sse_line_has_usage(line: bytes) -> bool:
+    """判 SSE data 行是否携带非空 usage 帧（独立 usage 帧 choices=[] 与 ride-on finish
+    帧都覆盖）；DONE/非 JSON/非 data 行 → False。"""
+    stripped = line.rstrip(b"\r\n")
+    if not stripped.startswith(b"data:") or DONE_RE.match(stripped):
+        return False
+    try:
+        data = json.loads(stripped[5:].strip().decode("utf-8", "replace"))
+    except ValueError:
+        return False
+    if not isinstance(data, dict):
+        return False
+    usage = data.get("usage")
+    return isinstance(usage, dict) and bool(usage)
 
 
 class _EmptyStream(Exception):
     """priming EOF 仍无 content/[DONE]：携带 filtered 计数与已滤毒缓冲行。"""
-    def __init__(self, filtered: int, lines: list):
+    def __init__(self, filtered: int, lines: list, reason: str = "eof-priming"):
         super().__init__("empty upstream sse stream")
         self.filtered = filtered
         self.lines = lines
+        self.reason = reason
 
 
 HOP_HEADERS = {"connection", "keep-alive", "proxy-connection",
@@ -100,6 +118,7 @@ _CFG_LOCK = threading.Lock()
 STATS_LOCK = threading.Lock()
 STATS = {"requests_total": 0, "filtered_total": 0, "errors_total": 0,
          "empty_retries_total": 0, "eof_without_done_total": 0,
+         "finish_retries_total": 0,
          "active": 0, "daily": {}, "daily_by_model": {}}
 _stats_dirty = False  # STATS_LOCK 保护：计数落盘脏标记（SIGTERM/60s 脏刷消费）
 STARTED_AT = time.time()
@@ -245,7 +264,8 @@ def save_stats_counters(path: str) -> None:
     """把累计计数、按天分桶与当前上游端点全量写入持久化文件（SIGTERM / set_upstream_base 共用）。"""
     with STATS_LOCK:
         counters = {k: STATS[k] for k in ("requests_total", "filtered_total", "errors_total",
-                                          "empty_retries_total", "eof_without_done_total")}
+                                          "empty_retries_total", "eof_without_done_total",
+                                          "finish_retries_total")}
         _prune_daily(STATS["daily"])           # 内存态原地 prune（副本 prune 修不了内存增长）
         _prune_daily(STATS["daily_by_model"])  # 内存态原地 prune（副本 prune 修不了内存增长）
         daily = {k: dict(v) for k, v in STATS["daily"].items()}  # prune 后拷贝：磁盘与内存一致
@@ -282,7 +302,7 @@ def load_stats_counters(path: str) -> dict:
     stats = _load_persist_file(path).get("stats")
     out = {}
     for key in ("requests_total", "filtered_total", "errors_total", "empty_retries_total",
-                "eof_without_done_total"):
+                "eof_without_done_total", "finish_retries_total"):
         value = stats.get(key) if isinstance(stats, dict) else None
         out[key] = value if isinstance(value, int) and value >= 0 else 0
     return out
@@ -453,14 +473,17 @@ def _record_poison_preview(raw: bytes) -> None:
         POISON_PREVIEWS.append({"ts": time.time(), "preview": preview})
 
 
-def _record_empty_retry(model=None) -> None:
+def _record_empty_retry(model=None, reason: str = "eof-priming") -> None:
     """空流重试计数：STATS 总量 + 当日桶 + daily_by_model。
+    finish-no-usage 形态额外累加 finish_retries_total。
     entry/桶形状必须与 _record_request 同步：dm entry 同为 6 字段（本函数无
     error/status 参数，errors_* 仅保形状不归因）；旧持久化桶经 load_daily_buckets
     的 _DAILY_FIELDS 清洗已补键。形状不同步时 += 直接 KeyError。"""
     global _stats_dirty
     with STATS_LOCK:
         STATS["empty_retries_total"] += 1
+        if reason == "finish-no-usage":
+            STATS["finish_retries_total"] += 1
         if model:
             day_models = STATS["daily_by_model"].setdefault(today_key(), {})
             entry_dm = day_models.get(model)
@@ -598,18 +621,21 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         result = "ok" if resp.status < 400 else "upstream-err"
         if "text/event-stream" in content_type:
             retried = 0
+            retry_reason = ""
             try:
                 filtered, truncated = self._relay_sse(resp, final=(EMPTY_RETRY_MAX < 1))
             except _EmptyStream as exc:
                 filtered = exc.filtered  # attempt-1 已滤毒缓冲随重试丢弃，filtered 只计交付流
                 retried = 1
-                _record_empty_retry(model)
+                retry_reason = exc.reason
+                _record_empty_retry(model, exc.reason)
                 conn.close()
                 try:
                     conn, resp = self._open_upstream(self.command, self.path, body, fwd_headers)
                 except (OSError, http.client.HTTPException) as retry_exc:
                     self._reply_502(retry_exc)  # 客户端尚未收到字节，502 语义与既有路径一致
-                    self._log(started, 502, "error", 0, model=model, retried=1)
+                    self._log(started, 502, "error", 0, model=model, retried=1,
+                              retry_reason=retry_reason)
                     _record_request(self.command, self.path, 502,
                                     (time.time() - started) * 1000, 0, model=model, error=True)
                     return
@@ -620,7 +646,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 # 路径不经此处）不误标；priming EOF 由 retries 计数承载，避免双计数
                 result = "eof-without-done"
                 _record_eof_without_done(model)
-            self._log(started, resp.status, result, filtered, model=model, retried=retried)
+            self._log(started, resp.status, result, filtered, model=model, retried=retried,
+                      retry_reason=retry_reason)
             _record_request(self.command, self.path, resp.status,
                             (time.time() - started) * 1000, filtered, model=model)
         else:
@@ -663,6 +690,16 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             poisoned = False  # 当前 record 内是否命中毒行
             primed = []       # priming 阶段已滤毒缓冲的完整 record 行（含终结空行）
             priming = True    # True = 客户端尚未收到任何字节
+            finish_hold = False  # finish record 触发 hold：缓冲尾段至 EOF 判 usage
+            saw_usage = False    # 整流是否出现过非空 usage 帧
+            hold_bytes = 0       # finish hold 期已缓冲的字节数
+
+            def _flush_primed() -> None:
+                """补发 SSE 头 + primed 缓冲并 flush，切换出 priming。"""
+                self._send_sse_headers(resp)
+                self.wfile.write(b"".join(primed))
+                self.wfile.flush()
+
             while True:
                 line = resp.readline()
                 if line in (b"\n", b"\r\n", b""):
@@ -676,12 +713,24 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                         primed.extend(pending)
                         if line:
                             primed.append(line)
-                        if "content" in kinds or "done" in kinds:
-                            # 首个信号 record：补发头 + 整段前缀，转 streaming
-                            self._send_sse_headers(resp)
-                            self.wfile.write(b"".join(primed))
-                            self.wfile.flush()
-                            priming = False
+                        if not saw_usage:
+                            saw_usage = any(sse_line_has_usage(l) for l in pending)
+                        if finish_hold:
+                            hold_bytes += sum(len(l) for l in pending) + len(line)
+                            if "content" in kinds:              # fail-open：finish 后反常 content
+                                _flush_primed()
+                                priming = False
+                                finish_hold = False
+                            elif hold_bytes > PRIMED_TAIL_CAP:  # 恶意/异常长尾 fail-open
+                                _flush_primed()
+                                priming = False
+                                finish_hold = False
+                            # done/finish/noise（含 usage）：继续缓冲尾段
+                        elif "content" in kinds or "done" in kinds:
+                            _flush_primed()
+                            priming = False       # v1.4 原语义不变
+                        elif "finish" in kinds:
+                            finish_hold = True    # hold 至 EOF 判 usage
                     else:
                         for buf_line in pending:
                             self.wfile.write(buf_line)
@@ -692,10 +741,14 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     poisoned = False
                     if line == b"":
                         if priming:  # EOF 仍 priming = 空流（零 record / reasoning-only 断流）
-                            if final:  # 按现状语义收尾：缓冲原样下发（含合法 [DONE] 零内容流）
-                                self._send_sse_headers(resp)
-                                self.wfile.write(b"".join(primed))
-                                self.wfile.flush()
+                            if finish_hold:
+                                if saw_usage or final:
+                                    _flush_primed()   # 合法零内容流（有 usage）或预算已尽 fail-open
+                                else:
+                                    raise _EmptyStream(filtered, primed,
+                                                      reason="finish-no-usage")
+                            elif final:
+                                _flush_primed()       # v1.4 原语义：switch off / 重试流原样下发
                             else:
                                 raise _EmptyStream(filtered, primed)
                         else:
@@ -737,11 +790,12 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         self.close_connection = True
 
     def _log(self, started: float, status: int, result: str, filtered: int, model=None,
-             retried: int = 0) -> None:
+             retried: int = 0, retry_reason: str = "") -> None:
         _safe_log_stderr("REQ %s %s -> %d dur=%.1fs result=%s filtered=%d "
-                         "model=%s retried=%d ts=%s"
+                         "model=%s retried=%d retry_reason=%s ts=%s"
                          % (self.command, self.path, status, time.time() - started,
                             result, filtered, model or "-", retried,
+                            retry_reason or "-",
                             time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime())))
 
 
@@ -1398,6 +1452,7 @@ def main() -> None:
         STATS["errors_total"] = counters["errors_total"]
         STATS["empty_retries_total"] = counters["empty_retries_total"]
         STATS["eof_without_done_total"] = counters["eof_without_done_total"]
+        STATS["finish_retries_total"] = counters["finish_retries_total"]
         STATS["daily"] = daily
         STATS["daily_by_model"] = daily_by_model
         EVENTS.clear()
