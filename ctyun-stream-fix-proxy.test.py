@@ -452,12 +452,12 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         path = os.path.join(tmp, "settings.json")
         self.assertEqual(mod.load_stats_counters(path),
                          {"requests_total": 0, "filtered_total": 0, "errors_total": 0,
-                          "empty_retries_total": 0})
+                          "empty_retries_total": 0, "eof_without_done_total": 0})
         with open(path, "w", encoding="utf-8") as fh:
             fh.write("{corrupt")
         self.assertEqual(mod.load_stats_counters(path),
                          {"requests_total": 0, "filtered_total": 0, "errors_total": 0,
-                          "empty_retries_total": 0})
+                          "empty_retries_total": 0, "eof_without_done_total": 0})
         mod._record_request("POST", "/x", 200, 1.0, 2)
         mod.save_stats_counters(path)
         with open(path, encoding="utf-8") as fh:
@@ -486,7 +486,7 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         mod._record_poison_preview(b"data:null")
         snap = mod.stats_snapshot()
         for key in ("requests_total", "filtered_total", "errors_total",
-                    "empty_retries_total", "active",
+                    "empty_retries_total", "eof_without_done_total", "active",
                     "uptime_s", "upstream_base", "upstream_source",
                     "recent", "poison_previews", "events"):
             self.assertIn(key, snap)
@@ -536,11 +536,13 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         }
         out = f(daily, "2026-02-01", "2026-02-28")
         self.assertEqual(out, {"requests": 8, "filtered": 1, "errors_proxy": 0,
-                               "errors_upstream": 1, "retries": 0, "days": 2})
+                               "errors_upstream": 1, "retries": 0,
+                               "eof_without_done": 0, "days": 2})
         # 空窗口：全 0 + days=0
         self.assertEqual(f(daily, "2025-01-01", "2025-01-31"),
                          {"requests": 0, "filtered": 0, "errors_proxy": 0,
-                          "errors_upstream": 0, "retries": 0, "days": 0})
+                          "errors_upstream": 0, "retries": 0,
+                          "eof_without_done": 0, "days": 0})
         # 端点闭合：start/end 当天都计入
         self.assertEqual(f(daily, "2026-02-02", "2026-02-02")["days"], 1)
         self.assertEqual(f(daily, "2026-02-02", "2026-02-02")["requests"], 5)
@@ -559,7 +561,7 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         for key in mod.RANGE_KEYS:
             self.assertEqual(set(plan["stats"][key]),
                              {"requests", "filtered", "errors_proxy",
-                              "errors_upstream", "retries", "days"})
+                              "errors_upstream", "retries", "eof_without_done", "days"})
             self.assertEqual(len(plan["bounds"][key]), 2)
         # 3d 窗口 = [02-27, 03-01]：两天桶都在窗内
         self.assertEqual(plan["stats"]["3d"]["requests"], 6)
@@ -649,10 +651,11 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         self.assertGreaterEqual(dm_today["m-a"]["filtered"], 1)
         self.assertGreaterEqual(dm_today["m-a"]["retries"], 1,
                                 "retry attribution must land in daily_by_model")
-        # v3：dm entry 恒 5 字段 + 错误归因与 daily 总桶同口径（error→proxy，5xx→upstream）
+        # v3：dm entry 恒 6 字段 + 错误归因与 daily 总桶同口径（error→proxy，5xx→upstream）
         self.assertEqual(
             set(dm_today["m-a"]),
-            {"requests", "filtered", "errors_proxy", "errors_upstream", "retries"},
+            {"requests", "filtered", "errors_proxy", "errors_upstream", "retries",
+             "eof_without_done"},
             "dm entry shape must stay in sync across both creation sites")
         mod._record_request("POST", "/dm", 502, 1.0, 0, model="m-a", error=True)
         self.assertEqual(dm_today["m-a"]["errors_proxy"], 1,
@@ -674,7 +677,7 @@ class ProxyDashboardUnitTest(unittest.TestCase):
             self.assertGreaterEqual(total, summed,
                                     "daily[%r][%r]=%d < Σ daily_by_model=%d"
                                     % (today, k, total, summed))
-        # v3：_record_empty_retry 的 dm entry 创建点（site-2）同样 5 字段——
+        # v3：_record_empty_retry 的 dm entry 创建点（site-2）同样 6 字段——
         # 用全新日期隔离（真实 today 的键位已被 cap 用例占满 32，新建会被 cap 拒绝）
         orig_today = mod.today_key
         try:
@@ -684,7 +687,8 @@ class ProxyDashboardUnitTest(unittest.TestCase):
             mod.today_key = orig_today
         self.assertEqual(
             set(mod.STATS["daily_by_model"]["2026-01-03"]["m-retry-only"]),
-            {"requests", "filtered", "errors_proxy", "errors_upstream", "retries"},
+            {"requests", "filtered", "errors_proxy", "errors_upstream", "retries",
+             "eof_without_done"},
             "empty-retry creation site must keep dm entry shape in sync")
 
     def test_events_record_and_cap(self) -> None:
@@ -803,12 +807,12 @@ class ProxyDashboardUnitTest(unittest.TestCase):
             matrix = {
                 "2026-01-02": {
                     "m1": {"requests": 3, "filtered": 5, "errors_proxy": 1,
-                           "errors_upstream": 2, "retries": 0},
+                           "errors_upstream": 2, "retries": 0, "eof_without_done": 0},
                     "m2": {"requests": 7, "filtered": 0, "errors_proxy": 0,
-                           "errors_upstream": 0, "retries": 4}},
+                           "errors_upstream": 0, "retries": 4, "eof_without_done": 0}},
                 "2026-01-05": {
                     "m1": {"requests": 1, "filtered": 0, "errors_proxy": 0,
-                           "errors_upstream": 0, "retries": 0}}}
+                           "errors_upstream": 0, "retries": 0, "eof_without_done": 0}}}
             mod.STATS["daily_by_model"] = matrix
             mod.save_stats_counters(path)
             self.assertEqual(mod.load_daily_by_model_buckets(path), matrix,
@@ -836,7 +840,8 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         self.assertEqual(mod.load_daily_by_model_buckets(path),
                          {"2026-01-02": {"m2": {"requests": 5, "filtered": 0,
                                                 "errors_proxy": 0,
-                                                "errors_upstream": 2, "retries": 0}}},
+                                                "errors_upstream": 2, "retries": 0,
+                                                "eof_without_done": 0}}},
                          "non-dict bucket/entry must be skipped; bad fields coerced to 0")
         # 用例 4：非 ISO 日期 key 跳过（round-trip 校验，版本无关）
         with open(path, "w", encoding="utf-8") as fh:
@@ -851,7 +856,7 @@ class ProxyDashboardUnitTest(unittest.TestCase):
                          "non-ISO date keys must be skipped")
         self.assertEqual(dbm["2026-01-03"]["m1"],
                          {"requests": 1, "filtered": 0, "errors_proxy": 0,
-                          "errors_upstream": 0, "retries": 0},
+                          "errors_upstream": 0, "retries": 0, "eof_without_done": 0},
                          "missing fields must be filled with 0")
         # 用例 5：单日 40 模型 → 读回恰 32（文件出现序前 32）
         with open(path, "w", encoding="utf-8") as fh:
@@ -1147,7 +1152,7 @@ class AdminIntegrationTest(unittest.TestCase):
         self.assertTrue(ctype and ctype.startswith("application/json"))
         snap = json.loads(body.decode("utf-8"))
         for key in ("requests_total", "filtered_total", "errors_total",
-                    "empty_retries_total", "active",
+                    "empty_retries_total", "eof_without_done_total", "active",
                     "uptime_s", "upstream_base", "upstream_source",
                     "recent", "poison_previews"):
             self.assertIn(key, snap)
@@ -1276,9 +1281,10 @@ class AdminIntegrationTest(unittest.TestCase):
         self.assertGreaterEqual(
             snap["daily_by_model"][today]["deepseek-v4-pro-0813-oc"]["requests"], 1,
             "per-model daily matrix must record the SSE request")
-        # v3：dm entry 5 键经 /api/stats 透出（纯新增键，旧客户端只读 3 键不受影响）
+        # v3：dm entry 6 键经 /api/stats 透出（纯新增键，旧客户端只读 3 键不受影响）
         dm_entry = snap["daily_by_model"][today]["deepseek-v4-pro-0813-oc"]
-        for key in ("requests", "filtered", "errors_proxy", "errors_upstream", "retries"):
+        for key in ("requests", "filtered", "errors_proxy", "errors_upstream",
+                    "retries", "eof_without_done"):
             self.assertIn(key, dm_entry)
             self.assertIsInstance(dm_entry[key], int)
             self.assertGreaterEqual(dm_entry[key], 0)
@@ -1297,6 +1303,8 @@ class AdminIntegrationTest(unittest.TestCase):
         self.assertEqual(snap["requests_total"], 7)
         self.assertEqual(snap["filtered_total"], 3)
         self.assertEqual(snap["errors_total"], 1)
+        self.assertEqual(snap["eof_without_done_total"], 0,
+                         "legacy persist without eof key must load as 0")
         post_sse(self.proc.proxy_port)  # 重启后的新代理端口
         _, body, _ = admin_get(self.proc.admin_port, "/api/stats")
         self.assertEqual(json.loads(body.decode("utf-8"))["requests_total"], 8)
@@ -1559,6 +1567,98 @@ class AdminIntegrationTest(unittest.TestCase):
         self.assertEqual(len(calls2), 2)
         _, body, _ = admin_get(self.proc.admin_port, "/api/stats")
         self.assertEqual(json.loads(body.decode("utf-8"))["empty_retries_total"], 6)
+
+    def test_eof_without_done_marked_counted_and_persisted(self) -> None:
+        # spec 用例 ①：有 content 无 [DONE] 即 EOF（上游截断签名，R31 现场复刻）
+        upstream_port, calls = make_scripted_upstream(body_override=SSE_A + SSE_B)
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        self.proc = start_proxy(upstream_port, free_port())
+        data = post_sse(self.proc.proxy_port)
+        self.assertEqual(len(calls), 1,
+                         "content-bearing stream must not retry, calls=%d" % len(calls))
+        self.assertEqual(data, SSE_A + SSE_B,
+                         "truncated stream must still relay byte-exact, got %r" % data)
+        _, body, _ = admin_get(self.proc.admin_port, "/api/stats")
+        snap = json.loads(body.decode("utf-8"))
+        today = time.strftime("%Y-%m-%d")
+        self.assertGreaterEqual(snap["eof_without_done_total"], 1,
+                                "eof-without-done must count into STATS total")
+        self.assertGreaterEqual(snap["daily"][today]["eof_without_done"], 1,
+                                "eof-without-done must count into daily bucket")
+        self.assertGreaterEqual(
+            snap["daily_by_model"][today]["deepseek-v4-pro-0813-oc"]["eof_without_done"], 1,
+            "eof-without-done must count into daily_by_model")
+        self.proc.terminate()  # SIGTERM → handler 落盘
+        self.proc.wait(timeout=5)
+        stderr = stderr_text(self.proc)
+        self.assertIn("result=eof-without-done", stderr,
+                      "REQ line must carry result=eof-without-done, stderr:\n" + stderr)
+        with open(os.path.join(self.proc.persist_dir, "settings.json"),
+                  encoding="utf-8") as fh:
+            saved = json.load(fh)["stats"]
+        self.assertGreaterEqual(saved["eof_without_done_total"], 1)
+        self.assertGreaterEqual(saved["daily"][today]["eof_without_done"], 1)
+        self.assertGreaterEqual(
+            saved["daily_by_model"][today]["deepseek-v4-pro-0813-oc"]["eof_without_done"], 1)
+        # 重启续算：seed 含新计数键 → /api/stats 透出（仿 empty_retries resume 段）
+        self.proc = start_proxy(
+            upstream_port, free_port(),
+            seed_persist={"upstream_base": "http://127.0.0.1:%d" % upstream_port,
+                          "stats": {"eof_without_done_total": 5}})
+        _, body, _ = admin_get(self.proc.admin_port, "/api/stats")
+        self.assertEqual(json.loads(body.decode("utf-8"))["eof_without_done_total"], 5,
+                         "seeded eof counter must resume from persist")
+
+    def test_done_streams_stay_ok_no_eof_counter(self) -> None:
+        # spec 用例 ② 对照组 A：默认正常流（SSE_A+SSE_B+[DONE]，setUp 假上游）
+        data = post_sse(self.proc.proxy_port)
+        self.assertEqual(data, SSE_A + SSE_B + SSE_DONE)
+        _, body, _ = admin_get(self.proc.admin_port, "/api/stats")
+        self.assertEqual(json.loads(body.decode("utf-8"))["eof_without_done_total"], 0,
+                         "normal done-terminated stream must not trip eof counter")
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr = stderr_text(self.proc)
+        self.assertIn("result=ok", stderr,
+                      "normal stream must stay result=ok, stderr:\n" + stderr)
+        # spec 用例 ② 对照组 B：reasoning 前缀 + 合法 [DONE]（priming 前缀场景）
+        upstream_port, calls = make_scripted_upstream(
+            body_override=SSE_REASONING + SSE_DONE)
+        self.proc = start_proxy(upstream_port, free_port())
+        data = post_sse(self.proc.proxy_port)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(data, SSE_REASONING + SSE_DONE)
+        _, body, _ = admin_get(self.proc.admin_port, "/api/stats")
+        self.assertEqual(json.loads(body.decode("utf-8"))["eof_without_done_total"], 0,
+                         "reasoning+[DONE] stream must not trip eof counter")
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr = stderr_text(self.proc)
+        self.assertIn("result=ok", stderr,
+                      "reasoning+[DONE] stream must stay result=ok, stderr:\n" + stderr)
+        self.assertNotIn("eof-without-done", stderr)
+
+    def test_double_empty_stream_not_marked_eof_without_done(self) -> None:
+        # spec 用例 ③：双空流 fallback（priming 路径 EOF 不加标记，避免与 retries 双计数）
+        upstream_port, calls = make_scripted_upstream(empty_stream=True)
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        self.proc = start_proxy(upstream_port, free_port())
+        data = post_sse(self.proc.proxy_port)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(data, SSE_REASONING)
+        _, body, _ = admin_get(self.proc.admin_port, "/api/stats")
+        self.assertEqual(json.loads(body.decode("utf-8"))["eof_without_done_total"], 0,
+                         "priming-stage EOF must not trip eof counter")
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr = stderr_text(self.proc)
+        self.assertNotIn("eof-without-done", stderr,
+                         "priming-stage EOF (empty stream fallback) must not be marked "
+                         "eof-without-done, stderr:\n" + stderr)
 
 
 if __name__ == "__main__":

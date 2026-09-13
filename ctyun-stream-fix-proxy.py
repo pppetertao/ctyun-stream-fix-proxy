@@ -99,7 +99,7 @@ STRIP_HEADERS = HOP_HEADERS | {"host", "content-length", "accept-encoding"}
 _CFG_LOCK = threading.Lock()
 STATS_LOCK = threading.Lock()
 STATS = {"requests_total": 0, "filtered_total": 0, "errors_total": 0,
-         "empty_retries_total": 0,
+         "empty_retries_total": 0, "eof_without_done_total": 0,
          "active": 0, "daily": {}, "daily_by_model": {}}
 _stats_dirty = False  # STATS_LOCK 保护：计数落盘脏标记（SIGTERM/60s 脏刷消费）
 STARTED_AT = time.time()
@@ -191,7 +191,7 @@ def range_bounds(today: str, range_key: str) -> tuple:
 def aggregate_daily_range(daily: dict, start: str, end: str) -> dict:
     """窗口 [start, end]（含端点）内 daily 桶逐字段求和；缺字段按 0。
 
-    返回 6 键 dict：_DAILY_FIELDS 五字段 + days=命中桶数。
+    返回 7 键 dict：_DAILY_FIELDS 六字段 + days=命中桶数。
     """
     out = {field: 0 for field in _DAILY_FIELDS}
     days = 0
@@ -245,7 +245,7 @@ def save_stats_counters(path: str) -> None:
     """把累计计数、按天分桶与当前上游端点全量写入持久化文件（SIGTERM / set_upstream_base 共用）。"""
     with STATS_LOCK:
         counters = {k: STATS[k] for k in ("requests_total", "filtered_total", "errors_total",
-                                          "empty_retries_total")}
+                                          "empty_retries_total", "eof_without_done_total")}
         _prune_daily(STATS["daily"])           # 内存态原地 prune（副本 prune 修不了内存增长）
         _prune_daily(STATS["daily_by_model"])  # 内存态原地 prune（副本 prune 修不了内存增长）
         daily = {k: dict(v) for k, v in STATS["daily"].items()}  # prune 后拷贝：磁盘与内存一致
@@ -281,13 +281,15 @@ def load_stats_counters(path: str) -> dict:
     """从持久化文件读累计计数；缺文件/损坏/legacy 无 stats 键 → 各键零值。"""
     stats = _load_persist_file(path).get("stats")
     out = {}
-    for key in ("requests_total", "filtered_total", "errors_total", "empty_retries_total"):
+    for key in ("requests_total", "filtered_total", "errors_total", "empty_retries_total",
+                "eof_without_done_total"):
         value = stats.get(key) if isinstance(stats, dict) else None
         out[key] = value if isinstance(value, int) and value >= 0 else 0
     return out
 
 
-_DAILY_FIELDS = ("requests", "filtered", "errors_proxy", "errors_upstream", "retries")
+_DAILY_FIELDS = ("requests", "filtered", "errors_proxy", "errors_upstream",
+                 "retries", "eof_without_done")
 
 
 def load_daily_buckets(path: str) -> dict:
@@ -413,7 +415,8 @@ def _record_request(method: str, path: str, status: int, dur_ms: float,
             if entry_dm is None and len(day_models) < BY_MODEL_CAP:
                 entry_dm = day_models[model] = {"requests": 0, "filtered": 0,
                                                 "errors_proxy": 0,
-                                                "errors_upstream": 0, "retries": 0}
+                                                "errors_upstream": 0, "retries": 0,
+                                                "eof_without_done": 0}
             if entry_dm is not None:  # 每日独立 cap：键数达上限后新模型不记录
                 entry_dm["requests"] += 1
                 entry_dm["filtered"] += filtered
@@ -423,7 +426,8 @@ def _record_request(method: str, path: str, status: int, dur_ms: float,
                     entry_dm["errors_upstream"] += 1
         bucket = STATS["daily"].setdefault(
             today_key(), {"requests": 0, "filtered": 0,
-                          "errors_proxy": 0, "errors_upstream": 0, "retries": 0})
+                          "errors_proxy": 0, "errors_upstream": 0, "retries": 0,
+                          "eof_without_done": 0})
         bucket["requests"] += 1
         bucket["filtered"] += filtered
         if error:
@@ -451,7 +455,7 @@ def _record_poison_preview(raw: bytes) -> None:
 
 def _record_empty_retry(model=None) -> None:
     """空流重试计数：STATS 总量 + 当日桶 + daily_by_model。
-    entry/桶形状必须与 _record_request 同步：dm entry 同为 5 字段（本函数无
+    entry/桶形状必须与 _record_request 同步：dm entry 同为 6 字段（本函数无
     error/status 参数，errors_* 仅保形状不归因）；旧持久化桶经 load_daily_buckets
     的 _DAILY_FIELDS 清洗已补键。形状不同步时 += 直接 KeyError。"""
     global _stats_dirty
@@ -463,14 +467,41 @@ def _record_empty_retry(model=None) -> None:
             if entry_dm is None and len(day_models) < BY_MODEL_CAP:
                 entry_dm = day_models[model] = {"requests": 0, "filtered": 0,
                                                 "errors_proxy": 0,
-                                                "errors_upstream": 0, "retries": 0}
+                                                "errors_upstream": 0, "retries": 0,
+                                                "eof_without_done": 0}
             if entry_dm is not None:  # 每日独立 cap：键数达上限后新模型不记录
                 entry_dm["retries"] += 1
         bucket = STATS["daily"].setdefault(
             today_key(), {"requests": 0, "filtered": 0,
-                          "errors_proxy": 0, "errors_upstream": 0, "retries": 0})
+                          "errors_proxy": 0, "errors_upstream": 0, "retries": 0,
+                          "eof_without_done": 0})
         bucket["retries"] += 1
         EVENTS.append({"ts": time.time(), "kind": "retry", "model": model, "status": None})
+        _stats_dirty = True
+
+
+def _record_eof_without_done(model=None) -> None:
+    """EOF-without-done 计数：STATS 总量 + 当日桶 + daily_by_model。
+    逐行镜像 _record_empty_retry（entry/桶形状同步），仅去掉 EVENTS 追加——
+    eof 信号由计数器 + result 标记承载（spec Exclusions：事件流不扩展）。"""
+    global _stats_dirty
+    with STATS_LOCK:
+        STATS["eof_without_done_total"] += 1
+        if model:
+            day_models = STATS["daily_by_model"].setdefault(today_key(), {})
+            entry_dm = day_models.get(model)
+            if entry_dm is None and len(day_models) < BY_MODEL_CAP:
+                entry_dm = day_models[model] = {"requests": 0, "filtered": 0,
+                                                "errors_proxy": 0,
+                                                "errors_upstream": 0, "retries": 0,
+                                                "eof_without_done": 0}
+            if entry_dm is not None:  # 每日独立 cap：键数达上限后新模型不记录
+                entry_dm["eof_without_done"] += 1
+        bucket = STATS["daily"].setdefault(
+            today_key(), {"requests": 0, "filtered": 0,
+                          "errors_proxy": 0, "errors_upstream": 0, "retries": 0,
+                          "eof_without_done": 0})
+        bucket["eof_without_done"] += 1
         _stats_dirty = True
 
 
@@ -568,7 +599,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         if "text/event-stream" in content_type:
             retried = 0
             try:
-                filtered = self._relay_sse(resp, final=(EMPTY_RETRY_MAX < 1))
+                filtered, truncated = self._relay_sse(resp, final=(EMPTY_RETRY_MAX < 1))
             except _EmptyStream as exc:
                 filtered = exc.filtered  # attempt-1 已滤毒缓冲随重试丢弃，filtered 只计交付流
                 retried = 1
@@ -582,8 +613,13 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     _record_request(self.command, self.path, 502,
                                     (time.time() - started) * 1000, 0, model=model, error=True)
                     return
-                filtered = self._relay_sse(resp, final=True)
+                filtered, truncated = self._relay_sse(resp, final=True)
             result = "ok" if resp.status < 400 else "upstream-err"  # 重试后按实际 resp 重算
+            if result == "ok" and truncated:
+                # 仅覆盖 ok：upstream-err（status≥400 更有信息量）与 aborted（异常
+                # 路径不经此处）不误标；priming EOF 由 retries 计数承载，避免双计数
+                result = "eof-without-done"
+                _record_eof_without_done(model)
             self._log(started, resp.status, result, filtered, model=model, retried=retried)
             _record_request(self.command, self.path, resp.status,
                             (time.time() - started) * 1000, filtered, model=model)
@@ -616,11 +652,13 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.close_connection = True
 
-    def _relay_sse(self, resp: http.client.HTTPResponse, final: bool) -> int:
+    def _relay_sse(self, resp: http.client.HTTPResponse, final: bool) -> tuple:
         old_timeout = self.connection.gettimeout()
         self.connection.settimeout(SEND_TIMEOUT_S)
         try:
             filtered = 0
+            saw_done = False   # 全程（priming+streaming）是否见过 [DONE] record
+            truncated = False  # streaming 阶段 EOF 且全程无 done → 上游截断标记
             pending = []      # 当前 SSE record 的行缓冲（不含终结空行）
             poisoned = False  # 当前 record 内是否命中毒行
             primed = []       # priming 阶段已滤毒缓冲的完整 record 行（含终结空行）
@@ -630,6 +668,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 if line in (b"\n", b"\r\n", b""):
                     # b"\n"/b"\r\n" = record 终结；b"" = EOF（残留 record 同规则收尾）
                     kinds = [sse_data_line_kind(buf_line) for buf_line in pending]
+                    saw_done = saw_done or ("done" in kinds)
                     if poisoned:
                         filtered += 1  # 整 record（含终结空行）丢弃，不损伤相邻字节（priming 期不进 primed）
                         _record_poison_preview(b"".join(pending))
@@ -659,12 +698,14 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                                 self.wfile.flush()
                             else:
                                 raise _EmptyStream(filtered, primed)
+                        else:
+                            truncated = not saw_done  # streaming EOF 无 done = 上游截断
                         break
                 else:
                     if POISON_RE.match(line.rstrip(b"\r\n")):
                         poisoned = True
                     pending.append(line)
-            return filtered
+            return filtered, truncated
         finally:
             self.connection.settimeout(old_timeout)
 
@@ -1356,6 +1397,7 @@ def main() -> None:
         STATS["filtered_total"] = counters["filtered_total"]
         STATS["errors_total"] = counters["errors_total"]
         STATS["empty_retries_total"] = counters["empty_retries_total"]
+        STATS["eof_without_done_total"] = counters["eof_without_done_total"]
         STATS["daily"] = daily
         STATS["daily_by_model"] = daily_by_model
         EVENTS.clear()
