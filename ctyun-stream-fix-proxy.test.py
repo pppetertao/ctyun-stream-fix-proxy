@@ -10,8 +10,10 @@
 """
 
 import collections
+import contextlib
 import http.client
 import importlib.util
+import io
 import json
 import os
 import re
@@ -1156,6 +1158,25 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         finally:
             sys.stderr = orig
 
+    def test_log_exc_field_single_line_and_placeholder(self) -> None:
+        mod = self.mod
+        handler = object.__new__(mod.ProxyHandler)
+        handler.command = "POST"
+        handler.path = "/v1/chat/completions"
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            handler._log(0.0, 502, "error", 0, model="m",
+                         exc=ValueError("boom word\nnext"))
+        lines = buf.getvalue().splitlines()
+        self.assertEqual(len(lines), 1,
+                         "异常内嵌换行不得把 REQ 行裂成多行")
+        self.assertIn("exc=ValueError:_boom_word_next", lines[0])
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            handler._log(0.0, 200, "ok", 0)
+        self.assertIn("exc=-", buf.getvalue(),
+                      "无异常时必须占位 exc=-")
+
     def test_stderr_text_joins_buffer(self) -> None:
         class FakeProc:
             stderr_buf = [b"REQ a\n", b"REQ b\n"]
@@ -1400,10 +1421,33 @@ class AdminIntegrationTest(unittest.TestCase):
                       r"model=deepseek-v4-pro-0813-oc "
                       r"retried=\d+ "
                       r"retry_reason=\S+ "
+                      r"exc=\S+ "
                       r"ts=(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{4})$",
                       stderr, re.M)
-        self.assertIsNotNone(m, "REQ 行必须带 model= / retry_reason= / ts= 字段，stderr:\n" + stderr)
+        self.assertIsNotNone(m, "REQ 行必须带 model= / retry_reason= / exc= / ts= 字段，stderr:\n" + stderr)
         time.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S%z")  # %z 回析：防平台差异静默退化
+
+    def test_req_error_line_carries_exc(self) -> None:
+        upstream_port = free_port()  # 死端口：连接即 ECONNREFUSED，进 :612 首次失败分支
+        proxy_port = free_port()
+        proc = start_proxy(upstream_port, proxy_port)
+        conn = http.client.HTTPConnection("127.0.0.1", proxy_port, timeout=30)
+        conn.request("POST", "/v1/chat/completions",
+                     body=b'{"model":"m","stream":true,"messages":[]}',
+                     headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        status = resp.status
+        resp.read()
+        conn.close()
+        self.assertEqual(status, 502, "上游不可达必须由代理合成 502")
+        proc.terminate()
+        proc.wait(timeout=5)
+        stderr = stderr_text(proc)
+        m = re.search(r"^REQ POST /v1/chat/completions -> 502 dur=\d+\.\ds "
+                      r"result=error .*? exc=(\S+)\s+ts=", stderr, re.M)
+        self.assertIsNotNone(m, "error 502 REQ 行必须带 exc= 字段，stderr:\n" + stderr)
+        self.assertNotEqual(m.group(1), "-",
+                            "exc 字段不得是占位符，stderr:\n" + stderr)
 
     def test_client_abort_is_quiet_and_not_error(self) -> None:
         upstream_port = make_fake_upstream(False, big=True)
