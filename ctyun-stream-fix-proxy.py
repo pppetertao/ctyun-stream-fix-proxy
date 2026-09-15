@@ -611,7 +611,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             conn, resp = self._open_upstream(self.command, self.path, body, fwd_headers)
         except (OSError, http.client.HTTPException) as exc:
             self._reply_502(exc)
-            self._log(started, 502, "error", 0, model=model)
+            self._log(started, 502, "error", 0, model=model, exc=exc)
             _record_request(self.command, self.path, 502,
                             (time.time() - started) * 1000, 0,
                             model=model, error=True)
@@ -635,7 +635,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 except (OSError, http.client.HTTPException) as retry_exc:
                     self._reply_502(retry_exc)  # 客户端尚未收到字节，502 语义与既有路径一致
                     self._log(started, 502, "error", 0, model=model, retried=1,
-                              retry_reason=retry_reason)
+                              retry_reason=retry_reason, exc=retry_exc)
                     _record_request(self.command, self.path, 502,
                                     (time.time() - started) * 1000, 0, model=model, error=True)
                     return
@@ -790,12 +790,16 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         self.close_connection = True
 
     def _log(self, started: float, status: int, result: str, filtered: int, model=None,
-             retried: int = 0, retry_reason: str = "") -> None:
+             retried: int = 0, retry_reason: str = "", exc=None) -> None:
+        exc_field = "-"
+        if exc is not None:
+            exc_field = re.sub(r"\s+", "_",
+                               ("%s: %s" % (type(exc).__name__, exc)).strip())[:200]
         _safe_log_stderr("REQ %s %s -> %d dur=%.1fs result=%s filtered=%d "
-                         "model=%s retried=%d retry_reason=%s ts=%s"
+                         "model=%s retried=%d retry_reason=%s exc=%s ts=%s"
                          % (self.command, self.path, status, time.time() - started,
                             result, filtered, model or "-", retried,
-                            retry_reason or "-",
+                            retry_reason or "-", exc_field,
                             time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime())))
 
 
