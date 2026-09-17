@@ -181,6 +181,35 @@ def extract_model(body):
     return model if isinstance(model, str) and model else None
 
 
+def normalize_null_assistant_content(body):
+    """把 messages 内 role=assistant 且显式 content:null 的消息归一为 content:""。
+
+    其余一切输入原样返回：空 body、非 JSON（ValueError 系）、顶层非 dict、
+    messages 非 list、无改动时返回**原 bytes 对象**（byte-identical 透传，
+    保上游 prompt cache）；序列化异常 fail-open 返回原 body，永不抛出。
+    """
+    if not body:
+        return body
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return body
+    if not isinstance(data, dict) or not isinstance(data.get("messages"), list):
+        return body
+    changed = False
+    for msg in data["messages"]:
+        if (isinstance(msg, dict) and msg.get("role") == "assistant"
+                and "content" in msg and msg["content"] is None):
+            msg["content"] = ""
+            changed = True
+    if not changed:
+        return body
+    try:
+        return json.dumps(data, ensure_ascii=False).encode("utf-8")
+    except (TypeError, ValueError):
+        return body
+
+
 def today_key() -> str:
     """当日日期桶 key（本地时区）；模块级函数便于测试 patch 模拟跨天。"""
     return time.strftime("%Y-%m-%d", time.localtime())
@@ -595,6 +624,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(length) if length > 0 else None
         model = extract_model(body)
+        body = normalize_null_assistant_content(body)
 
         fwd_headers = {}
         for key, value in self.headers.items():
