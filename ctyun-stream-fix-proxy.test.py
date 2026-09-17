@@ -55,11 +55,14 @@ class FakeUpstreamHandler(BaseHTTPRequestHandler):
     fault_finish_first = False   # True → 首呼回 SSE_FAULT_TAIL 后断连，次呼正常 body
     fault_finish_stream = False  # True → 每呼回故障尾段（SSE_FAULT_TAIL）
     calls = None          # 共享 list：非 None 时按调用序 append 计数；无 body_override 时首次回空流
+    bodies = None        # 共享 list：非 None 时按调用序 append 收到的原始请求体 bytes
 
     def do_POST(self) -> None:
         length = int(self.headers.get("Content-Length") or 0)
         if length > 0:
-            self.rfile.read(length)
+            raw = self.rfile.read(length)
+            if self.bodies is not None:
+                self.bodies.append(raw)
         if self.fail_500:
             body = b'{"error":"upstream exploded"}'
             self.send_response(500)
@@ -168,12 +171,13 @@ def make_fake_upstream(poison: bool, tag: str = "/plain", big: bool = False,
                        blank_stream: bool = False, body_override=None,
                        fault_finish_first: bool = False,
                        fault_finish_stream: bool = False,
-                       scripted: bool = False) -> int:
+                       scripted: bool = False, record_bodies: bool = False) -> int:
     attrs = {"poison": poison, "tag": tag, "big": big, "fail_500": fail_500,
              "empty_stream": empty_stream, "blank_stream": blank_stream,
              "body_override": body_override,
              "fault_finish_first": fault_finish_first,
-             "fault_finish_stream": fault_finish_stream}
+             "fault_finish_stream": fault_finish_stream,
+             "bodies": [] if record_bodies else None}
     if scripted:
         attrs["calls"] = []
     handler = type("FakeUpstreamHandler", (FakeUpstreamHandler,), attrs)
@@ -189,6 +193,12 @@ def make_scripted_upstream(**kwargs) -> tuple:
     fault_finish_first / fault_finish_stream（勿传 scripted/poison）。"""
     port = make_fake_upstream(False, scripted=True, **kwargs)
     return port, FAKE_SERVERS[-1].RequestHandlerClass.calls
+
+
+def make_body_recording_upstream(**kwargs) -> tuple:
+    """记录上游收到的原始请求体：返回 (port, bodies)；正常路径响应 SSE_A+SSE_B+DONE。"""
+    port = make_fake_upstream(False, record_bodies=True, **kwargs)
+    return port, FAKE_SERVERS[-1].RequestHandlerClass.bodies
 
 
 def stop_fake_upstreams() -> None:
@@ -286,9 +296,10 @@ def start_proxy(upstream_port: int, proxy_port: int, extra_env: dict = None,
     return proc
 
 
-def post_sse(port: int) -> bytes:
+def post_sse(port: int, payload: bytes = None) -> bytes:
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
-    payload = b'{"model":"deepseek-v4-pro-0813-oc","stream":true,"messages":[]}'
+    if payload is None:
+        payload = b'{"model":"deepseek-v4-pro-0813-oc","stream":true,"messages":[]}'
     conn.request("POST", "/v1/chat/completions", body=payload,
                  headers={"Content-Type": "application/json"})
     resp = conn.getresponse()
@@ -456,6 +467,63 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         self.assertIsNone(f(b"[1,2,3]"))
         self.assertIsNone(f(b'{"model":123}'))
         self.assertIsNone(f(b'{"model":""}'))
+
+    def test_normalize_null_assistant_content_basic(self) -> None:
+        f = self.mod.normalize_null_assistant_content
+        body = json.dumps({"model": "glm-5.3-oc", "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "c1"}]},
+        ]}).encode("utf-8")
+        data = json.loads(f(body).decode("utf-8"))
+        self.assertEqual(data["messages"][1]["content"], "")
+        self.assertEqual(data["messages"][1]["tool_calls"], [{"id": "c1"}])
+        self.assertEqual(data["messages"][0]["content"], "hi")
+
+    def test_normalize_identity_without_null(self) -> None:
+        f = self.mod.normalize_null_assistant_content
+        body = b'{"model":"glm-5.3-oc","messages":[{"role":"assistant","content":"x"}]}'
+        self.assertIs(f(body), body)  # 同一对象：字节级透传
+
+    def test_normalize_mixed_only_assistant_null(self) -> None:
+        f = self.mod.normalize_null_assistant_content
+        body = json.dumps({"messages": [
+            {"role": "user", "content": None},        # user null 不动
+            {"role": "assistant", "content": None},   # 唯一改动点
+            {"role": "assistant", "content": "done"},  # 非 null 不动
+            "not-a-dict", 42,                          # 非 dict 元素跳过
+        ]}).encode("utf-8")
+        msgs = json.loads(f(body).decode("utf-8"))["messages"]
+        self.assertIsNone(msgs[0]["content"])
+        self.assertEqual(msgs[1]["content"], "")
+        self.assertEqual(msgs[2]["content"], "done")
+        self.assertEqual(msgs[3], "not-a-dict")
+        self.assertEqual(msgs[4], 42)
+
+    def test_normalize_invalid_json_passthrough(self) -> None:
+        f = self.mod.normalize_null_assistant_content
+        for body in (b"not json", b"[1,2,3]", b'{"messages":"oops"}'):
+            self.assertIs(f(body), body)
+
+    def test_normalize_none_body_passthrough(self) -> None:
+        self.assertIsNone(self.mod.normalize_null_assistant_content(None))
+
+    def test_normalize_missing_messages_passthrough(self) -> None:
+        f = self.mod.normalize_null_assistant_content
+        body = b'{"model":"glm-5.3-oc","stream":true}'
+        self.assertIs(f(body), body)
+
+    def test_normalize_missing_content_key_untouched(self) -> None:
+        f = self.mod.normalize_null_assistant_content
+        body = b'{"messages":[{"role":"assistant","tool_calls":[{"id":"c1"}]}]}'
+        self.assertIs(f(body), body)  # 键不存在 != content:null
+
+    def test_normalize_non_assistant_null_untouched(self) -> None:
+        f = self.mod.normalize_null_assistant_content
+        body = json.dumps({"messages": [
+            {"role": "tool", "content": None},
+            {"role": "user", "content": None},
+        ]}).encode("utf-8")
+        self.assertIs(f(body), body)  # 无改动 -> 原 bytes 对象
 
     def test_sse_data_line_kind_matrix(self) -> None:
         f = self.mod.sse_data_line_kind
@@ -1917,6 +1985,35 @@ class AdminIntegrationTest(unittest.TestCase):
         self.assertEqual(len(data), len(body),
                          "fail-open must deliver all bytes, expected %d got %d"
                          % (len(body), len(data)))
+
+    def test_upstream_receives_normalized_null_content(self) -> None:
+        """端到端：assistant content:null 经代理后上游收到 content:"" 归一体；
+        无 null 的请求上游收到字节级一致 body。"""
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        upstream_port, bodies = make_body_recording_upstream()
+        self.proc = start_proxy(upstream_port, free_port())
+        payload = json.dumps({
+            "model": "glm-5.3-oc", "stream": True,
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": None,
+                 "tool_calls": [{"id": "c1", "type": "function",
+                                 "function": {"name": "f", "arguments": "{}"}}]},
+            ],
+        }).encode("utf-8")
+        data = post_sse(self.proc.proxy_port, payload)
+        self.assertEqual(data, SSE_A + SSE_B + SSE_DONE)
+        self.assertEqual(len(bodies), 1)
+        sent = json.loads(bodies[0].decode("utf-8"))
+        self.assertEqual(sent["messages"][1]["content"], "")
+        self.assertEqual(sent["messages"][1]["tool_calls"][0]["id"], "c1")
+        clean = json.dumps({"model": "glm-5.3-oc", "stream": True,
+                            "messages": [{"role": "user", "content": "hi"}]}).encode("utf-8")
+        post_sse(self.proc.proxy_port, clean)
+        self.assertEqual(len(bodies), 2)
+        self.assertEqual(bodies[1], clean)  # 无 null 请求字节级透传
 
 
 if __name__ == "__main__":
