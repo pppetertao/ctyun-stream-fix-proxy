@@ -36,6 +36,7 @@ PERSIST_PATH = os.environ.get(
     "CTYUN_PERSIST_PATH",
     os.path.expanduser("~/.local/etc/ctyun-stream-fix-proxy.json"))
 UPSTREAM_TIMEOUT = 600
+HEADER_TIMEOUT_S = max(1.0, float(os.environ.get("CTYUN_HEADER_TIMEOUT", "45")))
 # 客户端 send 超时：客户端优雅关闭(FIN)后代理的 send 会无限期阻塞（实测 sample 卡
 # __sendto），把线程永久钉死；健康读者不会让 send 阻塞超过一次缓冲排空，阻塞到此
 # 阈值即视为对端已死。env 仅作测试 seam（测试用 1s 加速）。
@@ -48,6 +49,7 @@ RANGE_KEYS = ("3d", "7d", "mtd", "last_month")  # 时间维度 tab 键序（快�
 POISON_RE = re.compile(rb"^data:\s*null\s*$")
 DONE_RE = re.compile(rb"^data:\s*\[DONE\]\s*$")
 EMPTY_RETRY_MAX = int(os.environ.get("CTYUN_EMPTY_RETRY", "1"))  # env seam，惯例同 SEND_TIMEOUT_S
+HEADER_RETRY_MAX = max(0, int(os.environ.get("CTYUN_HEADER_RETRY", "1")))
 PRIMED_TAIL_CAP = 262144  # finish hold 尾段缓冲上限（超限 fail-open 防内存膨胀）
 
 ERROR_RING_MAX = 50
@@ -69,6 +71,7 @@ ERR_KIND_EOF_NO_DONE = "eof_without_done"
 ERR_KIND_SYNTH_502 = "synth_502"
 ERR_KIND_UPSTREAM_5XX = "upstream_5xx"
 ERR_KIND_REQUEST_4XX = "request_4xx"
+ERR_KIND_HEADER_TIMEOUT = "header_timeout"
 
 _KIND_CATEGORY = {
     ERR_KIND_POISON: CLASS_POISON_FIXED,
@@ -77,6 +80,7 @@ _KIND_CATEGORY = {
     ERR_KIND_SYNTH_502: CLASS_UPSTREAM_FAULT,
     ERR_KIND_UPSTREAM_5XX: CLASS_UPSTREAM_FAULT,
     ERR_KIND_REQUEST_4XX: CLASS_REQUEST_FAULT,
+    ERR_KIND_HEADER_TIMEOUT: CLASS_UPSTREAM_FAULT,
 }
 
 
@@ -161,6 +165,12 @@ def classify_outcome(status=None, synth_502=False, client_abort=False,
 def empty_stream_should_retry(budget: int) -> bool:
     """空流重试决策：预算 > 0 时允许重试。调用点 :656 由 final=(EMPTY_RETRY_MAX < 1)
     改为 final=not empty_stream_should_retry(EMPTY_RETRY_MAX)，语义等价。"""
+    return budget > 0
+
+
+def header_timeout_should_retry(budget: int) -> bool:
+    """头超时重试决策：budget > 0 时允许重试。调用点 :864（_proxy_relay 首呼
+    (socket.timeout, RemoteDisconnected) catch）。"""
     return budget > 0
 
 
@@ -267,7 +277,7 @@ _CFG_LOCK = threading.Lock()
 STATS_LOCK = threading.Lock()
 STATS = {"requests_total": 0, "filtered_total": 0, "errors_total": 0,
          "empty_retries_total": 0, "eof_without_done_total": 0,
-         "finish_retries_total": 0,
+         "finish_retries_total": 0, "header_retries_total": 0,
          "active": 0, "daily": {}, "daily_by_model": {}}
 _stats_dirty = False  # STATS_LOCK 保护：计数落盘脏标记（SIGTERM/60s 脏刷消费）
 STARTED_AT = time.time()
@@ -457,7 +467,7 @@ def save_stats_counters(path: str) -> None:
     with STATS_LOCK:
         counters = {k: STATS[k] for k in ("requests_total", "filtered_total", "errors_total",
                                           "empty_retries_total", "eof_without_done_total",
-                                          "finish_retries_total")}
+                                          "finish_retries_total", "header_retries_total")}
         _prune_daily(STATS["daily"])           # 内存态原地 prune（副本 prune 修不了内存增长）
         _prune_daily(STATS["daily_by_model"])  # 内存态原地 prune（副本 prune 修不了内存增长）
         daily = {k: dict(v) for k, v in STATS["daily"].items()}  # prune 后拷贝：磁盘与内存一致
@@ -496,7 +506,7 @@ def load_stats_counters(path: str) -> dict:
     stats = _load_persist_file(path).get("stats")
     out = {}
     for key in ("requests_total", "filtered_total", "errors_total", "empty_retries_total",
-                "eof_without_done_total", "finish_retries_total"):
+                "eof_without_done_total", "finish_retries_total", "header_retries_total"):
         value = stats.get(key) if isinstance(stats, dict) else None
         out[key] = value if isinstance(value, int) and value >= 0 else 0
     return out
@@ -510,7 +520,7 @@ def load_capture_errors(path: str) -> bool:
 
 
 _DAILY_FIELDS = ("requests", "filtered", "errors_proxy", "errors_upstream",
-                 "retries", "eof_without_done")
+                 "retries", "eof_without_done", "header_retries")
 
 
 def load_daily_buckets(path: str) -> dict:
@@ -645,7 +655,8 @@ def _record_request(method: str, path: str, status: int, dur_ms: float,
                 entry_dm = day_models[model] = {"requests": 0, "filtered": 0,
                                                 "errors_proxy": 0,
                                                 "errors_upstream": 0, "retries": 0,
-                                                "eof_without_done": 0}
+                                                "eof_without_done": 0,
+                                                "header_retries": 0}
             if entry_dm is not None:  # 每日独立 cap：键数达上限后新模型不记录
                 entry_dm["requests"] += 1
                 entry_dm["filtered"] += filtered
@@ -656,7 +667,7 @@ def _record_request(method: str, path: str, status: int, dur_ms: float,
         bucket = STATS["daily"].setdefault(
             today_key(), {"requests": 0, "filtered": 0,
                           "errors_proxy": 0, "errors_upstream": 0, "retries": 0,
-                          "eof_without_done": 0})
+                          "eof_without_done": 0, "header_retries": 0})
         bucket["requests"] += 1
         bucket["filtered"] += filtered
         if error:
@@ -700,13 +711,14 @@ def _record_empty_retry(model=None, reason: str = "eof-priming") -> None:
                 entry_dm = day_models[model] = {"requests": 0, "filtered": 0,
                                                 "errors_proxy": 0,
                                                 "errors_upstream": 0, "retries": 0,
-                                                "eof_without_done": 0}
+                                                "eof_without_done": 0,
+                                                "header_retries": 0}
             if entry_dm is not None:  # 每日独立 cap：键数达上限后新模型不记录
                 entry_dm["retries"] += 1
         bucket = STATS["daily"].setdefault(
             today_key(), {"requests": 0, "filtered": 0,
                           "errors_proxy": 0, "errors_upstream": 0, "retries": 0,
-                          "eof_without_done": 0})
+                          "eof_without_done": 0, "header_retries": 0})
         bucket["retries"] += 1
         EVENTS.append({"ts": time.time(), "kind": "retry", "model": model, "status": None})
         _stats_dirty = True
@@ -726,14 +738,41 @@ def _record_eof_without_done(model=None) -> None:
                 entry_dm = day_models[model] = {"requests": 0, "filtered": 0,
                                                 "errors_proxy": 0,
                                                 "errors_upstream": 0, "retries": 0,
-                                                "eof_without_done": 0}
+                                                "eof_without_done": 0,
+                                                "header_retries": 0}
             if entry_dm is not None:  # 每日独立 cap：键数达上限后新模型不记录
                 entry_dm["eof_without_done"] += 1
         bucket = STATS["daily"].setdefault(
             today_key(), {"requests": 0, "filtered": 0,
                           "errors_proxy": 0, "errors_upstream": 0, "retries": 0,
-                          "eof_without_done": 0})
+                          "eof_without_done": 0, "header_retries": 0})
         bucket["eof_without_done"] += 1
+        _stats_dirty = True
+
+
+def _record_header_retry(model=None) -> None:
+    """头超时重试计数：STATS 总量 + 当日桶 + daily_by_model。
+    逐行镜像 _record_eof_without_done（entry/桶形状同步），仅去掉 EVENTS 追加——
+    头重试信号由计数器 + 错误留痕环承载（spec Exclusions：事件流不扩展）。"""
+    global _stats_dirty
+    with STATS_LOCK:
+        STATS["header_retries_total"] += 1
+        if model:
+            day_models = STATS["daily_by_model"].setdefault(today_key(), {})
+            entry_dm = day_models.get(model)
+            if entry_dm is None and len(day_models) < BY_MODEL_CAP:
+                entry_dm = day_models[model] = {"requests": 0, "filtered": 0,
+                                                "errors_proxy": 0,
+                                                "errors_upstream": 0, "retries": 0,
+                                                "eof_without_done": 0,
+                                                "header_retries": 0}
+            if entry_dm is not None:
+                entry_dm["header_retries"] += 1
+        bucket = STATS["daily"].setdefault(
+            today_key(), {"requests": 0, "filtered": 0,
+                          "errors_proxy": 0, "errors_upstream": 0, "retries": 0,
+                          "eof_without_done": 0, "header_retries": 0})
+        bucket["header_retries"] += 1
         _stats_dirty = True
 
 
@@ -818,29 +857,48 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 fwd_headers[lk] = value
         fwd_headers["accept-encoding"] = "identity"
 
+        header_retried = 0
+        header_retry_reason = ""
         try:
-            conn, resp = self._open_upstream(self.command, self.path, body, fwd_headers)
+            try:
+                conn, resp = self._open_upstream(self.command, self.path, body, fwd_headers)
+            except (socket.timeout, http.client.RemoteDisconnected) as first_exc:
+                # socket.timeout = 响应头阶段阻塞到 HEADER_TIMEOUT_S；RemoteDisconnected
+                # = 上游在响应头阶段直接关连接（未发任何响应字节）。两者同为"响应头阶段
+                # 未收到任何响应"（RemoteDisconnected ⊂ ConnectionError→OSError 且 ⊂
+                # BadStatusLine→HTTPException，外层兜底亦可捕获），priming 不可见论证
+                # 对二者同样成立：重试一次不损伤客户端交付。
+                if not header_timeout_should_retry(HEADER_RETRY_MAX):
+                    raise
+                header_retried = 1
+                header_retry_reason = "header-timeout"
+                record_error_event(ERR_KIND_HEADER_TIMEOUT, model=model, path=self.path,
+                                   exc=first_exc, body=body, retry_reason="header-timeout")
+                _record_header_retry(model)
+                conn, resp = self._open_upstream(self.command, self.path, body, fwd_headers)
         except (OSError, http.client.HTTPException) as exc:
             self._reply_502(exc)
             outcome = classify_outcome(synth_502=True)
-            self._log(started, 502, outcome.log_result, 0, model=model, exc=exc)
+            self._log(started, 502, outcome.log_result, 0, model=model, exc=exc,
+                      retried=header_retried, retry_reason=header_retry_reason)
             _record_request(self.command, self.path, 502,
                             (time.time() - started) * 1000, 0,
                             model=model, error=outcome.counts_error)
             record_error_event(ERR_KIND_SYNTH_502, model=model, path=self.path,
-                               exc=exc, body=body)
+                               exc=exc, body=body,
+                               retried=header_retried, retry_reason=header_retry_reason)
             return
 
         content_type = (resp.getheader("Content-Type") or "").lower()
         if "text/event-stream" in content_type:
-            retried = 0
-            retry_reason = ""
+            retried = header_retried
+            retry_reason = header_retry_reason
             try:
                 filtered, truncated = self._relay_sse(resp,
                     final=not empty_stream_should_retry(EMPTY_RETRY_MAX))
             except _EmptyStream as exc:
                 filtered = exc.filtered  # attempt-1 已滤毒缓冲随重试丢弃，filtered 只计交付流
-                retried = 1
+                retried = header_retried + 1
                 retry_reason = exc.reason
                 _record_empty_retry(model, exc.reason)
                 record_error_event(ERR_KIND_EMPTY_RETRY, model=model, path=self.path,
@@ -910,12 +968,18 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         upstream_path = parsed.path.rstrip("/") + path
         if parsed.scheme == "https":
             conn = http.client.HTTPSConnection(
-                parsed.hostname, parsed.port, timeout=UPSTREAM_TIMEOUT)
+                parsed.hostname, parsed.port, timeout=HEADER_TIMEOUT_S)
         else:
             conn = http.client.HTTPConnection(
-                parsed.hostname, parsed.port, timeout=UPSTREAM_TIMEOUT)
+                parsed.hostname, parsed.port, timeout=HEADER_TIMEOUT_S)
         conn.request(method, upstream_path, body=body, headers=fwd_headers)
-        return conn, conn.getresponse()
+        # getresponse() 成功返回后 conn.sock 会被置 None（socket 移交 HTTPResponse 的
+        # fp.raw），因此必须在此之前保留自己的引用；该引用与 HTTPResponse 包装的是
+        # 同一 socket 对象，settimeout 作用于体阶段读（不 poke resp.fp.raw._sock）。
+        sock = conn.sock
+        resp = conn.getresponse()
+        sock.settimeout(UPSTREAM_TIMEOUT)
+        return conn, resp
 
     def _send_sse_headers(self, resp) -> None:
         self.send_response(resp.status)
@@ -1783,6 +1847,7 @@ def main() -> None:
         STATS["empty_retries_total"] = counters["empty_retries_total"]
         STATS["eof_without_done_total"] = counters["eof_without_done_total"]
         STATS["finish_retries_total"] = counters["finish_retries_total"]
+        STATS["header_retries_total"] = counters["header_retries_total"]
         STATS["daily"] = daily
         STATS["daily_by_model"] = daily_by_model
         EVENTS.clear()

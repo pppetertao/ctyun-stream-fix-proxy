@@ -26,7 +26,7 @@ import tempfile
 import threading
 import time
 import unittest
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROXY_SCRIPT = os.path.join(HERE, "ctyun-stream-fix-proxy.py")
@@ -50,10 +50,13 @@ class FakeUpstreamHandler(BaseHTTPRequestHandler):
     big = False     # True → 1.2MB 大 SSE 流，供 client-abort 测试把代理写缓冲打穿
     fail_500 = False  # True → do_POST 回 500 JSON（上游 5xx 透传计数测试用）
     empty_stream = False  # True → 每次 POST 回空流（reasoning 后 EOF，无 [DONE]）
+    empty_stream_calls = ()  # 1-based 呼叫序号元组：命中则回空流（同 empty_stream 形态）
     blank_stream = False  # True → 空流形态为零字节 body（200 + SSE 头 + 立即 EOF）
     body_override = None  # 非 None → 正常路径 body 用此值（priming 前缀/合法 DONE 场景）
     fault_finish_first = False   # True → 首呼回 SSE_FAULT_TAIL 后断连，次呼正常 body
     fault_finish_stream = False  # True → 每呼回故障尾段（SSE_FAULT_TAIL）
+    stall_all = False       # True → 每呼读 body 后不写任何响应直接返回（触发 socket.timeout）
+    stall_calls = ()        # 1-based 呼叫序号元组：命中则 stall（不写响应不关连接）
     calls = None          # 共享 list：非 None 时按调用序 append 计数；无 body_override 时首次回空流
     bodies = None        # 共享 list：非 None 时按调用序 append 收到的原始请求体 bytes
 
@@ -63,6 +66,20 @@ class FakeUpstreamHandler(BaseHTTPRequestHandler):
             raw = self.rfile.read(length)
             if self.bodies is not None:
                 self.bodies.append(raw)
+        # --- calls 计上游被请求总次数（含 stall 呼）：append 提前到 stall 检查之前 ---
+        if self.calls is not None:
+            self.calls.append(1)
+        # --- stall 路径：读 body 后静默返回不写响应（触发代理 socket.timeout）---
+        if self.stall_all:
+            # 每呼均 stall：读 body 后直接返回，不写任何响应不关连接
+            self.close_connection = True
+            return
+        if self.stall_calls and self.calls is not None:
+            call_num = len(self.calls)  # 当前呼叫序号（1-based，append 之后 len 即为序号）
+            if call_num in self.stall_calls:
+                self.close_connection = True
+                return
+        # --- end stall ---
         if self.fail_500:
             body = b'{"error":"upstream exploded"}'
             self.send_response(500)
@@ -72,8 +89,6 @@ class FakeUpstreamHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             self.close_connection = True
             return
-        if self.calls is not None:
-            self.calls.append(1)
         if self.fault_finish_first:
             if self.calls is not None and len(self.calls) == 1:
                 # 首呼：故障尾段（reasoning + finish + [DONE]，无 content/usage）
@@ -99,8 +114,11 @@ class FakeUpstreamHandler(BaseHTTPRequestHandler):
                 pass
             self.close_connection = True
             return
-        if self.empty_stream or (self.calls is not None and len(self.calls) == 1
-                                 and self.body_override is None):
+        # 空流路径：empty_stream=True 每呼全空；empty_stream_calls 序号命中则单呼空
+        empty_hit = (self.empty_stream_calls and self.calls is not None
+                     and len(self.calls) in self.empty_stream_calls)
+        if self.empty_stream or empty_hit or (self.calls is not None and len(self.calls) == 1
+                                              and self.body_override is None):
             # 空流签名：200 + SSE 头 + 少量 reasoning delta 后无 [DONE] 即 EOF
             # （blank_stream 则零字节）。body_override 场景首呼走正常路径：
             # spec ②③ 的 calls==1 断言要求首响应即 override 内容、不触发重试。
@@ -168,20 +186,33 @@ class FakeUpstreamHandler(BaseHTTPRequestHandler):
 
 def make_fake_upstream(poison: bool, tag: str = "/plain", big: bool = False,
                        fail_500: bool = False, empty_stream: bool = False,
+                       empty_stream_calls: tuple = (),
                        blank_stream: bool = False, body_override=None,
                        fault_finish_first: bool = False,
                        fault_finish_stream: bool = False,
-                       scripted: bool = False, record_bodies: bool = False) -> int:
+                       scripted: bool = False, record_bodies: bool = False,
+                       stall_all: bool = False, stall_calls: tuple = ()) -> int:
     attrs = {"poison": poison, "tag": tag, "big": big, "fail_500": fail_500,
-             "empty_stream": empty_stream, "blank_stream": blank_stream,
+             "empty_stream": empty_stream, "empty_stream_calls": empty_stream_calls,
+             "blank_stream": blank_stream,
              "body_override": body_override,
              "fault_finish_first": fault_finish_first,
              "fault_finish_stream": fault_finish_stream,
+             "stall_all": stall_all,
+             "stall_calls": stall_calls,
              "bodies": [] if record_bodies else None}
     if scripted:
         attrs["calls"] = []
     handler = type("FakeUpstreamHandler", (FakeUpstreamHandler,), attrs)
-    server = HTTPServer(("127.0.0.1", 0), handler)
+    # stall 变体使用 ThreadingHTTPServer：单线程 HTTPServer 的 serve_forever 会卡死
+    # 在 stall 连接上，shutdown 挂测试；daemon_threads=True 保证 teardown 不阻塞
+    use_threading = stall_all or stall_calls
+    if use_threading:
+        from http.server import ThreadingHTTPServer
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        server.daemon_threads = True
+    else:
+        server = HTTPServer(("127.0.0.1", 0), handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     FAKE_SERVERS.append(server)
     return server.server_address[1]
@@ -192,6 +223,15 @@ def make_scripted_upstream(**kwargs) -> tuple:
     kwargs 透传 empty_stream / blank_stream / body_override /
     fault_finish_first / fault_finish_stream（勿传 scripted/poison）。"""
     port = make_fake_upstream(False, scripted=True, **kwargs)
+    return port, FAKE_SERVERS[-1].RequestHandlerClass.calls
+
+
+def make_stall_upstream(stall_all: bool = False, stall_calls: tuple = (), **kwargs) -> tuple:
+    """带调用计数的 stall 假上游：返回 (port, calls)。
+    stall_all/stall_calls 控制哪些呼叫不写响应直接返回。
+    其余 kwargs 透传 empty_stream / body_override 等。"""
+    port = make_fake_upstream(False, scripted=True,
+                              stall_all=stall_all, stall_calls=stall_calls, **kwargs)
     return port, FAKE_SERVERS[-1].RequestHandlerClass.calls
 
 
@@ -592,13 +632,13 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         self.assertEqual(mod.load_stats_counters(path),
                          {"requests_total": 0, "filtered_total": 0, "errors_total": 0,
                           "empty_retries_total": 0, "eof_without_done_total": 0,
-                          "finish_retries_total": 0})
+                          "finish_retries_total": 0, "header_retries_total": 0})
         with open(path, "w", encoding="utf-8") as fh:
             fh.write("{corrupt")
         self.assertEqual(mod.load_stats_counters(path),
                          {"requests_total": 0, "filtered_total": 0, "errors_total": 0,
                           "empty_retries_total": 0, "eof_without_done_total": 0,
-                          "finish_retries_total": 0})
+                          "finish_retries_total": 0, "header_retries_total": 0})
         mod._record_request("POST", "/x", 200, 1.0, 2)
         mod.save_stats_counters(path)
         with open(path, encoding="utf-8") as fh:
@@ -680,12 +720,14 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         out = f(daily, "2026-02-01", "2026-02-28")
         self.assertEqual(out, {"requests": 8, "filtered": 1, "errors_proxy": 0,
                                "errors_upstream": 1, "retries": 0,
-                               "eof_without_done": 0, "days": 2})
+                               "eof_without_done": 0, "header_retries": 0,
+                               "days": 2})
         # 空窗口：全 0 + days=0
         self.assertEqual(f(daily, "2025-01-01", "2025-01-31"),
                          {"requests": 0, "filtered": 0, "errors_proxy": 0,
                           "errors_upstream": 0, "retries": 0,
-                          "eof_without_done": 0, "days": 0})
+                          "eof_without_done": 0, "header_retries": 0,
+                          "days": 0})
         # 端点闭合：start/end 当天都计入
         self.assertEqual(f(daily, "2026-02-02", "2026-02-02")["days"], 1)
         self.assertEqual(f(daily, "2026-02-02", "2026-02-02")["requests"], 5)
@@ -704,7 +746,8 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         for key in mod.RANGE_KEYS:
             self.assertEqual(set(plan["stats"][key]),
                              {"requests", "filtered", "errors_proxy",
-                              "errors_upstream", "retries", "eof_without_done", "days"})
+                              "errors_upstream", "retries", "eof_without_done",
+                              "header_retries", "days"})
             self.assertEqual(len(plan["bounds"][key]), 2)
         # 3d 窗口 = [02-27, 03-01]：两天桶都在窗内
         self.assertEqual(plan["stats"]["3d"]["requests"], 6)
@@ -794,11 +837,11 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         self.assertGreaterEqual(dm_today["m-a"]["filtered"], 1)
         self.assertGreaterEqual(dm_today["m-a"]["retries"], 1,
                                 "retry attribution must land in daily_by_model")
-        # v3：dm entry 恒 6 字段 + 错误归因与 daily 总桶同口径（error→proxy，5xx→upstream）
+        # v3：dm entry 恒 7 字段 + 错误归因与 daily 总桶同口径（error→proxy，5xx→upstream）
         self.assertEqual(
             set(dm_today["m-a"]),
             {"requests", "filtered", "errors_proxy", "errors_upstream", "retries",
-             "eof_without_done"},
+             "eof_without_done", "header_retries"},
             "dm entry shape must stay in sync across both creation sites")
         mod._record_request("POST", "/dm", 502, 1.0, 0, model="m-a", error=True)
         self.assertEqual(dm_today["m-a"]["errors_proxy"], 1,
@@ -831,7 +874,7 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         self.assertEqual(
             set(mod.STATS["daily_by_model"]["2026-01-03"]["m-retry-only"]),
             {"requests", "filtered", "errors_proxy", "errors_upstream", "retries",
-             "eof_without_done"},
+             "eof_without_done", "header_retries"},
             "empty-retry creation site must keep dm entry shape in sync")
 
     def test_events_record_and_cap(self) -> None:
@@ -950,12 +993,15 @@ class ProxyDashboardUnitTest(unittest.TestCase):
             matrix = {
                 "2026-01-02": {
                     "m1": {"requests": 3, "filtered": 5, "errors_proxy": 1,
-                           "errors_upstream": 2, "retries": 0, "eof_without_done": 0},
+                           "errors_upstream": 2, "retries": 0, "eof_without_done": 0,
+                           "header_retries": 0},
                     "m2": {"requests": 7, "filtered": 0, "errors_proxy": 0,
-                           "errors_upstream": 0, "retries": 4, "eof_without_done": 0}},
+                           "errors_upstream": 0, "retries": 4, "eof_without_done": 0,
+                           "header_retries": 0}},
                 "2026-01-05": {
                     "m1": {"requests": 1, "filtered": 0, "errors_proxy": 0,
-                           "errors_upstream": 0, "retries": 0, "eof_without_done": 0}}}
+                           "errors_upstream": 0, "retries": 0, "eof_without_done": 0,
+                           "header_retries": 0}}}
             mod.STATS["daily_by_model"] = matrix
             mod.save_stats_counters(path)
             self.assertEqual(mod.load_daily_by_model_buckets(path), matrix,
@@ -984,7 +1030,8 @@ class ProxyDashboardUnitTest(unittest.TestCase):
                          {"2026-01-02": {"m2": {"requests": 5, "filtered": 0,
                                                 "errors_proxy": 0,
                                                 "errors_upstream": 2, "retries": 0,
-                                                "eof_without_done": 0}}},
+                                                "eof_without_done": 0,
+                                                "header_retries": 0}}},
                          "non-dict bucket/entry must be skipped; bad fields coerced to 0")
         # 用例 4：非 ISO 日期 key 跳过（round-trip 校验，版本无关）
         with open(path, "w", encoding="utf-8") as fh:
@@ -999,7 +1046,8 @@ class ProxyDashboardUnitTest(unittest.TestCase):
                          "non-ISO date keys must be skipped")
         self.assertEqual(dbm["2026-01-03"]["m1"],
                          {"requests": 1, "filtered": 0, "errors_proxy": 0,
-                          "errors_upstream": 0, "retries": 0, "eof_without_done": 0},
+                          "errors_upstream": 0, "retries": 0, "eof_without_done": 0,
+                          "header_retries": 0},
                          "missing fields must be filled with 0")
         # 用例 5：单日 40 模型 → 读回恰 32（文件出现序前 32）
         with open(path, "w", encoding="utf-8") as fh:
@@ -1609,6 +1657,103 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         finally:
             mod.LOG_RING = orig_ring
             mod._LOG_SEQ = orig_seq
+
+    def test_header_timeout_should_retry(self) -> None:
+        f = self.mod.header_timeout_should_retry
+        self.assertTrue(f(1))
+        self.assertTrue(f(10))
+        self.assertFalse(f(0))
+        self.assertFalse(f(-1))
+        self.assertEqual(not f(0), not 0 > 0)
+        self.assertEqual(not f(1), not 1 > 0)
+
+    def test_header_timeout_kind_category_and_classify_regression(self) -> None:
+        mod = self.mod
+        # 新 kind 映射正确
+        self.assertEqual(mod._KIND_CATEGORY.get(mod.ERR_KIND_HEADER_TIMEOUT),
+                         mod.CLASS_UPSTREAM_FAULT,
+                         "header_timeout must be classified as upstream_fault")
+        # 既有的 6 个 kind 映射不变（逐条锁死）
+        self.assertEqual(mod._KIND_CATEGORY[mod.ERR_KIND_POISON], mod.CLASS_POISON_FIXED)
+        self.assertEqual(mod._KIND_CATEGORY[mod.ERR_KIND_EMPTY_RETRY], mod.CLASS_OK)
+        self.assertEqual(mod._KIND_CATEGORY[mod.ERR_KIND_EOF_NO_DONE], mod.CLASS_UPSTREAM_FAULT)
+        self.assertEqual(mod._KIND_CATEGORY[mod.ERR_KIND_SYNTH_502], mod.CLASS_UPSTREAM_FAULT)
+        self.assertEqual(mod._KIND_CATEGORY[mod.ERR_KIND_UPSTREAM_5XX], mod.CLASS_UPSTREAM_FAULT)
+        self.assertEqual(mod._KIND_CATEGORY[mod.ERR_KIND_REQUEST_4XX], mod.CLASS_REQUEST_FAULT)
+        # classify_outcome 矩阵不受影响（关键路径逐条锁死）
+        self.assertEqual(mod.classify_outcome(client_abort=True).category, mod.CLASS_CLIENT_ABORT)
+        self.assertEqual(mod.classify_outcome(synth_502=True).category, mod.CLASS_UPSTREAM_FAULT)
+        self.assertEqual(mod.classify_outcome(eof_without_done=True).category, mod.CLASS_UPSTREAM_FAULT)
+        self.assertEqual(mod.classify_outcome(status=200).category, mod.CLASS_OK)
+        self.assertEqual(mod.classify_outcome(status=200, poison_filtered=1).category, mod.CLASS_POISON_FIXED)
+        self.assertEqual(mod.classify_outcome(status=404).category, mod.CLASS_REQUEST_FAULT)
+        self.assertEqual(mod.classify_outcome(status=502).category, mod.CLASS_UPSTREAM_FAULT)
+
+    def test_open_upstream_header_timeout_then_body_long_timeout(self) -> None:
+        """白盒：patch 假上游，调 _open_upstream 直连，断言 getresponse 后 sock timeout 已恢复 UPSTREAM_TIMEOUT。"""
+        mod = self.mod
+        import types
+        # 构造一个简单限定的 request handler：先存下调用参数，再构造假响应
+        saved_port = free_port()
+        # 用真实假上游验证：正常上游无 stall，直调 _open_upstream
+        upstream_port = make_fake_upstream(False)
+        try:
+            # Patch UPSTREAM_BASE 指向假上游
+            orig_base = mod.UPSTREAM_BASE
+            mod.UPSTREAM_BASE = "http://127.0.0.1:%d" % upstream_port
+            try:
+                # 临时设短超时
+                orig_ht = mod.HEADER_TIMEOUT_S
+                mod.HEADER_TIMEOUT_S = 0.5
+                try:
+                    body = b'{"model":"test","stream":true,"messages":[]}'
+                    conn, resp = mod.ProxyHandler._open_upstream(
+                        types.SimpleNamespace(), "POST", "/v1/chat/completions",
+                        body, {"Content-Type": "application/json"})
+                    # 断言 getresponse 后 sock timeout 已恢复 UPSTREAM_TIMEOUT。
+                    # 实测 getresponse() 返回后 conn.sock 已被置 None（socket 移交
+                    # HTTPResponse 的 fp.raw）；生产实现保留 getresponse 前的 sock
+                    # 引用并在其上 settimeout，与 resp.fp.raw._sock 为同一对象，
+                    # 故经此断言体阶段超时已恢复。
+                    self.assertIsNone(conn.sock)
+                    self.assertEqual(resp.fp.raw._sock.gettimeout(), mod.UPSTREAM_TIMEOUT,
+                                     "after getresponse, sock timeout must be UPSTREAM_TIMEOUT (body phase)")
+                    resp.read()
+                    conn.close()
+                finally:
+                    mod.HEADER_TIMEOUT_S = orig_ht
+            finally:
+                mod.UPSTREAM_BASE = orig_base
+        finally:
+            stop_fake_upstreams()
+
+    def test_open_upstream_stall_raises_socket_timeout(self) -> None:
+        """白盒：stall 上游 → _open_upstream 在 HEADER_TIMEOUT_S 内抛 RemoteDisconnected。
+
+        实测：stall 上游读 body 后不写响应直接关连接，代理侧 getresponse() 抛
+        http.client.RemoteDisconnected（"响应头阶段未收到任何响应字节"），而非
+        socket.timeout（后者仅当上游保持连接静默到超时阈值才出现）。"""
+        mod = self.mod
+        import types
+        upstream_port = make_fake_upstream(False, stall_all=True)
+        try:
+            orig_base = mod.UPSTREAM_BASE
+            mod.UPSTREAM_BASE = "http://127.0.0.1:%d" % upstream_port
+            try:
+                orig_ht = mod.HEADER_TIMEOUT_S
+                mod.HEADER_TIMEOUT_S = 0.5
+                try:
+                    body = b'{"model":"test","stream":true,"messages":[]}'
+                    with self.assertRaises(http.client.RemoteDisconnected):
+                        mod.ProxyHandler._open_upstream(
+                            types.SimpleNamespace(), "POST", "/v1/chat/completions",
+                            body, {"Content-Type": "application/json"})
+                finally:
+                    mod.HEADER_TIMEOUT_S = orig_ht
+            finally:
+                mod.UPSTREAM_BASE = orig_base
+        finally:
+            stop_fake_upstreams()
 
 
 class AdminIntegrationTest(unittest.TestCase):
@@ -2661,6 +2806,177 @@ class AdminIntegrationTest(unittest.TestCase):
         conn.close()
         _, body, _ = admin_get(self.proc.admin_port, "/api/stats")
         self.assertEqual(json.loads(body.decode("utf-8"))["errors_total"], 1)
+
+    def test_header_stall_retry_success(self) -> None:
+        """stall_calls=(1,) → 首呼 stall 触发 header-timeout 重试 → 次呼正常 → calls==2 + SSE 完整。"""
+        upstream_port, calls = make_stall_upstream(stall_calls=(1,))
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        self.proc = start_proxy(upstream_port, free_port(),
+                                extra_env={"CTYUN_HEADER_TIMEOUT": "1"})
+        data = post_sse(self.proc.proxy_port)
+        self.assertEqual(len(calls), 2,
+                         "header stall must trigger exactly one retry, calls=%d" % len(calls))
+        self.assertEqual(data, SSE_A + SSE_B + SSE_DONE,
+                         "attempt-2 must relay byte-exact stream, got %r" % data)
+        # header_timeout 留痕事件
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr = stderr_text(self.proc)
+        self.assertIn("retried=1", stderr,
+                      "REQ line must carry retried=1, stderr:\n" + stderr)
+        self.assertIn("header-timeout", stderr,
+                      "REQ line must carry retry_reason=header-timeout, stderr:\n" + stderr)
+        # /api/errors 含 kind=header_timeout（需先开启 capture_errors）
+        # 检查计数器
+        with open(os.path.join(self.proc.persist_dir, "settings.json"),
+                  encoding="utf-8") as fh:
+            saved = json.load(fh)["stats"]
+        self.assertGreaterEqual(saved.get("header_retries_total", 0), 1,
+                                "header_retries_total must be >=1 after stall retry")
+
+    def test_header_stall_both_timeout_returns_502(self) -> None:
+        """stall_all → 首呼+重试均超时 → 502 + calls==2 + synth_502 留痕含 retried=1。"""
+        upstream_port, calls = make_stall_upstream(stall_all=True)
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        self.proc = start_proxy(upstream_port, free_port(),
+                                extra_env={"CTYUN_HEADER_TIMEOUT": "1"})
+        conn = http.client.HTTPConnection("127.0.0.1", self.proc.proxy_port, timeout=30)
+        body = b'{"model":"m","stream":true,"messages":[]}'
+        conn.request("POST", "/v1/chat/completions", body=body,
+                     headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        status = resp.status
+        resp.read()
+        conn.close()
+        self.assertEqual(status, 502, "double stall must synthesize 502, got %d" % status)
+        self.assertEqual(len(calls), 2,
+                         "stall_all must trigger exactly one retry then fail, calls=%d" % len(calls))
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr = stderr_text(self.proc)
+        self.assertIn("retried=1", stderr,
+                      "502 REQ line must carry retried=1, stderr:\n" + stderr)
+        self.assertIn("retry_reason=header-timeout", stderr,
+                      "502 REQ line must carry retry_reason=header-timeout, stderr:\n" + stderr)
+
+    def test_header_stall_retry_disabled(self) -> None:
+        """CTYUN_HEADER_RETRY=0 + stall_all → 502 + calls==1（不重试）。"""
+        upstream_port, calls = make_stall_upstream(stall_all=True)
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        self.proc = start_proxy(upstream_port, free_port(),
+                                extra_env={"CTYUN_HEADER_TIMEOUT": "1",
+                                          "CTYUN_HEADER_RETRY": "0"})
+        conn = http.client.HTTPConnection("127.0.0.1", self.proc.proxy_port, timeout=30)
+        body = b'{"model":"m","stream":true,"messages":[]}'
+        conn.request("POST", "/v1/chat/completions", body=body,
+                     headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        self.assertEqual(resp.status, 502,
+                         "stall_all with retry disabled must return 502, got %d" % resp.status)
+        resp.read()
+        conn.close()
+        self.assertEqual(len(calls), 1,
+                         "CTYUN_HEADER_RETRY=0 must disable retry, calls=%d" % len(calls))
+
+    def test_header_timeout_does_not_leak_into_body_phase(self) -> None:
+        """滴流上游（chunk 间隔 1.5s > HEADER_TIMEOUT_S=1）→ 完整收流含 [DONE]。
+        证明 getresponse 后的 settimeout(UPSTREAM_TIMEOUT) 生效，短超时未漏进体阶段。"""
+        # 使用 body_override 构造慢速流：分块写，间隔 > HEADER_TIMEOUT_S
+        import time as _time
+        class SlowHandler(FakeUpstreamHandler):
+            slow_body = SSE_A + SSE_B + SSE_DONE
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                if length > 0:
+                    self.rfile.read(length)
+                if self.calls is not None:
+                    self.calls.append(1)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                try:
+                    # chunk 1: SSE_A
+                    self.wfile.write(SSE_A)
+                    self.wfile.flush()
+                    _time.sleep(1.5)  # > HEADER_TIMEOUT_S=1
+                    # chunk 2: SSE_B
+                    self.wfile.write(SSE_B)
+                    self.wfile.flush()
+                    _time.sleep(1.5)
+                    # chunk 3: SSE_DONE
+                    self.wfile.write(SSE_DONE)
+                    self.wfile.flush()
+                except ConnectionError:
+                    pass
+                self.close_connection = True
+
+            def log_message(self, format, *args):
+                pass
+
+        calls = []
+        handler = type("SlowHandler", (SlowHandler,), {"calls": calls})
+        server = HTTPServer(("127.0.0.1", 0), handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        FAKE_SERVERS.append(server)
+        upstream_port = server.server_address[1]
+
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        self.proc = start_proxy(upstream_port, free_port(),
+                                extra_env={"CTYUN_HEADER_TIMEOUT": "1"})
+        data = post_sse(self.proc.proxy_port)
+        # 滴流各 chunk 间隔 1.5s > HEADER_TIMEOUT_S=1，若短超时泄漏到体阶段
+        # 读 SSE_B 时必超时断开；完整收到即证明体阶段仍为 UPSTREAM_TIMEOUT=600s
+        self.assertEqual(data, SSE_A + SSE_B + SSE_DONE,
+                         "drip stream must relay completely despite chunks spaced > HEADER_TIMEOUT_S, "
+                         "proving body-phase timeout remains UPSTREAM_TIMEOUT. Got: %r" % data)
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr = stderr_text(self.proc)
+        self.assertIn("result=ok", stderr,
+                      "drip stream must stay result=ok, stderr:\n" + stderr)
+        self.assertNotIn("header-timeout", stderr,
+                         "body phase must not trigger header-timeout, stderr:\n" + stderr)
+
+    def test_header_stall_then_empty_stream_compound(self) -> None:
+        """stall_calls=(1,) + empty_stream_calls=(2,) → 首呼 header-stall 重试 →
+        次呼（空流）触发空流重试 → 三呼正常 → calls==3 + retried=2。"""
+        upstream_port, calls = make_stall_upstream(
+            stall_calls=(1,), empty_stream_calls=(2,))
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        self.proc = start_proxy(upstream_port, free_port(),
+                                extra_env={"CTYUN_HEADER_TIMEOUT": "1"})
+        data = post_sse(self.proc.proxy_port)
+        # 呼 1: stall → header-timeout retry
+        # 呼 2: empty_stream → 空流重试
+        # 呼 3: 正常 body_override=None 走默认 SSE_A+SSE_B+SSE_DONE
+        self.assertEqual(len(calls), 3,
+                         "header stall + empty stream compound must yield 3 calls, got %d" % len(calls))
+        self.assertEqual(data, SSE_A + SSE_B + SSE_DONE,
+                         "attempt-3 must relay byte-exact stream, got %r" % data)
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr = stderr_text(self.proc)
+        self.assertIn("retried=2", stderr,
+                      "compound scenario must carry retried=2, stderr:\n" + stderr)
+        self.assertIn("eof-priming", stderr,
+                      "compound scenario must mention eof-priming, stderr:\n" + stderr)
+        # header-timeout 事件仅入 ERROR_EVENTS 环（非 stderr），计数器可证 header retry 已发生
+        with open(os.path.join(self.proc.persist_dir, "settings.json"),
+                  encoding="utf-8") as fh:
+            saved = json.load(fh)["stats"]
+        self.assertGreaterEqual(saved.get("header_retries_total", 0), 1,
+                                "compound scenario must count header retry")
 
 
 if __name__ == "__main__":

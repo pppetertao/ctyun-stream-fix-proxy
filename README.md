@@ -25,6 +25,7 @@
 
 - `ThreadingHTTPServer` + `http.client` 阻塞反代，纯 stdlib
 - SSE 中继逐 record flush；relay 期间客户端 socket 设发送超时（默认 60s），避免客户端断开后写阻塞钉死线程
+- 头阶段（连接+请求发送+响应头读取）默认 45s 短超时、超时自动重试一次（重试对客户端不可见）；响应头到达后恢复长超时 600s 逐读 body/流式阶段
 - 统计每 60s 脏刷 + SIGTERM/SIGINT 落盘（原子写），daily 桶 90 天 prune
 - 错误双口径：`errors_proxy`（代理合成错误）与 `errors_upstream`（上游 ≥500 透传）互斥统计
 
@@ -51,6 +52,8 @@ launchctl kickstart -k gui/$UID/com.ctyun-stream-fix-proxy
 | `CTYUN_ADMIN_TOKEN` | 空 | 局域网访问 `POST /api/config` 所需 token（未设则 LAN 只读） |
 | `CTYUN_PERSIST_PATH` | `~/.local/etc/ctyun-stream-fix-proxy.json` | 统计持久化文件路径（原子写） |
 | `CTYUN_SEND_TIMEOUT` | `60` | relay 期间客户端 socket 发送超时（秒） |
+| `CTYUN_HEADER_TIMEOUT` | `45` | 头阶段（连接+响应头）超时（秒），最小值 1 |
+| `CTYUN_HEADER_RETRY` | `1` | 头超时自动重试次数（0 禁用） |
 
 配置优先级：env > 持久化文件 > 内置默认。
 
