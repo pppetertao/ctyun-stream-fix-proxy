@@ -315,13 +315,14 @@ def resolve_upstream_base(env_base: str, persist_path: str) -> tuple:
     return DEFAULT_UPSTREAM_BASE, "default"
 
 
-def persist_upstream(base: str, path: str) -> None:
+def persist_upstream(base: str, path: str, capture_errors: bool = False) -> None:
     directory = os.path.dirname(path)
     if directory:
         os.makedirs(directory, exist_ok=True)
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump({"upstream_base": base}, fh, ensure_ascii=False)
+        json.dump({"upstream_base": base, "capture_errors": capture_errors},
+                  fh, ensure_ascii=False)
     os.replace(tmp, path)  # 同目录原子替换，读侧不会见到半截文件
 
 
@@ -465,12 +466,14 @@ def save_stats_counters(path: str) -> None:
         events = [dict(e) for e in EVENTS]  # 逐条浅拷贝：磁盘与内存一致（≤100 条）
     with _CFG_LOCK:
         base = UPSTREAM_BASE
+        capture_enabled = CAPTURE_ERRORS
     directory = os.path.dirname(path)
     if directory:
         os.makedirs(directory, exist_ok=True)
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump({"upstream_base": base,
+                   "capture_errors": capture_enabled,
                    "stats": dict(counters, daily=daily, daily_by_model=daily_by_model,
                                  events=events)},
                   fh, ensure_ascii=False)
@@ -497,6 +500,13 @@ def load_stats_counters(path: str) -> dict:
         value = stats.get(key) if isinstance(stats, dict) else None
         out[key] = value if isinstance(value, int) and value >= 0 else 0
     return out
+
+
+def load_capture_errors(path: str) -> bool:
+    """从持久化文件读 capture_errors；缺/损坏/非 bool → False。"""
+    data = _load_persist_file(path)
+    val = data.get("capture_errors") if isinstance(data, dict) else None
+    return val if isinstance(val, bool) else False
 
 
 _DAILY_FIELDS = ("requests", "filtered", "errors_proxy", "errors_upstream",
@@ -590,8 +600,7 @@ def flush_stats_if_dirty(path: str) -> None:
         # 落盘失败（磁盘满/权限）：回置脏标记等下轮重试，代理继续服务不因统计
         # 持久化受阻，stderr 留痕。
         _stats_dirty = True
-        print("ctyun-stream-fix-proxy: stats flush failed: %s" % exc,
-              file=sys.stderr, flush=True)
+        _safe_log_stderr("ctyun-stream-fix-proxy: stats flush failed: %s" % exc)
 
 
 def write_allowed(peer_ip: str, token_header: str, token_env: str) -> bool:
@@ -607,9 +616,18 @@ def set_upstream_base(base: str) -> None:
     with _CFG_LOCK:
         UPSTREAM_BASE = base
         _upstream_source = "api"
-        persist_upstream(base, PERSIST_PATH)
+        persist_upstream(base, PERSIST_PATH, capture_errors=CAPTURE_ERRORS)
     # save_stats_counters 内部也要拿 _CFG_LOCK：必须在锁外调用，否则同线程
     # 非重入死锁（admin 线程挂死且 SIGTERM 退出时同样卡锁）。
+    save_stats_counters(PERSIST_PATH)
+
+
+def set_capture_errors(enabled: bool) -> None:
+    global CAPTURE_ERRORS
+    with _CFG_LOCK:
+        CAPTURE_ERRORS = enabled
+        persist_upstream(UPSTREAM_BASE, PERSIST_PATH, capture_errors=enabled)
+    # save_stats_counters 内部也要拿 _CFG_LOCK：必须在锁外调用（同 :449-451 死锁注释）
     save_stats_counters(PERSIST_PATH)
 
 
@@ -775,7 +793,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             # 都是"turn 中断、非代理故障"（客户端取消是常态；后两者无法与前者区分
             # 处也无需区分）。不重抛：再抛只进 handle_error 打 20+ 行 traceback 且
             # 无 status 记录；不计 errors_total。status 取 499（nginx 客户端中断惯例）。
-            self._log(started, 499, "aborted", 0)
+            outcome = classify_outcome(client_abort=True)
+            self._log(started, 499, outcome.log_result, 0)
             _record_request(self.command, self.path, 499,
                             (time.time() - started) * 1000, 0, model=None)
         finally:
@@ -803,50 +822,87 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             conn, resp = self._open_upstream(self.command, self.path, body, fwd_headers)
         except (OSError, http.client.HTTPException) as exc:
             self._reply_502(exc)
-            self._log(started, 502, "error", 0, model=model, exc=exc)
+            outcome = classify_outcome(synth_502=True)
+            self._log(started, 502, outcome.log_result, 0, model=model, exc=exc)
             _record_request(self.command, self.path, 502,
                             (time.time() - started) * 1000, 0,
-                            model=model, error=True)
+                            model=model, error=outcome.counts_error)
+            record_error_event(ERR_KIND_SYNTH_502, model=model, path=self.path,
+                               exc=exc, body=body)
             return
 
         content_type = (resp.getheader("Content-Type") or "").lower()
-        result = "ok" if resp.status < 400 else "upstream-err"
         if "text/event-stream" in content_type:
             retried = 0
             retry_reason = ""
             try:
-                filtered, truncated = self._relay_sse(resp, final=(EMPTY_RETRY_MAX < 1))
+                filtered, truncated = self._relay_sse(resp,
+                    final=not empty_stream_should_retry(EMPTY_RETRY_MAX))
             except _EmptyStream as exc:
                 filtered = exc.filtered  # attempt-1 已滤毒缓冲随重试丢弃，filtered 只计交付流
                 retried = 1
                 retry_reason = exc.reason
                 _record_empty_retry(model, exc.reason)
+                record_error_event(ERR_KIND_EMPTY_RETRY, model=model, path=self.path,
+                                   response=b"".join(exc.lines),
+                                   retry_reason=exc.reason)
                 conn.close()
                 try:
                     conn, resp = self._open_upstream(self.command, self.path, body, fwd_headers)
                 except (OSError, http.client.HTTPException) as retry_exc:
                     self._reply_502(retry_exc)  # 客户端尚未收到字节，502 语义与既有路径一致
-                    self._log(started, 502, "error", 0, model=model, retried=1,
+                    outcome = classify_outcome(synth_502=True)
+                    self._log(started, 502, outcome.log_result, 0, model=model, retried=1,
                               retry_reason=retry_reason, exc=retry_exc)
                     _record_request(self.command, self.path, 502,
-                                    (time.time() - started) * 1000, 0, model=model, error=True)
+                                    (time.time() - started) * 1000, 0, model=model,
+                                    error=outcome.counts_error)
+                    record_error_event(ERR_KIND_SYNTH_502, model=model, path=self.path,
+                                       exc=retry_exc, body=body,
+                                       retried=1, retry_reason=retry_reason)
                     return
                 filtered, truncated = self._relay_sse(resp, final=True)
-            result = "ok" if resp.status < 400 else "upstream-err"  # 重试后按实际 resp 重算
-            if result == "ok" and truncated:
+            outcome = classify_outcome(status=resp.status, poison_filtered=filtered)
+            result = outcome.log_result  # 重试后按实际 resp 重算
+            if truncated and result == "ok":
                 # 仅覆盖 ok：upstream-err（status≥400 更有信息量）与 aborted（异常
                 # 路径不经此处）不误标；priming EOF 由 retries 计数承载，避免双计数
                 result = "eof-without-done"
+                outcome = classify_outcome(eof_without_done=True)
                 _record_eof_without_done(model)
+            if outcome.capture:
+                if outcome.category == CLASS_POISON_FIXED:
+                    kind = ERR_KIND_POISON
+                elif result == "eof-without-done":
+                    kind = ERR_KIND_EOF_NO_DONE
+                elif resp.status >= 500:
+                    kind = ERR_KIND_UPSTREAM_5XX
+                else:
+                    kind = ERR_KIND_REQUEST_4XX
+                record_error_event(kind, model=model, path=self.path,
+                                   upstream_status=(resp.status
+                                                    if resp.status >= 400 else None),
+                                   body=body, filtered=filtered)
             self._log(started, resp.status, result, filtered, model=model, retried=retried,
                       retry_reason=retry_reason)
             _record_request(self.command, self.path, resp.status,
-                            (time.time() - started) * 1000, filtered, model=model)
+                            (time.time() - started) * 1000, filtered, model=model,
+                            error=outcome.counts_error)
         else:
-            self._relay_buffered(resp)
-            self._log(started, resp.status, result, 0, model=model)
+            relayed_data = self._relay_buffered(resp)
+            outcome = classify_outcome(status=resp.status)
+            self._log(started, resp.status, outcome.log_result, 0, model=model)
             _record_request(self.command, self.path, resp.status,
-                            (time.time() - started) * 1000, 0, model=model)
+                            (time.time() - started) * 1000, 0, model=model,
+                            error=outcome.counts_error)
+            if outcome.capture:
+                record_error_event(
+                    ERR_KIND_UPSTREAM_5XX if resp.status >= 500 else ERR_KIND_REQUEST_4XX,
+                    model=model, path=self.path,
+                    upstream_status=resp.status if resp.status >= 400 else None,
+                    body=body,
+                    response=relayed_data[:RESPONSE_SNIPPET_CAP]
+                    if resp.status >= 500 else None)
         conn.close()
 
     def _open_upstream(self, method: str, path: str, body, fwd_headers: dict):
@@ -954,7 +1010,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         finally:
             self.connection.settimeout(old_timeout)
 
-    def _relay_buffered(self, resp: http.client.HTTPResponse) -> None:
+    def _relay_buffered(self, resp: http.client.HTTPResponse) -> bytes:
         data = resp.read()
         self.send_response(resp.status)
         for name, value in resp.getheaders():
@@ -970,6 +1026,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(data)
         finally:
             self.connection.settimeout(old_timeout)
+        return data
 
     def _reply_502(self, exc: BaseException) -> None:
         payload = ("ctyun-stream-fix-proxy: upstream error: %s\n" % exc).encode("utf-8")
@@ -1008,8 +1065,73 @@ class AdminHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(200, stats_snapshot())
         elif path == "/api/config":
             with _CFG_LOCK:
-                payload = {"upstream_base": UPSTREAM_BASE, "source": _upstream_source}
+                payload = {"upstream_base": UPSTREAM_BASE, "source": _upstream_source,
+                           "capture_errors": CAPTURE_ERRORS}
             self._send_json(200, payload)
+        elif path == "/api/errors":
+            id_str = urllib.parse.parse_qs(
+                urllib.parse.urlsplit(self.path).query).get("id", [None])[0]
+            if id_str is not None:
+                # 单条详情（含 body/response），需鉴权
+                try:
+                    eid = int(id_str)
+                except (ValueError, TypeError):
+                    self._send_json(400, {"error": "id must be an integer"})
+                    return
+                if not write_allowed(self.client_address[0],
+                                     self.headers.get("X-Admin-Token") or "",
+                                     os.environ.get("CTYUN_ADMIN_TOKEN", "")):
+                    self._send_json(403, {"error": "detail requires X-Admin-Token"})
+                    return
+                with ERROR_LOCK:
+                    match = None
+                    for ev in ERROR_EVENTS:
+                        if ev["id"] == eid:
+                            match = dict(ev)
+                            break
+                if match is None:
+                    self._send_json(404, {"error": "event not found"})
+                else:
+                    self._send_json(200, match)
+            else:
+                # 列表（不含 body/response），无鉴权
+                with ERROR_LOCK:
+                    events = [{"id": e["id"], "ts": e["ts"], "kind": e["kind"],
+                               "category": e["category"], "model": e["model"],
+                               "path": e["path"],
+                               "upstream_status": e["upstream_status"],
+                               "exc": e["exc"], "filtered": e["filtered"],
+                               "retried": e["retried"],
+                               "retry_reason": e["retry_reason"]}
+                              for e in ERROR_EVENTS]
+                events.reverse()  # newest-first（锁外反转：events 已是新 list）
+                with _CFG_LOCK:
+                    cap_enabled = CAPTURE_ERRORS
+                self._send_json(200, {"capture_errors": cap_enabled,
+                                      "count": len(events),
+                                      "events": events})
+        elif path == "/api/logs":
+            qs = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            cursor = qs.get("cursor", [None])[0]
+            tail = qs.get("tail", [None])[0]
+            if cursor is not None:
+                try:
+                    cursor = int(cursor)
+                except (ValueError, TypeError):
+                    self._send_json(400, {"error": "cursor must be an integer"})
+                    return
+            if tail is not None:
+                try:
+                    tail = int(tail)
+                except (ValueError, TypeError):
+                    self._send_json(400, {"error": "tail must be an integer"})
+                    return
+            try:
+                snap = logs_snapshot(cursor=cursor, tail=tail)
+            except ValueError as exc:
+                self._send_json(400, {"error": str(exc)})
+                return
+            self._send_json(200, snap)
         else:
             self._send(404, "text/plain; charset=utf-8", b"not found")
 
@@ -1037,12 +1159,21 @@ class AdminHandler(http.server.BaseHTTPRequestHandler):
                                            "请发 {\"upstream_base\": \"https://...\"}"})
             return
         base = data.get("upstream_base") if isinstance(data, dict) else None
+        cap = data.get("capture_errors") if isinstance(data, dict) else None  # 可选键
+        if cap is not None and not isinstance(cap, bool):
+            self._send_json(400, {"error": "capture_errors must be a boolean"})
+            return
         if not isinstance(base, str) or not valid_upstream_url(base):
             self._send_json(400, {"error": "upstream_base 需为 "
                                            "http(s)://host[:port]/path 形式的合法 URL"})
             return
         set_upstream_base(base)
-        self._send_json(200, {"ok": True, "upstream_base": base, "source": "api"})
+        if cap is not None:
+            set_capture_errors(cap)
+        with _CFG_LOCK:
+            resp = {"ok": True, "upstream_base": base, "source": "api",
+                    "capture_errors": CAPTURE_ERRORS}
+        self._send_json(200, resp)
 
     def _send(self, status: int, content_type: str, body: bytes) -> None:
         self.send_response(status)
@@ -1635,13 +1766,14 @@ FAVICON_ICO = base64.b64decode(_FAVICON_B64)
 
 
 def main() -> None:
-    global UPSTREAM_BASE, _upstream_source, _stats_dirty
+    global UPSTREAM_BASE, _upstream_source, _stats_dirty, CAPTURE_ERRORS
     UPSTREAM_BASE, _upstream_source = resolve_upstream_base(
         os.environ.get("CTYUN_UPSTREAM_BASE"), PERSIST_PATH)
     counters = load_stats_counters(PERSIST_PATH)  # 累计计数跨重启续算
     daily = load_daily_buckets(PERSIST_PATH)      # 按天分桶跨重启续算
     daily_by_model = load_daily_by_model_buckets(PERSIST_PATH)  # 按天×模型矩阵跨重启续算
     events = load_stats_events(PERSIST_PATH)      # 错误/重试事件流跨重启续算
+    CAPTURE_ERRORS = load_capture_errors(PERSIST_PATH)  # 启动时回填开关
     with STATS_LOCK:
         STATS["requests_total"] = counters["requests_total"]
         STATS["filtered_total"] = counters["filtered_total"]
@@ -1670,9 +1802,8 @@ def main() -> None:
     try:
         admin_server = http.server.ThreadingHTTPServer((ADMIN_HOST, ADMIN_PORT), AdminHandler)
     except OSError as exc:
-        print("ctyun-stream-fix-proxy: admin bind failed on %s:%d: %s — exit 1，"
-              "交由 launchd KeepAlive 重试" % (ADMIN_HOST, ADMIN_PORT, exc),
-              file=sys.stderr, flush=True)
+        _safe_log_stderr("ctyun-stream-fix-proxy: admin bind failed on %s:%d: %s — exit 1，"
+                         "交由 launchd KeepAlive 重试" % (ADMIN_HOST, ADMIN_PORT, exc))
         raise SystemExit(1)
     admin_server.daemon_threads = True
     threading.Thread(target=admin_server.serve_forever, daemon=True,
@@ -1688,9 +1819,8 @@ def main() -> None:
 
     server = http.server.ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), ProxyHandler)
     server.daemon_threads = True
-    print("ctyun-stream-fix-proxy listening on %s:%d -> %s (admin dashboard on %s:%d)"
-          % (LISTEN_HOST, LISTEN_PORT, UPSTREAM_BASE, ADMIN_HOST, ADMIN_PORT),
-          file=sys.stderr, flush=True)
+    _safe_log_stderr("ctyun-stream-fix-proxy listening on %s:%d -> %s (admin dashboard on %s:%d)"
+                     % (LISTEN_HOST, LISTEN_PORT, UPSTREAM_BASE, ADMIN_HOST, ADMIN_PORT))
     try:
         server.serve_forever()
     except KeyboardInterrupt:

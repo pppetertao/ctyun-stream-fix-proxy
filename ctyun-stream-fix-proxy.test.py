@@ -387,9 +387,12 @@ def load_proxy_module():
     return mod
 
 
-def admin_get(port: int, path: str):
+def admin_get(port: int, path: str, headers: dict = None):
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
-    conn.request("GET", path)
+    hdrs = {}
+    if headers:
+        hdrs.update(headers)
+    conn.request("GET", path, headers=hdrs)
     resp = conn.getresponse()
     out = (resp.status, resp.read(), resp.getheader("Content-Type"))
     conn.close()
@@ -2338,6 +2341,300 @@ class AdminIntegrationTest(unittest.TestCase):
         post_sse(self.proc.proxy_port, clean)
         self.assertEqual(len(bodies), 2)
         self.assertEqual(bodies[1], clean)  # 无 null 请求字节级透传
+
+    def test_errors_endpoint_default_off(self) -> None:
+        """默认 CAPTURE_ERRORS=False：/api/errors 返回 capture_errors:false + 空列表。"""
+        status, body, ctype = admin_get(self.proc.admin_port, "/api/errors")
+        self.assertEqual(status, 200)
+        self.assertTrue(ctype and ctype.startswith("application/json"))
+        data = json.loads(body.decode("utf-8"))
+        self.assertFalse(data["capture_errors"])
+        self.assertEqual(data["count"], 0)
+        self.assertEqual(data["events"], [])
+        # 列表项不应含 body/response
+        for ev in data["events"]:
+            self.assertNotIn("body", ev)
+            self.assertNotIn("response", ev)
+
+    def test_capture_errors_post_get_roundtrip(self) -> None:
+        """POST capture_errors:true → GET /api/config 回读 → 持久化文件含键。"""
+        status, body = admin_post(
+            self.proc.admin_port, "/api/config",
+            json.dumps({"upstream_base": "http://127.0.0.1:%d" % self.upstream_port,
+                        "capture_errors": True}).encode("utf-8"))
+        self.assertEqual(status, 200)
+        resp = json.loads(body.decode("utf-8"))
+        self.assertTrue(resp["ok"])
+        self.assertTrue(resp.get("capture_errors"))
+
+        # GET /api/config 回读
+        status, body, _ = admin_get(self.proc.admin_port, "/api/config")
+        cfg = json.loads(body.decode("utf-8"))
+        self.assertTrue(cfg["capture_errors"])
+
+        # GET /api/errors 报告 capture_errors:true
+        status, body, _ = admin_get(self.proc.admin_port, "/api/errors")
+        data = json.loads(body.decode("utf-8"))
+        self.assertTrue(data["capture_errors"])
+
+        # 持久化文件含 capture_errors
+        with open(os.path.join(self.proc.persist_dir, "settings.json"),
+                  encoding="utf-8") as fh:
+            saved = json.load(fh)
+        self.assertTrue(saved.get("capture_errors"))
+
+    def test_capture_errors_bad_input(self) -> None:
+        """capture_errors 非 bool → 400。"""
+        status, body = admin_post(
+            self.proc.admin_port, "/api/config",
+            json.dumps({"upstream_base": "http://127.0.0.1:%d" % self.upstream_port,
+                        "capture_errors": "yes"}).encode("utf-8"))
+        self.assertEqual(status, 400)
+
+    def test_errors_endpoint_kind_upstream_5xx(self) -> None:
+        """上游 500 + capture_errors on → /api/errors kind=upstream_5xx 且 ?id= 含 response。"""
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_fake_upstreams()
+        bad_port = make_fake_upstream(False, fail_500=True)
+        self.proc = start_proxy(bad_port, free_port())
+        admin_post(
+            self.proc.admin_port, "/api/config",
+            json.dumps({"upstream_base": "http://127.0.0.1:%d" % bad_port,
+                        "capture_errors": True}).encode("utf-8"))
+        conn = http.client.HTTPConnection("127.0.0.1", self.proc.proxy_port, timeout=10)
+        conn.request("POST", "/v1/chat/completions", body=b'{"model":"m-500"}',
+                     headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        self.assertEqual(resp.status, 500)
+        resp.read()
+        conn.close()
+        status, body, _ = admin_get(self.proc.admin_port, "/api/errors")
+        data = json.loads(body.decode("utf-8"))
+        self.assertTrue(data["capture_errors"])
+        self.assertGreaterEqual(data["count"], 1)
+        kinds = [e["kind"] for e in data["events"]]
+        self.assertIn("upstream_5xx", kinds)
+        # 详情含 response 快照（newest-first → events[0] 为最新 500 事件）
+        eid = data["events"][0]["id"]
+        status, body, _ = admin_get(self.proc.admin_port, "/api/errors?id=%d" % eid)
+        self.assertEqual(status, 200)
+        ev = json.loads(body.decode("utf-8"))
+        self.assertEqual(ev["kind"], "upstream_5xx")
+        self.assertIn("response", ev)
+        self.assertIsNotNone(ev["response"])
+
+    def test_errors_detail_by_id_and_bad_params(self) -> None:
+        """?id= 详情（含 body/response/exc）；404/400 分支。"""
+        dead_port = free_port()
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_fake_upstreams()
+        self.proc = start_proxy(dead_port, free_port(),
+                                extra_env={"CTYUN_ADMIN_TOKEN": "sekret"})
+        admin_post(
+            self.proc.admin_port, "/api/config",
+            json.dumps({"upstream_base": "http://127.0.0.1:%d" % dead_port,
+                        "capture_errors": True}).encode("utf-8"))
+        conn = http.client.HTTPConnection("127.0.0.1", self.proc.proxy_port, timeout=10)
+        conn.request("POST", "/v1/chat/completions", body=b'{"model":"m"}',
+                     headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        self.assertEqual(resp.status, 502)
+        resp.read()
+        conn.close()
+        # ?id=1（本机 + 带 token 头）→ 200 含 body/exc
+        status, body, _ = admin_get(self.proc.admin_port, "/api/errors?id=1",
+                                    headers={"X-Admin-Token": "sekret"})
+        self.assertEqual(status, 200)
+        ev = json.loads(body.decode("utf-8"))
+        self.assertEqual(ev["id"], 1)
+        self.assertEqual(ev["kind"], "synth_502")
+        self.assertIn("body", ev)
+        self.assertIsNotNone(ev["body"])
+        self.assertIn("exc", ev)
+        self.assertIsNotNone(ev["exc"])
+        # ?id=9999 → 404
+        status, body, _ = admin_get(self.proc.admin_port, "/api/errors?id=9999",
+                                    headers={"X-Admin-Token": "sekret"})
+        self.assertEqual(status, 404)
+        # ?id=abc → 400
+        status, body, _ = admin_get(self.proc.admin_port, "/api/errors?id=abc")
+        self.assertEqual(status, 400)
+        # 列表不含 body/response 键
+        status, body, _ = admin_get(self.proc.admin_port, "/api/errors")
+        data = json.loads(body.decode("utf-8"))
+        for event in data["events"]:
+            self.assertNotIn("body", event)
+            self.assertNotIn("response", event)
+
+    def test_errors_poison_hit(self) -> None:
+        """poison=True 上游 + capture_errors on → kind=poison_hit。"""
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_fake_upstreams()
+        poison_port = make_fake_upstream(True)
+        self.proc = start_proxy(poison_port, free_port())
+        admin_post(
+            self.proc.admin_port, "/api/config",
+            json.dumps({"upstream_base": "http://127.0.0.1:%d" % poison_port,
+                        "capture_errors": True}).encode("utf-8"))
+        post_sse(self.proc.proxy_port)
+        status, body, _ = admin_get(self.proc.admin_port, "/api/errors")
+        data = json.loads(body.decode("utf-8"))
+        kinds = [e["kind"] for e in data["events"]]
+        self.assertIn("poison_hit", kinds)
+
+    def test_errors_eof_without_done(self) -> None:
+        """截断流 + capture_errors on → kind=eof_without_done。"""
+        # spec 测试列表写 "fault_finish_stream → eof_without_done"，但按 relay 代码实测
+        # fault_finish_stream（reasoning+finish+DONE 尾段）attempt-2 final=True 走
+        # _flush_primed fail-open，产出 EMPTY_RETRY(finish-no-usage) 而非 eof 标记；
+        # eof_without_done 的真实签名是"有 content 无 [DONE] 即 EOF"（与既有
+        # test_eof_without_done_marked_counted_and_persisted 同场景），故本测试用
+        # body_override=SSE_A+SSE_B 复刻。五种 kind 的集成覆盖不受影响。
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_fake_upstreams()
+        upstream_port, calls = make_scripted_upstream(body_override=SSE_A + SSE_B)
+        self.proc = start_proxy(upstream_port, free_port())
+        admin_post(
+            self.proc.admin_port, "/api/config",
+            json.dumps({"upstream_base": "http://127.0.0.1:%d" % upstream_port,
+                        "capture_errors": True}).encode("utf-8"))
+        post_sse(self.proc.proxy_port)
+        status, body, _ = admin_get(self.proc.admin_port, "/api/errors")
+        data = json.loads(body.decode("utf-8"))
+        kinds = [e["kind"] for e in data["events"]]
+        self.assertIn("eof_without_done", kinds)
+
+    def test_errors_empty_retry(self) -> None:
+        """空流重试 + capture_errors on → kind=empty_retry。"""
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_fake_upstreams()
+        upstream_port, calls = make_scripted_upstream()
+        self.proc = start_proxy(upstream_port, free_port())
+        admin_post(
+            self.proc.admin_port, "/api/config",
+            json.dumps({"upstream_base": "http://127.0.0.1:%d" % upstream_port,
+                        "capture_errors": True}).encode("utf-8"))
+        post_sse(self.proc.proxy_port)
+        status, body, _ = admin_get(self.proc.admin_port, "/api/errors")
+        data = json.loads(body.decode("utf-8"))
+        kinds = [e["kind"] for e in data["events"]]
+        self.assertIn("empty_retry", kinds)
+
+    def test_capture_errors_restart_roundtrip(self) -> None:
+        """capture_errors 经 POST→GET→重启（seed_persist）roundtrip 保持。"""
+        admin_post(
+            self.proc.admin_port, "/api/config",
+            json.dumps({"upstream_base": "http://127.0.0.1:%d" % self.upstream_port,
+                        "capture_errors": True}).encode("utf-8"))
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        # 重启并 seed 持久化文件
+        persist_path = os.path.join(self.proc.persist_dir, "settings.json")
+        with open(persist_path, encoding="utf-8") as fh:
+            saved = json.load(fh)
+        self.proc = start_proxy(
+            self.upstream_port, free_port(),
+            seed_persist=saved)
+        status, body, _ = admin_get(self.proc.admin_port, "/api/config")
+        cfg = json.loads(body.decode("utf-8"))
+        self.assertTrue(cfg["capture_errors"],
+                        "capture_errors must survive restart via seed_persist")
+
+    def test_logs_endpoint_tail(self) -> None:
+        """GET /api/logs?tail=20 返回 <=20 行。"""
+        # 先发一个请求确保 stderr 有内容
+        post_sse(self.proxy_port)
+        status, body, ctype = admin_get(self.proc.admin_port, "/api/logs?tail=20")
+        self.assertEqual(status, 200)
+        self.assertTrue(ctype and ctype.startswith("application/json"))
+        data = json.loads(body.decode("utf-8"))
+        self.assertLessEqual(len(data["lines"]), 20)
+        self.assertIn("lines", data)
+        self.assertIn("next_cursor", data)
+        self.assertIn("oldest_seq", data)
+        self.assertIn("ring_max", data)
+        for line in data["lines"]:
+            self.assertIn("seq", line)
+            self.assertIn("line", line)
+            self.assertIsInstance(line["seq"], int)
+
+    def test_logs_endpoint_cursor_incremental(self) -> None:
+        """cursor 增量拉取至 lines=[]。"""
+        post_sse(self.proxy_port)
+        # 先取 tail 获取 cursor
+        status, body, _ = admin_get(self.proc.admin_port, "/api/logs?tail=10")
+        data = json.loads(body.decode("utf-8"))
+        cursor = data["next_cursor"]
+        # cursor 增量拉取
+        status, body, _ = admin_get(
+            self.proc.admin_port, "/api/logs?cursor=%d" % cursor)
+        data = json.loads(body.decode("utf-8"))
+        self.assertEqual(len(data["lines"]), 0,
+                         "cursor at latest should return empty lines")
+        self.assertEqual(data["next_cursor"], cursor)
+
+    def test_logs_endpoint_invalid_params(self) -> None:
+        """cursor+tail 同给 / 非 int → 400。"""
+        status, body, _ = admin_get(self.proc.admin_port, "/api/logs?cursor=1&tail=10")
+        self.assertEqual(status, 400)
+        status, body, _ = admin_get(self.proc.admin_port, "/api/logs?cursor=abc")
+        self.assertEqual(status, 400)
+        status, body, _ = admin_get(self.proc.admin_port, "/api/logs?tail=0")
+        self.assertEqual(status, 400)
+        status, body, _ = admin_get(self.proc.admin_port, "/api/logs?tail=2000")
+        self.assertEqual(status, 400)
+
+    def test_logs_line_contains_req(self) -> None:
+        """日志行含 "REQ POST" 等请求记录。"""
+        post_sse(self.proxy_port)
+        status, body, _ = admin_get(self.proc.admin_port, "/api/logs?tail=50")
+        data = json.loads(body.decode("utf-8"))
+        lines_text = " ".join(l["line"] for l in data["lines"])
+        self.assertIn("REQ POST", lines_text)
+
+    def test_classifier_stats_regression_errors_total(self) -> None:
+        """统计口径回归：errors_total 仅 502 合成路径 +1；现有断言不变。"""
+        # 正常 SSE 请求不应增 errors_total
+        _, body, _ = admin_get(self.proc.admin_port, "/api/stats")
+        before = json.loads(body.decode("utf-8"))["errors_total"]
+        post_sse(self.proxy_port)
+        _, body, _ = admin_get(self.proc.admin_port, "/api/stats")
+        after = json.loads(body.decode("utf-8"))["errors_total"]
+        self.assertEqual(after, before,
+                         "normal SSE must not increment errors_total")
+        # 502 合成错误应 +1
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_fake_upstreams()
+        dead_port = free_port()
+        self.proc = start_proxy(dead_port, free_port())
+        conn = http.client.HTTPConnection("127.0.0.1", self.proc.proxy_port, timeout=10)
+        conn.request("POST", "/v1/chat/completions", body=b'{"model":"m"}',
+                     headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        self.assertEqual(resp.status, 502)
+        resp.read()
+        conn.close()
+        _, body, _ = admin_get(self.proc.admin_port, "/api/stats")
+        self.assertEqual(json.loads(body.decode("utf-8"))["errors_total"], 1)
 
 
 if __name__ == "__main__":
