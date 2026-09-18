@@ -55,8 +55,8 @@ class FakeUpstreamHandler(BaseHTTPRequestHandler):
     body_override = None  # 非 None → 正常路径 body 用此值（priming 前缀/合法 DONE 场景）
     fault_finish_first = False   # True → 首呼回 SSE_FAULT_TAIL 后断连，次呼正常 body
     fault_finish_stream = False  # True → 每呼回故障尾段（SSE_FAULT_TAIL）
-    stall_all = False       # True → 每呼读 body 后不写任何响应直接返回（触发 socket.timeout）
-    stall_calls = ()        # 1-based 呼叫序号元组：命中则 stall（不写响应不关连接）
+    stall_all = False       # True → 每呼读 body 后 close_connection=True 直接返回（代理 getresponse 抛 http.client.RemoteDisconnected）
+    stall_calls = ()        # 1-based 呼叫序号元组：命中则 close_connection=True 不写响应（代理 getresponse 抛 http.client.RemoteDisconnected）
     calls = None          # 共享 list：非 None 时按调用序 append 计数；无 body_override 时首次回空流
     bodies = None        # 共享 list：非 None 时按调用序 append 收到的原始请求体 bytes
 
@@ -69,7 +69,7 @@ class FakeUpstreamHandler(BaseHTTPRequestHandler):
         # --- calls 计上游被请求总次数（含 stall 呼）：append 提前到 stall 检查之前 ---
         if self.calls is not None:
             self.calls.append(1)
-        # --- stall 路径：读 body 后静默返回不写响应（触发代理 socket.timeout）---
+        # --- stall 路径：读 body 后静默返回不写响应（close_connection=True，代理 getresponse 抛 RemoteDisconnected）---
         if self.stall_all:
             # 每呼均 stall：读 body 后直接返回，不写任何响应不关连接
             self.close_connection = True
@@ -208,7 +208,6 @@ def make_fake_upstream(poison: bool, tag: str = "/plain", big: bool = False,
     # 在 stall 连接上，shutdown 挂测试；daemon_threads=True 保证 teardown 不阻塞
     use_threading = stall_all or stall_calls
     if use_threading:
-        from http.server import ThreadingHTTPServer
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         server.daemon_threads = True
     else:
@@ -1693,8 +1692,6 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         """白盒：patch 假上游，调 _open_upstream 直连，断言 getresponse 后 sock timeout 已恢复 UPSTREAM_TIMEOUT。"""
         mod = self.mod
         import types
-        # 构造一个简单限定的 request handler：先存下调用参数，再构造假响应
-        saved_port = free_port()
         # 用真实假上游验证：正常上游无 stall，直调 _open_upstream
         upstream_port = make_fake_upstream(False)
         try:
@@ -1727,7 +1724,7 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         finally:
             stop_fake_upstreams()
 
-    def test_open_upstream_stall_raises_socket_timeout(self) -> None:
+    def test_open_upstream_stall_raises_remote_disconnected(self) -> None:
         """白盒：stall 上游 → _open_upstream 在 HEADER_TIMEOUT_S 内抛 RemoteDisconnected。
 
         实测：stall 上游读 body 后不写响应直接关连接，代理侧 getresponse() 抛

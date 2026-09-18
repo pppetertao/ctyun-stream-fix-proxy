@@ -446,8 +446,6 @@ def make_stall_upstream(stall_all: bool = False, stall_calls: tuple = (), **kwar
         """白盒：patch 假上游，调 _open_upstream 直连，断言 getresponse 后 sock timeout 已恢复 UPSTREAM_TIMEOUT。"""
         mod = self.mod
         import types
-        # 构造一个简单限定的 request handler：先存下调用参数，再构造假响应
-        saved_port = free_port()
         # 用真实假上游验证：正常上游无 stall，直调 _open_upstream
         upstream_port = make_fake_upstream(False)
         try:
@@ -463,9 +461,13 @@ def make_stall_upstream(stall_all: bool = False, stall_calls: tuple = (), **kwar
                     conn, resp = mod.ProxyHandler._open_upstream(
                         types.SimpleNamespace(), "POST", "/v1/chat/completions",
                         body, {"Content-Type": "application/json"})
-                    # 断言 getresponse 后 sock timeout 已恢复 UPSTREAM_TIMEOUT
-                    self.assertIsNotNone(conn.sock)
-                    self.assertEqual(conn.sock.gettimeout(), mod.UPSTREAM_TIMEOUT,
+                    # 断言 getresponse 后 sock timeout 已恢复 UPSTREAM_TIMEOUT。
+                    # 实测 getresponse() 返回后 conn.sock 已被置 None（socket 移交
+                    # HTTPResponse 的 fp.raw）；生产实现保留 getresponse 前的 sock
+                    # 引用并在其上 settimeout，与 resp.fp.raw._sock 为同一对象，
+                    # 故经此断言体阶段超时已恢复。
+                    self.assertIsNone(conn.sock)
+                    self.assertEqual(resp.fp.raw._sock.gettimeout(), mod.UPSTREAM_TIMEOUT,
                                      "after getresponse, sock timeout must be UPSTREAM_TIMEOUT (body phase)")
                     resp.read()
                     conn.close()
@@ -476,8 +478,12 @@ def make_stall_upstream(stall_all: bool = False, stall_calls: tuple = (), **kwar
         finally:
             stop_fake_upstreams()
 
-    def test_open_upstream_stall_raises_socket_timeout(self) -> None:
-        """白盒：stall 上游 → _open_upstream 在 HEADER_TIMEOUT_S 内抛 socket.timeout。"""
+    def test_open_upstream_stall_raises_remote_disconnected(self) -> None:
+        """白盒：stall 上游 → _open_upstream 在 HEADER_TIMEOUT_S 内抛 RemoteDisconnected。
+
+        实测：stall 上游读 body 后不写响应直接关连接，代理侧 getresponse() 抛
+        http.client.RemoteDisconnected（"响应头阶段未收到任何响应字节"），而非
+        socket.timeout（后者仅当上游保持连接静默到超时阈值才出现）。"""
         mod = self.mod
         import types
         upstream_port = make_fake_upstream(False, stall_all=True)
@@ -489,7 +495,7 @@ def make_stall_upstream(stall_all: bool = False, stall_calls: tuple = (), **kwar
                 mod.HEADER_TIMEOUT_S = 0.5
                 try:
                     body = b'{"model":"test","stream":true,"messages":[]}'
-                    with self.assertRaises(socket.timeout):
+                    with self.assertRaises(http.client.RemoteDisconnected):
                         mod.ProxyHandler._open_upstream(
                             types.SimpleNamespace(), "POST", "/v1/chat/completions",
                             body, {"Content-Type": "application/json"})
@@ -658,14 +664,14 @@ def make_stall_upstream(stall_all: bool = False, stall_calls: tuple = (), **kwar
                          "body phase must not trigger header-timeout, stderr:\n" + stderr)
 ```
 
-**测试 5e: 叠加——stall_calls=(1,) + empty_stream → calls==3 + retried=2**
+**测试 5e: 叠加——stall_calls=(1,) + empty_stream_calls=(2,) → calls==3 + retried=2**
 
 ```python
     def test_header_stall_then_empty_stream_compound(self) -> None:
-        """stall_calls=(1,) + empty_stream=True → 首呼 header-stall 重试 →
-        次呼（empty_stream）触发空流重试 → 三呼正常 → calls==3 + retried=2。"""
+        """stall_calls=(1,) + empty_stream_calls=(2,) → 首呼 header-stall 重试 →
+        次呼（空流）触发空流重试 → 三呼正常 → calls==3 + retried=2。"""
         upstream_port, calls = make_stall_upstream(
-            stall_calls=(1,), empty_stream=True)
+            stall_calls=(1,), empty_stream_calls=(2,))
         self.proc.terminate()
         self.proc.wait(timeout=5)
         stderr_text(self.proc)
@@ -684,10 +690,14 @@ def make_stall_upstream(stall_all: bool = False, stall_calls: tuple = (), **kwar
         stderr = stderr_text(self.proc)
         self.assertIn("retried=2", stderr,
                       "compound scenario must carry retried=2, stderr:\n" + stderr)
-        self.assertIn("header-timeout", stderr,
-                      "compound scenario must mention header-timeout, stderr:\n" + stderr)
         self.assertIn("eof-priming", stderr,
                       "compound scenario must mention eof-priming, stderr:\n" + stderr)
+        # header-timeout 事件仅入 ERROR_EVENTS 环（非 stderr），计数器可证 header retry 已发生
+        with open(os.path.join(self.proc.persist_dir, "settings.json"),
+                  encoding="utf-8") as fh:
+            saved = json.load(fh)["stats"]
+        self.assertGreaterEqual(saved.get("header_retries_total", 0), 1,
+                                "compound scenario must count header retry")
 ```
 
 #### 验证命令
