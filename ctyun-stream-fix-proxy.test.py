@@ -1689,6 +1689,32 @@ class AdminIntegrationTest(unittest.TestCase):
         status, _ = admin_post(self.proc.admin_port, "/api/config", b"not json")
         self.assertEqual(status, 400)
 
+    def test_capture_errors_alone_post(self) -> None:
+        """单独 POST capture_errors（无 upstream_base）应 200，并维持上游。"""
+        original_base = "http://127.0.0.1:%d" % self.upstream_port
+        # 单独 POST capture_errors:true
+        status, body = admin_post(
+            self.proc.admin_port, "/api/config",
+            json.dumps({"capture_errors": True}).encode("utf-8"))
+        self.assertEqual(status, 200)
+        resp = json.loads(body.decode("utf-8"))
+        self.assertTrue(resp.get("ok"))
+        self.assertTrue(resp.get("capture_errors"))
+        self.assertEqual(resp.get("upstream_base"), original_base)
+        # GET /api/config 回读一致
+        status, body, _ = admin_get(self.proc.admin_port, "/api/config")
+        cfg = json.loads(body.decode("utf-8"))
+        self.assertTrue(cfg["capture_errors"])
+        self.assertEqual(cfg["upstream_base"], original_base)
+        # 再单独 POST capture_errors:false
+        status, body = admin_post(
+            self.proc.admin_port, "/api/config",
+            json.dumps({"capture_errors": False}).encode("utf-8"))
+        self.assertEqual(status, 200)
+        resp = json.loads(body.decode("utf-8"))
+        self.assertFalse(resp.get("capture_errors"))
+        self.assertEqual(resp.get("upstream_base"), original_base)
+
     def test_dashboard_html_full_page(self) -> None:
         status, body, ctype = admin_get(self.proc.admin_port, "/")
         self.assertEqual(status, 200)

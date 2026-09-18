@@ -990,15 +990,17 @@ def main() -> None:
         if cap is not None and not isinstance(cap, bool):
             self._send_json(400, {"error": "capture_errors must be a boolean"})
             return
-        if not isinstance(base, str) or not valid_upstream_url(base):
+        # upstream_base 缺失/为 None 时允许单独 POST capture_errors；给出但非法仍 400。
+        if base is not None and (not isinstance(base, str) or not valid_upstream_url(base)):
             self._send_json(400, {"error": "upstream_base 需为 "
                                            "http(s)://host[:port]/path 形式的合法 URL"})
             return
-        set_upstream_base(base)
+        if base is not None:
+            set_upstream_base(base)
         if cap is not None:
             set_capture_errors(cap)
         with _CFG_LOCK:
-            resp = {"ok": True, "upstream_base": base, "source": "api",
+            resp = {"ok": True, "upstream_base": UPSTREAM_BASE, "source": "api",
                     "capture_errors": CAPTURE_ERRORS}
         self._send_json(200, resp)
 ```
@@ -1097,6 +1099,32 @@ def admin_get(port: int, path: str, headers: dict = None):
             json.dumps({"upstream_base": "http://127.0.0.1:%d" % self.upstream_port,
                         "capture_errors": "yes"}).encode("utf-8"))
         self.assertEqual(status, 400)
+
+    def test_capture_errors_alone_post(self) -> None:
+        """单独 POST capture_errors（无 upstream_base）应 200，并维持上游。"""
+        original_base = "http://127.0.0.1:%d" % self.upstream_port
+        # 单独 POST capture_errors:true
+        status, body = admin_post(
+            self.proc.admin_port, "/api/config",
+            json.dumps({"capture_errors": True}).encode("utf-8"))
+        self.assertEqual(status, 200)
+        resp = json.loads(body.decode("utf-8"))
+        self.assertTrue(resp.get("ok"))
+        self.assertTrue(resp.get("capture_errors"))
+        self.assertEqual(resp.get("upstream_base"), original_base)
+        # GET /api/config 回读一致
+        status, body, _ = admin_get(self.proc.admin_port, "/api/config")
+        cfg = json.loads(body.decode("utf-8"))
+        self.assertTrue(cfg["capture_errors"])
+        self.assertEqual(cfg["upstream_base"], original_base)
+        # 再单独 POST capture_errors:false
+        status, body = admin_post(
+            self.proc.admin_port, "/api/config",
+            json.dumps({"capture_errors": False}).encode("utf-8"))
+        self.assertEqual(status, 200)
+        resp = json.loads(body.decode("utf-8"))
+        self.assertFalse(resp.get("capture_errors"))
+        self.assertEqual(resp.get("upstream_base"), original_base)
 
     def test_errors_endpoint_kind_upstream_5xx(self) -> None:
         """上游 500 + capture_errors on → /api/errors kind=upstream_5xx 且 ?id= 含 response。"""
@@ -1363,7 +1391,7 @@ cd /Users/peter/Documents/project/ctyun-stream-fix-proxy/.worktrees/ops-observab
 在 API 区（现有 `/api/stats`、`/api/config` 文档之后）追加：
 
 ```markdown
-- `GET /api/errors` — 错误留痕列表（newest-first，不含 body/response）。无鉴权（敏感度与 `/api/stats` 同级）。`capture_errors` off 时 count=0、events=[]。
+- `GET /api/errors` — 错误留痕列表（newest-first，不含 body/response）。无鉴权（敏感度与 `/api/stats` 同级）。默认 off（`count:0`、`events:[]`）；关闭开关只停止新增，已留痕事件保留至环自然淘汰，期间 `?id=` 详情仍可读取。
 - `GET /api/errors?id=N` — 单条错误事件详情（含 body/response 快照，≤4096/≤2048 字符）。**需鉴权**：本机（127.0.0.1/::1）放行，非本机需 `X-Admin-Token` 头（与 `POST /api/config` 同一 HMAC 比对）。id 不存在返回 404。
 - `POST /api/config` — 现支持可选 `capture_errors` 布尔键：`{"upstream_base":"...","capture_errors":true}`。仅 upstream_base 必填，capture_errors 可选；可单独 POST 开关。
 - `GET /api/logs` — stderr 日志镜像（内存环，重启即清）。缺省返回最近 100 行；`?tail=N`（1..1000）；`?cursor=C` 分页（返回 seq>C 最多 500 条，oldest->newest）；cursor 与 tail 互斥。无鉴权（行内容=method/path/status/model/异常文本，与 /api/stats 同级）。

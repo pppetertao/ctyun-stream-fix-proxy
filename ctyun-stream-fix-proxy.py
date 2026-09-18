@@ -1163,15 +1163,17 @@ class AdminHandler(http.server.BaseHTTPRequestHandler):
         if cap is not None and not isinstance(cap, bool):
             self._send_json(400, {"error": "capture_errors must be a boolean"})
             return
-        if not isinstance(base, str) or not valid_upstream_url(base):
+        # upstream_base 缺失/为 None 时允许单独 POST capture_errors；给出但非法仍 400。
+        if base is not None and (not isinstance(base, str) or not valid_upstream_url(base)):
             self._send_json(400, {"error": "upstream_base 需为 "
                                            "http(s)://host[:port]/path 形式的合法 URL"})
             return
-        set_upstream_base(base)
+        if base is not None:
+            set_upstream_base(base)
         if cap is not None:
             set_capture_errors(cap)
         with _CFG_LOCK:
-            resp = {"ok": True, "upstream_base": base, "source": "api",
+            resp = {"ok": True, "upstream_base": UPSTREAM_BASE, "source": "api",
                     "capture_errors": CAPTURE_ERRORS}
         self._send_json(200, resp)
 

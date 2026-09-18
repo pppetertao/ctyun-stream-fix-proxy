@@ -59,7 +59,7 @@ launchctl kickstart -k gui/$UID/com.ctyun-stream-fix-proxy
 - `GET /api/stats` — 全量统计 JSON（计数 / daily 分桶 / daily_by_model / recent 100 / 毒行流带 / range_stats 四维度聚合 / range_bounds 四维度窗口闭区间；后两键为加性新增，旧消费者零破坏）
 - `GET /api/config` — 当前上游 base URL
 - `POST /api/config` `{"upstream_base": "..."}` — 热切上游（本机免鉴权，LAN 需 `X-Admin-Token`）
-- `GET /api/errors` — 错误留痕列表（newest-first，不含 body/response）。无鉴权（敏感度与 `/api/stats` 同级）。`capture_errors` off 时 count=0、events=[]。
+- `GET /api/errors` — 错误留痕列表（newest-first，不含 body/response）。无鉴权（敏感度与 `/api/stats` 同级）。默认 off（`count:0`、`events:[]`）；关闭开关只停止新增，已留痕事件保留至环自然淘汰，期间 `?id=` 详情仍可读取。
 - `GET /api/errors?id=N` — 单条错误事件详情（含 body/response 快照，≤4096/≤2048 字符）。**需鉴权**：本机（127.0.0.1/::1）放行，非本机需 `X-Admin-Token` 头（与 `POST /api/config` 同一 HMAC 比对）。id 不存在返回 404。
 - `POST /api/config` — 现支持可选 `capture_errors` 布尔键：`{"upstream_base":"...","capture_errors":true}`。仅 upstream_base 必填，capture_errors 可选；可单独 POST 开关。
 - `GET /api/logs` — stderr 日志镜像（内存环，重启即清）。缺省返回最近 100 行；`?tail=N`（1..1000）；`?cursor=C` 分页（返回 seq>C 最多 500 条，oldest->newest）；cursor 与 tail 互斥。无鉴权（行内容=method/path/status/model/异常文本，与 /api/stats 同级）。
