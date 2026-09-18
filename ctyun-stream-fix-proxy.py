@@ -222,6 +222,12 @@ def logs_snapshot(cursor=None, tail=None) -> dict:
     """
     if cursor is not None and tail is not None:
         raise ValueError("cursor and tail are mutually exclusive")
+    if tail is not None:
+        if not isinstance(tail, int) or tail < 1 or tail > LOG_RING_MAX:
+            raise ValueError("tail must be 1..%d" % LOG_RING_MAX)
+    if cursor is not None:
+        if not isinstance(cursor, int):
+            raise ValueError("cursor must be an integer")
     with LOG_LOCK:
         ring_snap = list(LOG_RING)
     if not ring_snap:
@@ -229,14 +235,10 @@ def logs_snapshot(cursor=None, tail=None) -> dict:
 
     oldest_seq = ring_snap[0]["seq"]
     if tail is not None:
-        if not isinstance(tail, int) or tail < 1 or tail > LOG_RING_MAX:
-            raise ValueError("tail must be 1..%d" % LOG_RING_MAX)
         lines = ring_snap[-tail:]
         return {"lines": lines, "next_cursor": lines[-1]["seq"] if lines else 0,
                 "oldest_seq": oldest_seq, "ring_max": LOG_RING_MAX}
     if cursor is not None:
-        if not isinstance(cursor, int):
-            raise ValueError("cursor must be an integer")
         # cursor=C 返回 seq>C 最多 LOG_PAGE_MAX 条 oldest->newest
         page = [l for l in ring_snap if l["seq"] > cursor][:LOG_PAGE_MAX]
         next_cursor = page[-1]["seq"] if page else cursor

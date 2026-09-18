@@ -1553,8 +1553,8 @@ class ProxyDashboardUnitTest(unittest.TestCase):
     def test_logs_snapshot_invalid_params(self) -> None:
         mod = self.mod
         orig_ring = mod.LOG_RING
-        mod.LOG_RING = collections.deque(
-            [{"seq": 1, "line": "x"}], maxlen=mod.LOG_RING_MAX)
+        # 子测试 1：空环状态下非法参数仍抛 ValueError（参数校验先于空环早退）
+        mod.LOG_RING = collections.deque(maxlen=mod.LOG_RING_MAX)
         try:
             # cursor 和 tail 同给
             with self.assertRaises(ValueError):
@@ -1568,6 +1568,22 @@ class ProxyDashboardUnitTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 mod.logs_snapshot(cursor="abc")
             # tail 非 int
+            with self.assertRaises(ValueError):
+                mod.logs_snapshot(tail="abc")
+        finally:
+            mod.LOG_RING = orig_ring
+        # 子测试 2：非空环状态下同样非法参数也抛 ValueError（防回归掩盖）
+        mod.LOG_RING = collections.deque(
+            [{"seq": 1, "line": "x"}], maxlen=mod.LOG_RING_MAX)
+        try:
+            with self.assertRaises(ValueError):
+                mod.logs_snapshot(cursor=1, tail=10)
+            with self.assertRaises(ValueError):
+                mod.logs_snapshot(tail=0)
+            with self.assertRaises(ValueError):
+                mod.logs_snapshot(tail=mod.LOG_RING_MAX + 1)
+            with self.assertRaises(ValueError):
+                mod.logs_snapshot(cursor="abc")
             with self.assertRaises(ValueError):
                 mod.logs_snapshot(tail="abc")
         finally:
