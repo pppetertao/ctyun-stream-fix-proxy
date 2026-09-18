@@ -1403,9 +1403,9 @@ capture_errors 开关：
 - /api/errors 详情含用户 prompt 走 LAN 明文 HTTP + token 头，不建议跨不可信网段使用。
 ```
 
-将用例数从 `54` 更新为 `102`（现有 baseline 76 + Card 1 单元 12 + Card 2 集成 14；**以全量绿后 unittest 输出 `Ran N tests` 为准**）：
+将用例数从 `54` 更新为 `103`（现有 baseline 76 + Card 1 单元 12 + Card 2 集成 15；**以全量绿后 unittest 输出 `Ran N tests` 为准**）：
 
-找到 `README.md` 中 `54` 用例数的位置（:69），改为 `102`。
+找到 `README.md` 中 `54` 用例数的位置（:69），改为 `103`。
 
 **验证命令**：
 ```bash
@@ -1419,5 +1419,5 @@ cd /Users/peter/Documents/project/ctyun-stream-fix-proxy/.worktrees/ops-observab
 1. **spec coverage** — 四件能力全卡覆盖：失败留痕（Card 1 record_error_event + Card 2 6 处落点）、capture_errors 开关（Card 2 persist/load/set + main()）、日志 API（Card 1 logs_snapshot + _safe_log_stderr 修改 + Card 2 /api/logs 路由）、分类网关（Card 1 classify_outcome/empty_stream_should_retry + Card 2 _proxy_relay 接入）。spec 锚点 28 处全对应。spec 测试列表 "fault_finish_stream → eof_without_done" 与 relay 实测行为不一致（attempt-2 final=True 走 fail-open 不触发 eof）；eof 集成测试改用 body_override=SSE_A+SSE_B（与既有 test_eof_without_done_marked_counted_and_persisted 同签名）。
 2. **placeholder scan** — 零占位符。所有卡内代码均为完整 Python/JSON/Markdown。`_KIND_CATEGORY` 字典消解了 category 字段的 None 占位；buffered 分支的 data 重读已改为 `_relay_buffered` 返回值；`'outcome' in dir()` 已清除。
 3. **type consistency** — Python 3.9 兼容（namedtuple/deque/标准库）；函数签名与 spec 一致（classify_outcome 8 行映射表逐字段锁定 category/log_result/counts_error/capture）；模块态变量类型明确（bool/deque/Lock/int）；`admin_get` 头参数签名 `headers: dict = None` 符合 spec 要求。
-4. **可落盘性** — 验证命令均为 `/usr/bin/python3 ctyun-stream-fix-proxy.test.py`（Card 2 全量 102 例；Card 1 `ProxyDashboardUnitTest` 单测类过滤，12 新例）；落盘路径 worktree 内；README verify 用 grep 检查关键词。
+4. **可落盘性** — 验证命令均为 `/usr/bin/python3 ctyun-stream-fix-proxy.test.py`（Card 2 全量 103 例；Card 1 `ProxyDashboardUnitTest` 单测类过滤，12 新例）；落盘路径 worktree 内；README verify 用 grep 检查关键词。
 5. **锚点实测** — baseline 76 tests/exit 0 已实录 Header（2026-09-18 实测 `Ran 76 tests in 28.049s OK exit 0`）；Card 2 的 `_proxy_relay` 插入行号基于当前代码实测（:642-687 删除 :651 行 + 6 处落点均与当前代码匹配）；启动 banner :1529 与 :1511 两处 `print(file=sys.stderr)` 锚点确认需替换为 `_safe_log_stderr`。
