@@ -1283,6 +1283,314 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         self.assertEqual(len(tmod._PROCS), 0, "registry must be cleared")
         self.assertEqual(tmod.kill_registered(), [], "second call is a no-op")
 
+    def test_classify_outcome_full_matrix(self) -> None:
+        mod = self.mod
+        f = mod.classify_outcome
+
+        # client_abort
+        o = f(client_abort=True)
+        self.assertEqual(o.category, mod.CLASS_CLIENT_ABORT)
+        self.assertEqual(o.log_result, "aborted")
+        self.assertFalse(o.counts_error)
+        self.assertFalse(o.capture)
+
+        # synth_502
+        o = f(synth_502=True)
+        self.assertEqual(o.category, mod.CLASS_UPSTREAM_FAULT)
+        self.assertEqual(o.log_result, "error")
+        self.assertTrue(o.counts_error)
+        self.assertTrue(o.capture)
+
+        # eof_without_done
+        o = f(eof_without_done=True)
+        self.assertEqual(o.category, mod.CLASS_UPSTREAM_FAULT)
+        self.assertEqual(o.log_result, "eof-without-done")
+        self.assertFalse(o.counts_error)
+        self.assertTrue(o.capture)
+
+        # status < 400, no poison
+        o = f(status=200)
+        self.assertEqual(o.category, mod.CLASS_OK)
+        self.assertEqual(o.log_result, "ok")
+        self.assertFalse(o.counts_error)
+        self.assertFalse(o.capture)
+
+        # status < 400, poison_filtered > 0
+        o = f(status=200, poison_filtered=1)
+        self.assertEqual(o.category, mod.CLASS_POISON_FIXED)
+        self.assertEqual(o.log_result, "ok")
+        self.assertFalse(o.counts_error)
+        self.assertTrue(o.capture)
+
+        # 400 <= status < 500
+        o = f(status=404)
+        self.assertEqual(o.category, mod.CLASS_REQUEST_FAULT)
+        self.assertEqual(o.log_result, "upstream-err")
+        self.assertFalse(o.counts_error)
+        self.assertTrue(o.capture)
+
+        # status >= 500
+        o = f(status=502)
+        self.assertEqual(o.category, mod.CLASS_UPSTREAM_FAULT)
+        self.assertEqual(o.log_result, "upstream-err")
+        self.assertFalse(o.counts_error)
+        self.assertTrue(o.capture)
+
+        # priority: client_abort > synth_502 (flags 优先级验证)
+        o = f(client_abort=True, synth_502=True)
+        self.assertEqual(o.category, mod.CLASS_CLIENT_ABORT)
+        self.assertEqual(o.log_result, "aborted")
+
+        # priority: synth_502 > eof_without_done
+        o = f(synth_502=True, eof_without_done=True)
+        self.assertEqual(o.category, mod.CLASS_UPSTREAM_FAULT)
+        self.assertEqual(o.log_result, "error")
+        self.assertTrue(o.counts_error)
+
+        # ValueError: status=None and no flags
+        with self.assertRaises(ValueError):
+            f()
+        with self.assertRaises(ValueError):
+            f(status=None)
+
+    def test_empty_stream_should_retry(self) -> None:
+        f = self.mod.empty_stream_should_retry
+        self.assertTrue(f(1))
+        self.assertTrue(f(10))
+        self.assertFalse(f(0))
+        self.assertFalse(f(-1))
+        # 等价性验证：final = not f(budget) 必须与直接比较一致
+        self.assertEqual(not f(0), not 0 > 0)
+        self.assertEqual(not f(1), not 1 > 0)
+
+    def test_snapshot_text_normal_and_truncation(self) -> None:
+        f = self.mod._snapshot_text
+        self.assertEqual(f(b"hello", 100), "hello")
+        self.assertEqual(f(b"", 10), "")
+        self.assertEqual(f(None, 10), "")
+        long_bytes = b"x" * 5000
+        result = f(long_bytes, 100)
+        self.assertLessEqual(len(result), 100 + len("\u2026[truncated]"))
+        self.assertTrue(result.endswith("[truncated]"))
+        # 恰等于 cap 时不截断
+        exact = b"a" * 50
+        self.assertEqual(f(exact, 50), "a" * 50)
+        # unicode 替换字符
+        invalid = b"\xff\xfe"
+        self.assertIn("\ufffd", f(invalid, 50))
+
+    def test_record_error_event_off_no_capture(self) -> None:
+        mod = self.mod
+        orig_cap = mod.CAPTURE_ERRORS
+        orig_events = mod.ERROR_EVENTS
+        orig_seq = mod._ERROR_EVENT_SEQ
+        mod.ERROR_EVENTS = collections.deque(maxlen=mod.ERROR_RING_MAX)
+        mod._ERROR_EVENT_SEQ = 0
+        try:
+            mod.CAPTURE_ERRORS = False
+            mod.record_error_event(mod.ERR_KIND_SYNTH_502, model="m", exc=ValueError("boom"))
+            self.assertEqual(len(mod.ERROR_EVENTS), 0,
+                             "CAPTURE_ERRORS=False must not add events")
+            self.assertEqual(mod._ERROR_EVENT_SEQ, 0,
+                             "seq must not advance when capture is off")
+            mod.CAPTURE_ERRORS = True
+            mod.record_error_event(mod.ERR_KIND_SYNTH_502, model="m", exc=ValueError("boom"))
+            self.assertEqual(len(mod.ERROR_EVENTS), 1)
+            self.assertEqual(mod._ERROR_EVENT_SEQ, 1)
+            ev = mod.ERROR_EVENTS[0]
+            self.assertEqual(ev["kind"], mod.ERR_KIND_SYNTH_502)
+            self.assertEqual(ev["model"], "m")
+            self.assertIsInstance(ev["id"], int)
+            self.assertIsInstance(ev["ts"], float)
+            self.assertIn("ValueError", ev["exc"])
+        finally:
+            mod.CAPTURE_ERRORS = orig_cap
+            mod.ERROR_EVENTS = orig_events
+            mod._ERROR_EVENT_SEQ = orig_seq
+
+    def test_record_error_event_ring_eviction_and_id_monotonic(self) -> None:
+        mod = self.mod
+        orig_cap = mod.CAPTURE_ERRORS
+        orig_events = mod.ERROR_EVENTS
+        orig_seq = mod._ERROR_EVENT_SEQ
+        mod.ERROR_EVENTS = collections.deque(maxlen=mod.ERROR_RING_MAX)
+        mod._ERROR_EVENT_SEQ = 0
+        try:
+            mod.CAPTURE_ERRORS = True
+            cap = mod.ERROR_RING_MAX
+            for i in range(cap + 10):
+                mod.record_error_event(mod.ERR_KIND_SYNTH_502)
+            self.assertEqual(len(mod.ERROR_EVENTS), cap,
+                             "ring must cap at ERROR_RING_MAX")
+            self.assertEqual(mod.ERROR_EVENTS[-1]["id"], cap + 10,
+                             "id must stay monotonic across eviction")
+            # 最老 10 条已被淘汰
+            self.assertGreater(mod.ERROR_EVENTS[0]["id"], 10)
+        finally:
+            mod.CAPTURE_ERRORS = orig_cap
+            mod.ERROR_EVENTS = orig_events
+            mod._ERROR_EVENT_SEQ = orig_seq
+
+    def test_record_error_event_body_response_snapshot(self) -> None:
+        mod = self.mod
+        orig_cap = mod.CAPTURE_ERRORS
+        orig_events = mod.ERROR_EVENTS
+        orig_seq = mod._ERROR_EVENT_SEQ
+        mod.ERROR_EVENTS = collections.deque(maxlen=mod.ERROR_RING_MAX)
+        mod._ERROR_EVENT_SEQ = 0
+        try:
+            mod.CAPTURE_ERRORS = True
+            body = b"x" * 5000
+            resp = b"y" * 3000
+            mod.record_error_event(
+                mod.ERR_KIND_UPSTREAM_5XX, model="m",
+                upstream_status=500, body=body, response=resp,
+                filtered=3, retried=1, retry_reason="test")
+            ev = mod.ERROR_EVENTS[0]
+            self.assertLessEqual(len(ev["body"]), mod.BODY_SNAPSHOT_CAP + len("\u2026[truncated]"))
+            self.assertLessEqual(len(ev["response"]), mod.RESPONSE_SNIPPET_CAP + len("\u2026[truncated]"))
+            self.assertTrue(ev["body"].endswith("[truncated]"))
+            self.assertTrue(ev["response"].endswith("[truncated]"))
+            self.assertEqual(ev["filtered"], 3)
+            self.assertEqual(ev["retried"], 1)
+            self.assertEqual(ev["retry_reason"], "test")
+            self.assertEqual(ev["upstream_status"], 500)
+        finally:
+            mod.CAPTURE_ERRORS = orig_cap
+            mod.ERROR_EVENTS = orig_events
+            mod._ERROR_EVENT_SEQ = orig_seq
+
+    def test_logs_snapshot_empty_ring(self) -> None:
+        mod = self.mod
+        orig_ring = mod.LOG_RING
+        mod.LOG_RING = collections.deque(maxlen=mod.LOG_RING_MAX)
+        try:
+            snap = mod.logs_snapshot()
+            self.assertEqual(snap["lines"], [])
+            self.assertEqual(snap["next_cursor"], 0)
+            self.assertEqual(snap["oldest_seq"], 0)
+            self.assertEqual(snap["ring_max"], mod.LOG_RING_MAX)
+        finally:
+            mod.LOG_RING = orig_ring
+
+    def test_logs_snapshot_tail_default_and_custom(self) -> None:
+        mod = self.mod
+        orig_ring = mod.LOG_RING
+        mod.LOG_RING = collections.deque(
+            [{"seq": i + 1, "line": "msg-%d" % (i + 1)} for i in range(200)],
+            maxlen=mod.LOG_RING_MAX)
+        try:
+            # 缺省 tail=100
+            snap = mod.logs_snapshot()
+            self.assertEqual(len(snap["lines"]), 100)
+            self.assertEqual(snap["lines"][0]["seq"], 101)
+            self.assertEqual(snap["lines"][-1]["seq"], 200)
+            self.assertEqual(snap["next_cursor"], 200)
+            self.assertEqual(snap["oldest_seq"], 1)
+
+            # tail=20
+            snap = mod.logs_snapshot(tail=20)
+            self.assertEqual(len(snap["lines"]), 20)
+            self.assertEqual(snap["lines"][-1]["seq"], 200)
+            self.assertEqual(snap["next_cursor"], 200)
+
+            # tail 边界：1 和 LOG_RING_MAX
+            snap = mod.logs_snapshot(tail=1)
+            self.assertEqual(len(snap["lines"]), 1)
+            snap = mod.logs_snapshot(tail=mod.LOG_RING_MAX)
+            self.assertEqual(len(snap["lines"]), 200)
+        finally:
+            mod.LOG_RING = orig_ring
+
+    def test_logs_snapshot_cursor_incremental(self) -> None:
+        mod = self.mod
+        orig_ring = mod.LOG_RING
+        mod.LOG_RING = collections.deque(
+            [{"seq": i + 1, "line": "msg-%d" % (i + 1)} for i in range(50)],
+            maxlen=mod.LOG_RING_MAX)
+        try:
+            # cursor 在中间
+            snap = mod.logs_snapshot(cursor=20)
+            lines = snap["lines"]
+            self.assertEqual(len(lines), 30)  # seq 21..50
+            self.assertEqual(lines[0]["seq"], 21)
+            self.assertEqual(lines[-1]["seq"], 50)
+            self.assertEqual(snap["next_cursor"], 50)
+            self.assertEqual(snap["oldest_seq"], 1)
+
+            # cursor 在最新 → 空结果
+            snap = mod.logs_snapshot(cursor=50)
+            self.assertEqual(snap["lines"], [])
+            self.assertEqual(snap["next_cursor"], 50)
+
+            # cursor 在最新之后（未来 cursor）
+            snap = mod.logs_snapshot(cursor=99)
+            self.assertEqual(snap["lines"], [])
+            self.assertEqual(snap["next_cursor"], 99)
+
+            # cursor 在 oldest 之前（淘汰可检测）
+            snap = mod.logs_snapshot(cursor=0)
+            self.assertEqual(len(snap["lines"]), 50)
+            self.assertEqual(snap["oldest_seq"], 1)
+        finally:
+            mod.LOG_RING = orig_ring
+
+    def test_logs_snapshot_cursor_page_limit(self) -> None:
+        mod = self.mod
+        orig_ring = mod.LOG_RING
+        mod.LOG_RING = collections.deque(
+            [{"seq": i + 1, "line": "msg-%d" % (i + 1)} for i in range(800)],
+            maxlen=mod.LOG_RING_MAX)
+        try:
+            snap = mod.logs_snapshot(cursor=0)
+            # page 上限 LOG_PAGE_MAX=500
+            self.assertLessEqual(len(snap["lines"]), mod.LOG_PAGE_MAX)
+            self.assertEqual(snap["lines"][0]["seq"], 1)
+            self.assertEqual(snap["lines"][-1]["seq"], mod.LOG_PAGE_MAX)
+        finally:
+            mod.LOG_RING = orig_ring
+
+    def test_logs_snapshot_invalid_params(self) -> None:
+        mod = self.mod
+        orig_ring = mod.LOG_RING
+        mod.LOG_RING = collections.deque(
+            [{"seq": 1, "line": "x"}], maxlen=mod.LOG_RING_MAX)
+        try:
+            # cursor 和 tail 同给
+            with self.assertRaises(ValueError):
+                mod.logs_snapshot(cursor=1, tail=10)
+            # tail 越界
+            with self.assertRaises(ValueError):
+                mod.logs_snapshot(tail=0)
+            with self.assertRaises(ValueError):
+                mod.logs_snapshot(tail=mod.LOG_RING_MAX + 1)
+            # cursor 非 int
+            with self.assertRaises(ValueError):
+                mod.logs_snapshot(cursor="abc")
+            # tail 非 int
+            with self.assertRaises(ValueError):
+                mod.logs_snapshot(tail="abc")
+        finally:
+            mod.LOG_RING = orig_ring
+
+    def test_safe_log_stderr_writes_to_log_ring(self) -> None:
+        mod = self.mod
+        orig_ring = mod.LOG_RING
+        orig_seq = mod._LOG_SEQ
+        mod.LOG_RING = collections.deque(maxlen=mod.LOG_RING_MAX)
+        mod._LOG_SEQ = 0
+        try:
+            mod._safe_log_stderr("hello-ring")
+            self.assertEqual(len(mod.LOG_RING), 1)
+            self.assertEqual(mod.LOG_RING[0]["line"], "hello-ring")
+            self.assertEqual(mod.LOG_RING[0]["seq"], 1)
+            mod._safe_log_stderr("msg-2")
+            self.assertEqual(len(mod.LOG_RING), 2)
+            self.assertEqual(mod.LOG_RING[1]["seq"], 2)
+        finally:
+            mod.LOG_RING = orig_ring
+            mod._LOG_SEQ = orig_seq
+
 
 class AdminIntegrationTest(unittest.TestCase):
     """admin/dashboard 子进程集成测试（真实 socket，端口与持久化均走 seam）。"""

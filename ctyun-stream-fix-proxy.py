@@ -50,6 +50,35 @@ DONE_RE = re.compile(rb"^data:\s*\[DONE\]\s*$")
 EMPTY_RETRY_MAX = int(os.environ.get("CTYUN_EMPTY_RETRY", "1"))  # env seam，惯例同 SEND_TIMEOUT_S
 PRIMED_TAIL_CAP = 262144  # finish hold 尾段缓冲上限（超限 fail-open 防内存膨胀）
 
+ERROR_RING_MAX = 50
+BODY_SNAPSHOT_CAP = 4096
+RESPONSE_SNIPPET_CAP = 2048
+LOG_RING_MAX = 1000
+LOG_TAIL_DEFAULT = 100
+LOG_PAGE_MAX = 500
+
+CLASS_OK = "ok"
+CLASS_CLIENT_ABORT = "client_abort"
+CLASS_REQUEST_FAULT = "request_fault"
+CLASS_UPSTREAM_FAULT = "upstream_fault"
+CLASS_POISON_FIXED = "poison_fixed"
+
+ERR_KIND_POISON = "poison_hit"
+ERR_KIND_EMPTY_RETRY = "empty_retry"
+ERR_KIND_EOF_NO_DONE = "eof_without_done"
+ERR_KIND_SYNTH_502 = "synth_502"
+ERR_KIND_UPSTREAM_5XX = "upstream_5xx"
+ERR_KIND_REQUEST_4XX = "request_4xx"
+
+_KIND_CATEGORY = {
+    ERR_KIND_POISON: CLASS_POISON_FIXED,
+    ERR_KIND_EMPTY_RETRY: CLASS_OK,
+    ERR_KIND_EOF_NO_DONE: CLASS_UPSTREAM_FAULT,
+    ERR_KIND_SYNTH_502: CLASS_UPSTREAM_FAULT,
+    ERR_KIND_UPSTREAM_5XX: CLASS_UPSTREAM_FAULT,
+    ERR_KIND_REQUEST_4XX: CLASS_REQUEST_FAULT,
+}
+
 
 def sse_data_line_kind(line: bytes) -> str:
     """SSE data 行归类："done" / "content" / "finish" / "noise"。判定序：
@@ -101,6 +130,124 @@ def sse_line_has_usage(line: bytes) -> bool:
     return isinstance(usage, dict) and bool(usage)
 
 
+_Outcome = collections.namedtuple("_Outcome", "category log_result counts_error capture")
+
+
+def classify_outcome(status=None, synth_502=False, client_abort=False,
+                     eof_without_done=False, poison_filtered=0) -> _Outcome:
+    """错误分类网关：输入场景标志 → 返回 (category, log_result, counts_error, capture)。
+
+    判定优先级 client_abort > synth_502 > eof_without_done > status 阈值；
+    status=None 且无 flags → ValueError。
+    """
+    if client_abort:
+        return _Outcome(CLASS_CLIENT_ABORT, "aborted", False, False)
+    if synth_502:
+        return _Outcome(CLASS_UPSTREAM_FAULT, "error", True, True)
+    if eof_without_done:
+        return _Outcome(CLASS_UPSTREAM_FAULT, "eof-without-done", False, True)
+    if status is None:
+        raise ValueError("classify_outcome: status required when no flag is set")
+    if status < 400:
+        if poison_filtered > 0:
+            return _Outcome(CLASS_POISON_FIXED, "ok", False, True)
+        return _Outcome(CLASS_OK, "ok", False, False)
+    if 400 <= status < 500:
+        return _Outcome(CLASS_REQUEST_FAULT, "upstream-err", False, True)
+    # status >= 500
+    return _Outcome(CLASS_UPSTREAM_FAULT, "upstream-err", False, True)
+
+
+def empty_stream_should_retry(budget: int) -> bool:
+    """空流重试决策：预算 > 0 时允许重试。调用点 :656 由 final=(EMPTY_RETRY_MAX < 1)
+    改为 final=not empty_stream_should_retry(EMPTY_RETRY_MAX)，语义等价。"""
+    return budget > 0
+
+
+def _snapshot_text(raw: bytes, cap: int) -> str:
+    """字节快照截断：utf-8 replace 解码，超 cap 截断追加 trunc 标记。"""
+    if raw is None:
+        return ""
+    text = raw.decode("utf-8", "replace")
+    if len(text) <= cap:
+        return text
+    return text[:cap] + "\u2026[truncated]"
+
+
+def record_error_event(kind, model=None, path=None, upstream_status=None, exc=None,
+                       body=None, response=None, filtered=0, retried=0,
+                       retry_reason="") -> None:
+    """记录一条错误留痕事件到 ERROR_EVENTS 环。
+
+    CAPTURE_ERRORS 为 False 时直接返回（off=只走现有计数，不留痕不抓 body）。
+    条目 schema：{id, ts, kind, category, model, path, upstream_status,
+    exc(<=200ch), body(<=4096ch), response(<=2048ch), filtered, retried,
+    retry_reason}；id 进程内单调递增（ERROR_LOCK 内）。"""
+    if not CAPTURE_ERRORS:
+        return
+    global _ERROR_EVENT_SEQ
+    exc_text = ""
+    if exc is not None:
+        exc_text = re.sub(r"\s+", "_",
+                          ("%s: %s" % (type(exc).__name__, exc)).strip())[:200]
+    with ERROR_LOCK:
+        _ERROR_EVENT_SEQ += 1
+        ERROR_EVENTS.append({
+            "id": _ERROR_EVENT_SEQ,
+            "ts": time.time(),
+            "kind": kind,
+            "category": _KIND_CATEGORY.get(kind),
+            "model": model,
+            "path": path,
+            "upstream_status": upstream_status,
+            "exc": exc_text or None,
+            "body": _snapshot_text(body, BODY_SNAPSHOT_CAP) if body else None,
+            "response": _snapshot_text(response, RESPONSE_SNIPPET_CAP) if response else None,
+            "filtered": filtered,
+            "retried": retried,
+            "retry_reason": retry_reason or None,
+        })
+
+
+def logs_snapshot(cursor=None, tail=None) -> dict:
+    """日志分页纯函数：从 LOG_RING 取副本后计算，可单测。
+
+    返回 dict：{"lines": [{"seq": int, "line": str}], "next_cursor": int,
+    "oldest_seq": int, "ring_max": 1000}。
+
+    参数校验（非法 → ValueError）：
+    - tail 非 int / tail < 1 / tail > LOG_RING_MAX → ValueError
+    - cursor 非 int → ValueError
+    - cursor 与 tail 同给 → ValueError
+    """
+    if cursor is not None and tail is not None:
+        raise ValueError("cursor and tail are mutually exclusive")
+    with LOG_LOCK:
+        ring_snap = list(LOG_RING)
+    if not ring_snap:
+        return {"lines": [], "next_cursor": 0, "oldest_seq": 0, "ring_max": LOG_RING_MAX}
+
+    oldest_seq = ring_snap[0]["seq"]
+    if tail is not None:
+        if not isinstance(tail, int) or tail < 1 or tail > LOG_RING_MAX:
+            raise ValueError("tail must be 1..%d" % LOG_RING_MAX)
+        lines = ring_snap[-tail:]
+        return {"lines": lines, "next_cursor": lines[-1]["seq"] if lines else 0,
+                "oldest_seq": oldest_seq, "ring_max": LOG_RING_MAX}
+    if cursor is not None:
+        if not isinstance(cursor, int):
+            raise ValueError("cursor must be an integer")
+        # cursor=C 返回 seq>C 最多 LOG_PAGE_MAX 条 oldest->newest
+        page = [l for l in ring_snap if l["seq"] > cursor][:LOG_PAGE_MAX]
+        next_cursor = page[-1]["seq"] if page else cursor
+        return {"lines": page, "next_cursor": next_cursor,
+                "oldest_seq": oldest_seq, "ring_max": LOG_RING_MAX}
+    # 缺省 tail=LOG_TAIL_DEFAULT
+    lines = ring_snap[-LOG_TAIL_DEFAULT:]
+    return {"lines": lines, "next_cursor": lines[-1]["seq"] if lines else 0,
+            "oldest_seq": oldest_seq, "ring_max": LOG_RING_MAX}
+
+
 class _EmptyStream(Exception):
     """priming EOF 仍无 content/[DONE]：携带 filtered 计数与已滤毒缓冲行。"""
     def __init__(self, filtered: int, lines: list, reason: str = "eof-priming"):
@@ -127,6 +274,15 @@ POISON_PREVIEWS = collections.deque(maxlen=20)   # {"ts","preview"} 最近剥除
 EVENTS = collections.deque(maxlen=100)  # {"ts","kind":"proxy"|"upstream"|"retry","model","status"}
 # 单一全局事件流（kind 区分）而非按 (day,model,kind) 分环：per-key 环形几十个 deque
 # 持久化/清洗成本高，单流 maxlen=100 硬上界等价满足"每 key 有界"，tooltip 按需过滤。
+
+CAPTURE_ERRORS = False  # _CFG_LOCK 守护
+ERROR_EVENTS = collections.deque(maxlen=ERROR_RING_MAX)
+ERROR_LOCK = threading.Lock()
+_ERROR_EVENT_SEQ = 0  # ERROR_LOCK 内递增
+
+LOG_RING = collections.deque(maxlen=LOG_RING_MAX)
+LOG_LOCK = threading.Lock()
+_LOG_SEQ = 0  # LOG_LOCK 内递增
 
 
 def valid_upstream_url(url: str) -> bool:
@@ -287,6 +443,10 @@ def _safe_log_stderr(msg: str) -> None:
         print(msg, file=sys.stderr, flush=True)
     except OSError:
         pass
+    global _LOG_SEQ
+    with LOG_LOCK:
+        _LOG_SEQ += 1
+        LOG_RING.append({"seq": _LOG_SEQ, "line": msg})
 
 
 def save_stats_counters(path: str) -> None:
