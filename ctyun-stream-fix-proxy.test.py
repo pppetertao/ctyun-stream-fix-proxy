@@ -222,7 +222,12 @@ def make_fake_upstream(poison: bool, tag: str = "/plain", big: bool = False,
     # 在 stall 连接上，shutdown 挂测试；daemon_threads=True 保证 teardown 不阻塞
     use_threading = stall_all or stall_calls or rst_all or rst_calls
     if use_threading:
-        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        # RST 变体走 RstUpstreamServer：跳过 std shutdown_request 的 SHUT_WR 阶段，
+        # 防止 FIN 在 SO_LINGER(1,0) close 的 RST 之前先到客户端诱发 RemoteDisconnected。
+        if rst_all or rst_calls:
+            server = RstUpstreamServer(("127.0.0.1", 0), handler)
+        else:
+            server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         server.daemon_threads = True
     else:
         server = HTTPServer(("127.0.0.1", 0), handler)
@@ -255,6 +260,13 @@ def make_rst_upstream(rst_all: bool = False, rst_calls: tuple = (), **kwargs) ->
     port = make_fake_upstream(False, scripted=True,
                               rst_all=rst_all, rst_calls=rst_calls, **kwargs)
     return port, FAKE_SERVERS[-1].RequestHandlerClass.calls
+
+
+class RstUpstreamServer(ThreadingHTTPServer):
+    def shutdown_request(self, request):
+        # std 流程 shutdown(SHUT_WR) 的 FIN 先于 SO_LINGER(1,0) close 的 RST，
+        # 客户端可能先读 EOF 抛 RemoteDisconnected；跳过 shutdown 保纯 RST。
+        self.close_request(request)
 
 
 def make_body_recording_upstream(**kwargs) -> tuple:
@@ -1792,10 +1804,13 @@ class ProxyDashboardUnitTest(unittest.TestCase):
                 mod.HEADER_TIMEOUT_S = 0.5
                 try:
                     body = b'{"model":"test","stream":true,"messages":[]}'
-                    with self.assertRaises(ConnectionResetError):
+                    with self.assertRaises(ConnectionResetError) as cm:
                         mod.ProxyHandler._open_upstream(
                             types.SimpleNamespace(), "POST", "/v1/chat/completions",
                             body, {"Content-Type": "application/json"})
+                    self.assertIs(type(cm.exception), ConnectionResetError,
+                                  "RST fixture must raise exactly ConnectionResetError,"
+                                  " not a subclass like RemoteDisconnected")
                 finally:
                     mod.HEADER_TIMEOUT_S = orig_ht
             finally:
