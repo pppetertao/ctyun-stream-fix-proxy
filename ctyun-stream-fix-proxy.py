@@ -169,9 +169,9 @@ def empty_stream_should_retry(budget: int) -> bool:
 
 
 def header_timeout_should_retry(budget: int) -> bool:
-    """头超时重试决策：budget > 0 时允许重试。调用点 :864（_proxy_relay 首呼
-    (socket.timeout, RemoteDisconnected, ConnectionResetError) catch），覆盖
-    头阶段三类可重试故障（阻塞超时/上游 FIN-close/上游 RST）。"""
+    """头超时重试决策：budget > 0 时允许重试。调用点在 _proxy_relay 头阶段
+    首呼的 (socket.timeout, RemoteDisconnected, ConnectionResetError) catch 分支，
+    覆盖头阶段三类可重试故障（阻塞超时/上游 FIN-close/上游 RST）。"""
     return budget > 0
 
 
