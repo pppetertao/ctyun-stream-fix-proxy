@@ -20,6 +20,7 @@ import re
 import shutil
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -57,6 +58,8 @@ class FakeUpstreamHandler(BaseHTTPRequestHandler):
     fault_finish_stream = False  # True → 每呼回故障尾段（SSE_FAULT_TAIL）
     stall_all = False       # True → 每呼读 body 后 close_connection=True 直接返回（代理 getresponse 抛 http.client.RemoteDisconnected）
     stall_calls = ()        # 1-based 呼叫序号元组：命中则 close_connection=True 不写响应（代理 getresponse 抛 http.client.RemoteDisconnected）
+    rst_all = False         # True → 每呼读 body 后 SO_LINGER(1,0) close 强制发 RST（代理 getresponse 抛 ConnectionResetError）
+    rst_calls = ()          # 1-based 呼叫序号元组：命中则 SO_LINGER(1,0) close 强制发 RST（同 rst_all 形态）
     calls = None          # 共享 list：非 None 时按调用序 append 计数；无 body_override 时首次回空流
     bodies = None        # 共享 list：非 None 时按调用序 append 收到的原始请求体 bytes
 
@@ -80,6 +83,14 @@ class FakeUpstreamHandler(BaseHTTPRequestHandler):
                 self.close_connection = True
                 return
         # --- end stall ---
+        if self.rst_all or (self.rst_calls and self.calls is not None
+                            and len(self.calls) in self.rst_calls):
+            # SO_LINGER(1,0) close 强制发 RST（非 FIN），代理 getresponse 抛
+            # ConnectionResetError；macOS 要求 8 字节 linger struct，int 直传 EINVAL
+            self.request.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                                    struct.pack("ii", 1, 0))
+            self.close_connection = True
+            return
         if self.fail_500:
             body = b'{"error":"upstream exploded"}'
             self.send_response(500)
@@ -191,7 +202,8 @@ def make_fake_upstream(poison: bool, tag: str = "/plain", big: bool = False,
                        fault_finish_first: bool = False,
                        fault_finish_stream: bool = False,
                        scripted: bool = False, record_bodies: bool = False,
-                       stall_all: bool = False, stall_calls: tuple = ()) -> int:
+                       stall_all: bool = False, stall_calls: tuple = (),
+                       rst_all: bool = False, rst_calls: tuple = ()) -> int:
     attrs = {"poison": poison, "tag": tag, "big": big, "fail_500": fail_500,
              "empty_stream": empty_stream, "empty_stream_calls": empty_stream_calls,
              "blank_stream": blank_stream,
@@ -200,13 +212,15 @@ def make_fake_upstream(poison: bool, tag: str = "/plain", big: bool = False,
              "fault_finish_stream": fault_finish_stream,
              "stall_all": stall_all,
              "stall_calls": stall_calls,
+             "rst_all": rst_all,
+             "rst_calls": rst_calls,
              "bodies": [] if record_bodies else None}
     if scripted:
         attrs["calls"] = []
     handler = type("FakeUpstreamHandler", (FakeUpstreamHandler,), attrs)
     # stall 变体使用 ThreadingHTTPServer：单线程 HTTPServer 的 serve_forever 会卡死
     # 在 stall 连接上，shutdown 挂测试；daemon_threads=True 保证 teardown 不阻塞
-    use_threading = stall_all or stall_calls
+    use_threading = stall_all or stall_calls or rst_all or rst_calls
     if use_threading:
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         server.daemon_threads = True
@@ -231,6 +245,15 @@ def make_stall_upstream(stall_all: bool = False, stall_calls: tuple = (), **kwar
     其余 kwargs 透传 empty_stream / body_override 等。"""
     port = make_fake_upstream(False, scripted=True,
                               stall_all=stall_all, stall_calls=stall_calls, **kwargs)
+    return port, FAKE_SERVERS[-1].RequestHandlerClass.calls
+
+
+def make_rst_upstream(rst_all: bool = False, rst_calls: tuple = (), **kwargs) -> tuple:
+    """带调用计数的 RST 假上游：返回 (port, calls)。
+    rst_all/rst_calls 控制哪些呼叫在读 body 后 SO_LINGER(1,0) close 强制发 RST。
+    其余 kwargs 透传 empty_stream / body_override 等。"""
+    port = make_fake_upstream(False, scripted=True,
+                              rst_all=rst_all, rst_calls=rst_calls, **kwargs)
     return port, FAKE_SERVERS[-1].RequestHandlerClass.calls
 
 
@@ -1752,6 +1775,34 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         finally:
             stop_fake_upstreams()
 
+    def test_open_upstream_rst_raises_connection_reset_error(self) -> None:
+        """白盒：RST 上游 → _open_upstream 在 HEADER_TIMEOUT_S 内抛 ConnectionResetError。
+
+        SO_LINGER(1,0) close 强制发 RST（非 FIN-close），代理侧抛 ConnectionResetError
+        且类型恰为 ConnectionResetError（非其子类 RemoteDisconnected——后者是 FIN 竞态
+        产物，此处锁死真 RST 以证夹具确定性）。"""
+        mod = self.mod
+        import types
+        upstream_port = make_fake_upstream(False, rst_all=True)
+        try:
+            orig_base = mod.UPSTREAM_BASE
+            mod.UPSTREAM_BASE = "http://127.0.0.1:%d" % upstream_port
+            try:
+                orig_ht = mod.HEADER_TIMEOUT_S
+                mod.HEADER_TIMEOUT_S = 0.5
+                try:
+                    body = b'{"model":"test","stream":true,"messages":[]}'
+                    with self.assertRaises(ConnectionResetError):
+                        mod.ProxyHandler._open_upstream(
+                            types.SimpleNamespace(), "POST", "/v1/chat/completions",
+                            body, {"Content-Type": "application/json"})
+                finally:
+                    mod.HEADER_TIMEOUT_S = orig_ht
+            finally:
+                mod.UPSTREAM_BASE = orig_base
+        finally:
+            stop_fake_upstreams()
+
 
 class AdminIntegrationTest(unittest.TestCase):
     """admin/dashboard 子进程集成测试（真实 socket，端口与持久化均走 seam）。"""
@@ -2880,6 +2931,59 @@ class AdminIntegrationTest(unittest.TestCase):
         conn.close()
         self.assertEqual(len(calls), 1,
                          "CTYUN_HEADER_RETRY=0 must disable retry, calls=%d" % len(calls))
+
+    def test_header_rst_retry_success(self) -> None:
+        """rst_calls=(1,) → 首呼 RST 触发 conn-reset 重试 → 次呼正常 → calls==2 + SSE 完整。"""
+        upstream_port, calls = make_rst_upstream(rst_calls=(1,))
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        self.proc = start_proxy(upstream_port, free_port(),
+                                extra_env={"CTYUN_HEADER_TIMEOUT": "1"})
+        data = post_sse(self.proc.proxy_port)
+        self.assertEqual(len(calls), 2,
+                         "header RST must trigger exactly one retry, calls=%d" % len(calls))
+        self.assertEqual(data, SSE_A + SSE_B + SSE_DONE,
+                         "attempt-2 must relay byte-exact stream, got %r" % data)
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr = stderr_text(self.proc)
+        self.assertIn("retried=1", stderr,
+                      "REQ line must carry retried=1, stderr:\n" + stderr)
+        self.assertIn("retry_reason=conn-reset", stderr,
+                      "REQ line must carry retry_reason=conn-reset, stderr:\n" + stderr)
+        with open(os.path.join(self.proc.persist_dir, "settings.json"),
+                  encoding="utf-8") as fh:
+            saved = json.load(fh)["stats"]
+        self.assertGreaterEqual(saved.get("header_retries_total", 0), 1,
+                                "header_retries_total must be >=1 after RST retry")
+
+    def test_header_rst_both_timeout_returns_502(self) -> None:
+        """rst_all → 首呼+重试均 RST → 502 + calls==2 + synth_502 留痕含 retried=1 / conn-reset。"""
+        upstream_port, calls = make_rst_upstream(rst_all=True)
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        self.proc = start_proxy(upstream_port, free_port(),
+                                extra_env={"CTYUN_HEADER_TIMEOUT": "1"})
+        conn = http.client.HTTPConnection("127.0.0.1", self.proc.proxy_port, timeout=30)
+        body = b'{"model":"m","stream":true,"messages":[]}'
+        conn.request("POST", "/v1/chat/completions", body=body,
+                     headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        status = resp.status
+        resp.read()
+        conn.close()
+        self.assertEqual(status, 502, "double RST must synthesize 502, got %d" % status)
+        self.assertEqual(len(calls), 2,
+                         "rst_all must trigger exactly one retry then fail, calls=%d" % len(calls))
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr = stderr_text(self.proc)
+        self.assertIn("retried=1", stderr,
+                      "502 REQ line must carry retried=1, stderr:\n" + stderr)
+        self.assertIn("retry_reason=conn-reset", stderr,
+                      "502 REQ line must carry retry_reason=conn-reset, stderr:\n" + stderr)
 
     def test_header_timeout_does_not_leak_into_body_phase(self) -> None:
         """滴流上游（chunk 间隔 1.5s > HEADER_TIMEOUT_S=1）→ 完整收流含 [DONE]。
