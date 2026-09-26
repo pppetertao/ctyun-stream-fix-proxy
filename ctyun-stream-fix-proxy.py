@@ -170,7 +170,8 @@ def empty_stream_should_retry(budget: int) -> bool:
 
 def header_timeout_should_retry(budget: int) -> bool:
     """头超时重试决策：budget > 0 时允许重试。调用点 :864（_proxy_relay 首呼
-    (socket.timeout, RemoteDisconnected) catch）。"""
+    (socket.timeout, RemoteDisconnected, ConnectionResetError) catch），覆盖
+    头阶段三类可重试故障（阻塞超时/上游 FIN-close/上游 RST）。"""
     return budget > 0
 
 
@@ -862,18 +863,23 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         try:
             try:
                 conn, resp = self._open_upstream(self.command, self.path, body, fwd_headers)
-            except (socket.timeout, http.client.RemoteDisconnected) as first_exc:
+            except (socket.timeout, http.client.RemoteDisconnected, ConnectionResetError) as first_exc:
                 # socket.timeout = 响应头阶段阻塞到 HEADER_TIMEOUT_S；RemoteDisconnected
-                # = 上游在响应头阶段直接关连接（未发任何响应字节）。两者同为"响应头阶段
-                # 未收到任何响应"（RemoteDisconnected ⊂ ConnectionError→OSError 且 ⊂
-                # BadStatusLine→HTTPException，外层兜底亦可捕获），priming 不可见论证
-                # 对二者同样成立：重试一次不损伤客户端交付。
+                # = 上游在响应头阶段直接关连接（未发任何响应字节）；ConnectionResetError =
+                # connect/TLS/request 发送/getresponse 头读阶段被 RST。三者同为"响应头阶段
+                # 未收到任何响应字节"，priming 不可见论证对三者同样成立：重试一次不损伤
+                # 客户端交付。retry_reason 有意偏离阶段命名：RST 指向上游 LB 健康、timeout
+                # 指向上游慢，运维 grep 需区分；kind 与计数器仍按阶段复用 header_timeout，
+                # 避免 9 触点统计形状改动。
                 if not header_timeout_should_retry(HEADER_RETRY_MAX):
                     raise
                 header_retried = 1
-                header_retry_reason = "header-timeout"
+                header_retry_reason = ("header-timeout"
+                                       if isinstance(first_exc, (socket.timeout,
+                                                                 http.client.RemoteDisconnected))
+                                       else "conn-reset")
                 record_error_event(ERR_KIND_HEADER_TIMEOUT, model=model, path=self.path,
-                                   exc=first_exc, body=body, retry_reason="header-timeout")
+                                   exc=first_exc, body=body, retry_reason=header_retry_reason)
                 _record_header_retry(model)
                 conn, resp = self._open_upstream(self.command, self.path, body, fwd_headers)
         except (OSError, http.client.HTTPException) as exc:
