@@ -58,6 +58,9 @@ class FakeUpstreamHandler(BaseHTTPRequestHandler):
     fault_finish_stream = False  # True → 每呼回故障尾段（SSE_FAULT_TAIL）
     stall_all = False       # True → 每呼读 body 后 close_connection=True 直接返回（代理 getresponse 抛 http.client.RemoteDisconnected）
     stall_calls = ()        # 1-based 呼叫序号元组：命中则 close_connection=True 不写响应（代理 getresponse 抛 http.client.RemoteDisconnected）
+    sleep_stall_all = False    # True → 每呼读 body 后 sleep 持连不写响应（代理 getresponse 抛 socket.timeout）
+    sleep_stall_calls = ()     # 1-based 呼叫序号元组：命中则 sleep 持连不写响应（同 sleep_stall_all 形态）
+    sleep_stall_seconds = 3.0  # 须 > 用例 HEADER_TIMEOUT（白盒 0.5s/黑盒 1s），余量 ≥2s 防 flaky
     rst_all = False         # True → 每呼读 body 后 SO_LINGER(1,0) close 强制发 RST（代理 getresponse 抛 ConnectionResetError）
     rst_calls = ()          # 1-based 呼叫序号元组：命中则 SO_LINGER(1,0) close 强制发 RST（同 rst_all 形态）
     calls = None          # 共享 list：非 None 时按调用序 append 计数；无 body_override 时首次回空流
@@ -82,6 +85,14 @@ class FakeUpstreamHandler(BaseHTTPRequestHandler):
             if call_num in self.stall_calls:
                 self.close_connection = True
                 return
+        # --- sleep-stall 路径：读 body 后持连 sleep 不写响应（连接保持，代理 getresponse 阻塞到
+        # HEADER_TIMEOUT_S 抛 socket.timeout；区别于 stall 的关连接路径——后者产 RemoteDisconnected）---
+        if self.sleep_stall_all or (self.sleep_stall_calls and self.calls is not None
+                                    and len(self.calls) in self.sleep_stall_calls):
+            time.sleep(self.sleep_stall_seconds)
+            self.close_connection = True
+            return
+        # --- end sleep-stall ---
         # --- end stall ---
         if self.rst_all or (self.rst_calls and self.calls is not None
                             and len(self.calls) in self.rst_calls):
@@ -203,6 +214,8 @@ def make_fake_upstream(poison: bool, tag: str = "/plain", big: bool = False,
                        fault_finish_stream: bool = False,
                        scripted: bool = False, record_bodies: bool = False,
                        stall_all: bool = False, stall_calls: tuple = (),
+                       sleep_stall_all: bool = False, sleep_stall_calls: tuple = (),
+                       sleep_stall_seconds: float = 3.0,
                        rst_all: bool = False, rst_calls: tuple = ()) -> int:
     attrs = {"poison": poison, "tag": tag, "big": big, "fail_500": fail_500,
              "empty_stream": empty_stream, "empty_stream_calls": empty_stream_calls,
@@ -212,6 +225,9 @@ def make_fake_upstream(poison: bool, tag: str = "/plain", big: bool = False,
              "fault_finish_stream": fault_finish_stream,
              "stall_all": stall_all,
              "stall_calls": stall_calls,
+             "sleep_stall_all": sleep_stall_all,
+             "sleep_stall_calls": sleep_stall_calls,
+             "sleep_stall_seconds": sleep_stall_seconds,
              "rst_all": rst_all,
              "rst_calls": rst_calls,
              "bodies": [] if record_bodies else None}
@@ -220,7 +236,8 @@ def make_fake_upstream(poison: bool, tag: str = "/plain", big: bool = False,
     handler = type("FakeUpstreamHandler", (FakeUpstreamHandler,), attrs)
     # stall 变体使用 ThreadingHTTPServer：单线程 HTTPServer 的 serve_forever 会卡死
     # 在 stall 连接上，shutdown 挂测试；daemon_threads=True 保证 teardown 不阻塞
-    use_threading = stall_all or stall_calls or rst_all or rst_calls
+    use_threading = (stall_all or stall_calls or rst_all or rst_calls
+                     or sleep_stall_all or sleep_stall_calls)
     if use_threading:
         # RST 变体走 RstUpstreamServer：跳过 std shutdown_request 的 SHUT_WR 阶段，
         # 防止 FIN 在 SO_LINGER(1,0) close 的 RST 之前先到客户端诱发 RemoteDisconnected。
@@ -250,6 +267,19 @@ def make_stall_upstream(stall_all: bool = False, stall_calls: tuple = (), **kwar
     其余 kwargs 透传 empty_stream / body_override 等。"""
     port = make_fake_upstream(False, scripted=True,
                               stall_all=stall_all, stall_calls=stall_calls, **kwargs)
+    return port, FAKE_SERVERS[-1].RequestHandlerClass.calls
+
+
+def make_sleep_stall_upstream(sleep_stall_all: bool = False,
+                              sleep_stall_calls: tuple = (), **kwargs) -> tuple:
+    """带调用计数的 sleep-stall 假上游：返回 (port, calls)。
+    sleep_stall_all/sleep_stall_calls 控制哪些呼叫在读 body 后 sleep 持连不写响应
+    （连接保持静默 → 代理 getresponse 阻塞到 HEADER_TIMEOUT_S 抛 socket.timeout；
+    区别于 stall 的关连接路径——后者产 RemoteDisconnected）。
+    其余 kwargs 透传 empty_stream / body_override 等。"""
+    port = make_fake_upstream(False, scripted=True,
+                              sleep_stall_all=sleep_stall_all,
+                              sleep_stall_calls=sleep_stall_calls, **kwargs)
     return port, FAKE_SERVERS[-1].RequestHandlerClass.calls
 
 
@@ -1787,6 +1817,34 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         finally:
             stop_fake_upstreams()
 
+    def test_open_upstream_sleep_stall_raises_socket_timeout(self) -> None:
+        """白盒：sleep-stall 上游 → _open_upstream 在 HEADER_TIMEOUT_S 内抛 socket.timeout。
+
+        sleep-stall 夹具读 body 后持连静默（不写响应、不关连接），代理侧 getresponse
+        阻塞到 HEADER_TIMEOUT_S 抛 socket.timeout；与 stall 夹具的
+        RemoteDisconnected（关连接路径）互补，锁可重试元组最后零覆盖子分支。"""
+        mod = self.mod
+        import types
+        upstream_port = make_fake_upstream(False, sleep_stall_all=True)
+        try:
+            orig_base = mod.UPSTREAM_BASE
+            mod.UPSTREAM_BASE = "http://127.0.0.1:%d" % upstream_port
+            try:
+                orig_ht = mod.HEADER_TIMEOUT_S
+                mod.HEADER_TIMEOUT_S = 0.5
+                try:
+                    body = b'{"model":"test","stream":true,"messages":[]}'
+                    with self.assertRaises(socket.timeout):
+                        mod.ProxyHandler._open_upstream(
+                            types.SimpleNamespace(), "POST", "/v1/chat/completions",
+                            body, {"Content-Type": "application/json"})
+                finally:
+                    mod.HEADER_TIMEOUT_S = orig_ht
+            finally:
+                mod.UPSTREAM_BASE = orig_base
+        finally:
+            stop_fake_upstreams()
+
     def test_open_upstream_rst_raises_connection_reset_error(self) -> None:
         """白盒：RST 上游 → _open_upstream 在 HEADER_TIMEOUT_S 内抛 ConnectionResetError。
 
@@ -2898,6 +2956,34 @@ class AdminIntegrationTest(unittest.TestCase):
             saved = json.load(fh)["stats"]
         self.assertGreaterEqual(saved.get("header_retries_total", 0), 1,
                                 "header_retries_total must be >=1 after stall retry")
+
+    def test_header_sleep_stall_retry_success(self) -> None:
+        """sleep_stall_calls=(1,) → 首呼持连静默到 socket.timeout 触发 header-timeout 重试 → 次呼正常 → calls==2 + SSE 完整。"""
+        upstream_port, calls = make_sleep_stall_upstream(sleep_stall_calls=(1,))
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        self.proc = start_proxy(upstream_port, free_port(),
+                                extra_env={"CTYUN_HEADER_TIMEOUT": "1"})
+        data = post_sse(self.proc.proxy_port)
+        self.assertEqual(len(calls), 2,
+                         "header sleep-stall must trigger exactly one retry, calls=%d" % len(calls))
+        self.assertEqual(data, SSE_A + SSE_B + SSE_DONE,
+                         "attempt-2 must relay byte-exact stream, got %r" % data)
+        # REQ 日志含 retried=1 + retry_reason=header-timeout
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr = stderr_text(self.proc)
+        self.assertIn("retried=1", stderr,
+                      "REQ line must carry retried=1, stderr:\n" + stderr)
+        self.assertIn("retry_reason=header-timeout", stderr,
+                      "REQ line must carry retry_reason=header-timeout, stderr:\n" + stderr)
+        # 持久化计数器
+        with open(os.path.join(self.proc.persist_dir, "settings.json"),
+                  encoding="utf-8") as fh:
+            saved = json.load(fh)["stats"]
+        self.assertGreaterEqual(saved.get("header_retries_total", 0), 1,
+                                "header_retries_total must be >=1 after sleep-stall retry")
 
     def test_header_stall_both_timeout_returns_502(self) -> None:
         """stall_all → 首呼+重试均超时 → 502 + calls==2 + synth_502 留痕含 retried=1。"""

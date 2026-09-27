@@ -78,7 +78,7 @@ capture_errors 开关：
 /usr/bin/python3 ctyun-stream-fix-proxy.test.py
 ```
 
-115 个用例。**必须用 `/usr/bin/python3`**：Homebrew 的 Python 3.14 `http.server.HTTPServer` 构造会挂死（进程存活但不 LISTEN、零报错）。
+117 个用例。**必须用 `/usr/bin/python3`**：Homebrew 的 Python 3.14 `http.server.HTTPServer` 构造会挂死（进程存活但不 LISTEN、零报错）。
 
 ## 计数口径
 
