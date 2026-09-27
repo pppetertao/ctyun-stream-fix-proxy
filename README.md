@@ -31,17 +31,16 @@
 
 ## 部署
 
-1. 将 `ctyun-stream-fix-proxy.py` 放到部署路径（plist 模板默认 `/usr/local/bin/`），`chmod +x`。
-2. 按需调整 `com.ctyun-stream-fix-proxy.plist` 中的路径（脚本位置与日志位置），放入 `~/Library/LaunchAgents/`。
-3. 加载：
+本机实际部署（2026-09-18 验收口径）：脚本 `~/.local/bin/ctyun-stream-fix-proxy.py`，plist `~/Library/LaunchAgents/com.ctyun-stream-fix-proxy.plist`（仓库内 plist 为模板，路径按目标机调整；日志路径见本机 plist 的 StandardOutPath/StandardErrorPath）。
+
+日常 deploy（改代码后生效）：
 
 ```sh
-launchctl load ~/Library/LaunchAgents/com.ctyun-stream-fix-proxy.plist
-# 或加载后重启生效：
+cp ctyun-stream-fix-proxy.py ~/.local/bin/ctyun-stream-fix-proxy.py
 launchctl kickstart -k gui/$UID/com.ctyun-stream-fix-proxy
 ```
 
-4. 浏览器打开 `http://127.0.0.1:7921/` 查看监控台。
+首次安装：1. `mkdir -p ~/.local/bin` + cp + `chmod +x`；2. 按目标机调整仓库 plist 模板（脚本/日志路径）拷入 `~/Library/LaunchAgents/`；3. `launchctl load ~/Library/LaunchAgents/com.ctyun-stream-fix-proxy.plist`；4. 浏览器打开 `http://127.0.0.1:7921/`。
 
 ### 环境变量（seam）
 
