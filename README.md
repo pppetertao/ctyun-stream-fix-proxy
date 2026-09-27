@@ -53,7 +53,7 @@ launchctl kickstart -k gui/$UID/com.ctyun-stream-fix-proxy
 | `CTYUN_PERSIST_PATH` | `~/.local/etc/ctyun-stream-fix-proxy.json` | 统计持久化文件路径（原子写） |
 | `CTYUN_SEND_TIMEOUT` | `60` | relay 期间客户端 socket 发送超时（秒） |
 | `CTYUN_HEADER_TIMEOUT` | `45` | 头阶段（连接+响应头）超时（秒），最小值 1 |
-| `CTYUN_HEADER_RETRY` | `1` | 头阶段故障（超时/断连/RST）自动重试次数（0 禁用） |
+| `CTYUN_HEADER_RETRY` | `1` | 头阶段故障（超时/断连/RST）自动重试开关（>0 开启单次重试，0 禁用） |
 
 配置优先级：env > 持久化文件 > 内置默认。
 
