@@ -974,6 +974,13 @@ class TokenPersistTest(unittest.TestCase):
 
 ---
 
+## 卡 2 执行勘误（executor 偏离与 fix 记录，2026-09-30）
+
+1. **2a 位置修正**：brief 原文"`_DAILY_FIELDS = DAILY_V2_FIELDS` 放 :886 基元组处"会导致 NameError（`DAILY_V2_FIELDS` 定义在 :892）。实际落盘：基元组保留为 7 字段基元组，注释块 + 赋值语句挪到 `DAILY_V2_FIELDS` 定义之后。
+2. **2i 清单补充 2 个既有测试**（同模式改 `set(mod.DAILY_V2_FIELDS) | {"days"}` / 16 字段字面量值断言）：`ProxyDashboardUnitTest.test_range_stats_all_four_keys`（test.py:1297）、`P1ConstantsTest.test_v2_constants_declared`（test.py:3926）。
+3. **2f 增量块补 None 守卫**（brief 代码缺陷）：dm 增量块（tokens/bytes/stream/ttfb/outcome）原缩进在 `if entry_dm is not None:` 之外——模型数达 BY_MODEL_CAP 时 entry_dm 为 None，卡 3 传入真实 tokens 即 AttributeError。fix：整块包进 `if entry_dm is not None:`。
+4. test.py:1414 注释"同样 6 字段"过时 → 同步为 16 字段口径。
+
 ## 实测锚点表（2026-09-30 实跑 grep，TPM 合入后的 worktree 行号）
 
 ```
