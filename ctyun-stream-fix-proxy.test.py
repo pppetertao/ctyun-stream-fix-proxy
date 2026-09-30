@@ -1261,7 +1261,8 @@ class ProxyDashboardUnitTest(unittest.TestCase):
             f("2026-03-01", "30d")
 
     def test_aggregate_daily_range_sums_and_days(self) -> None:
-        f = self.mod.aggregate_daily_range
+        mod = self.mod
+        f = mod.aggregate_daily_range
         daily = {
             "2026-02-01": {"requests": 3, "filtered": 1, "errors_proxy": 0,
                            "errors_upstream": 1, "retries": 0},
@@ -1270,16 +1271,14 @@ class ProxyDashboardUnitTest(unittest.TestCase):
                            "errors_upstream": 0, "retries": 4},  # 窗口外
         }
         out = f(daily, "2026-02-01", "2026-02-28")
-        self.assertEqual(out, {"requests": 8, "filtered": 1, "errors_proxy": 0,
-                               "errors_upstream": 1, "retries": 0,
-                               "eof_without_done": 0, "header_retries": 0,
-                               "days": 2})
+        expected = dict.fromkeys(mod.DAILY_V2_FIELDS, 0)
+        expected.update({"requests": 8, "filtered": 1, "errors_upstream": 1,
+                         "retries": 0, "days": 2})
+        self.assertEqual(out, expected)
         # 空窗口：全 0 + days=0
-        self.assertEqual(f(daily, "2025-01-01", "2025-01-31"),
-                         {"requests": 0, "filtered": 0, "errors_proxy": 0,
-                          "errors_upstream": 0, "retries": 0,
-                          "eof_without_done": 0, "header_retries": 0,
-                          "days": 0})
+        expected_empty = dict.fromkeys(mod.DAILY_V2_FIELDS, 0)
+        expected_empty["days"] = 0
+        self.assertEqual(f(daily, "2025-01-01", "2025-01-31"), expected_empty)
         # 端点闭合：start/end 当天都计入
         self.assertEqual(f(daily, "2026-02-02", "2026-02-02")["days"], 1)
         self.assertEqual(f(daily, "2026-02-02", "2026-02-02")["requests"], 5)
@@ -1297,9 +1296,7 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         self.assertEqual(set(plan["bounds"]), set(mod.RANGE_KEYS))
         for key in mod.RANGE_KEYS:
             self.assertEqual(set(plan["stats"][key]),
-                             {"requests", "filtered", "errors_proxy",
-                              "errors_upstream", "retries", "eof_without_done",
-                              "header_retries", "days"})
+                             set(mod.DAILY_V2_FIELDS) | {"days"})
             self.assertEqual(len(plan["bounds"][key]), 2)
         # 3d 窗口 = [02-27, 03-01]：两天桶都在窗内
         self.assertEqual(plan["stats"]["3d"]["requests"], 6)
@@ -1339,8 +1336,7 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         mod = self.mod
         today = mod.today_key()
         bucket = mod.STATS["daily"].setdefault(
-            today, {"requests": 0, "filtered": 0, "errors_proxy": 0,
-                    "errors_upstream": 0, "retries": 0})
+            today, dict.fromkeys(mod.DAILY_V2_FIELDS, 0))
         base = dict(bucket)
         err_base = mod.STATS["errors_total"]
         mod._record_request("POST", "/d1", 200, 1.0, 2)
@@ -1392,9 +1388,8 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         # v3：dm entry 恒 7 字段 + 错误归因与 daily 总桶同口径（error→proxy，5xx→upstream）
         self.assertEqual(
             set(dm_today["m-a"]),
-            {"requests", "filtered", "errors_proxy", "errors_upstream", "retries",
-             "eof_without_done", "header_retries"},
-            "dm entry shape must stay in sync across both creation sites")
+            set(mod.DAILY_V2_FIELDS),
+            "dm entry shape must stay in sync across both creation sites (16 fields)")
         mod._record_request("POST", "/dm", 502, 1.0, 0, model="m-a", error=True)
         self.assertEqual(dm_today["m-a"]["errors_proxy"], 1,
                          "error=True (proxy-made 502) must land in dm errors_proxy")
@@ -1425,9 +1420,8 @@ class ProxyDashboardUnitTest(unittest.TestCase):
             mod.today_key = orig_today
         self.assertEqual(
             set(mod.STATS["daily_by_model"]["2026-01-03"]["m-retry-only"]),
-            {"requests", "filtered", "errors_proxy", "errors_upstream", "retries",
-             "eof_without_done", "header_retries"},
-            "empty-retry creation site must keep dm entry shape in sync")
+            set(mod.DAILY_V2_FIELDS),
+            "empty-retry creation site must keep dm entry shape in sync (16 fields)")
 
     def test_events_record_and_cap(self) -> None:
         mod = self.mod
@@ -1546,14 +1540,29 @@ class ProxyDashboardUnitTest(unittest.TestCase):
                 "2026-01-02": {
                     "m1": {"requests": 3, "filtered": 5, "errors_proxy": 1,
                            "errors_upstream": 2, "retries": 0, "eof_without_done": 0,
-                           "header_retries": 0},
+                           "header_retries": 0,
+                           "tokens_prompt": 0, "tokens_completion": 0,
+                           "bytes_out": 0, "stream_requests": 0,
+                           "ttfb_sum_ms": 0, "ttfb_count": 0,
+                           "outcome_ok": 0, "outcome_degraded": 0,
+                           "outcome_failed": 0},
                     "m2": {"requests": 7, "filtered": 0, "errors_proxy": 0,
                            "errors_upstream": 0, "retries": 4, "eof_without_done": 0,
-                           "header_retries": 0}},
+                           "header_retries": 0,
+                           "tokens_prompt": 0, "tokens_completion": 0,
+                           "bytes_out": 0, "stream_requests": 0,
+                           "ttfb_sum_ms": 0, "ttfb_count": 0,
+                           "outcome_ok": 0, "outcome_degraded": 0,
+                           "outcome_failed": 0}},
                 "2026-01-05": {
                     "m1": {"requests": 1, "filtered": 0, "errors_proxy": 0,
                            "errors_upstream": 0, "retries": 0, "eof_without_done": 0,
-                           "header_retries": 0}}}
+                           "header_retries": 0,
+                           "tokens_prompt": 0, "tokens_completion": 0,
+                           "bytes_out": 0, "stream_requests": 0,
+                           "ttfb_sum_ms": 0, "ttfb_count": 0,
+                           "outcome_ok": 0, "outcome_degraded": 0,
+                           "outcome_failed": 0}}}
             mod.STATS["daily_by_model"] = matrix
             mod.save_stats_counters(path)
             self.assertEqual(mod.load_daily_by_model_buckets(path), matrix,
@@ -1583,7 +1592,13 @@ class ProxyDashboardUnitTest(unittest.TestCase):
                                                 "errors_proxy": 0,
                                                 "errors_upstream": 2, "retries": 0,
                                                 "eof_without_done": 0,
-                                                "header_retries": 0}}},
+                                                "header_retries": 0,
+                                                "tokens_prompt": 0,
+                                                "tokens_completion": 0,
+                                                "bytes_out": 0, "stream_requests": 0,
+                                                "ttfb_sum_ms": 0, "ttfb_count": 0,
+                                                "outcome_ok": 0, "outcome_degraded": 0,
+                                                "outcome_failed": 0}}},
                          "non-dict bucket/entry must be skipped; bad fields coerced to 0")
         # 用例 4：非 ISO 日期 key 跳过（round-trip 校验，版本无关）
         with open(path, "w", encoding="utf-8") as fh:
@@ -1599,7 +1614,12 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         self.assertEqual(dbm["2026-01-03"]["m1"],
                          {"requests": 1, "filtered": 0, "errors_proxy": 0,
                           "errors_upstream": 0, "retries": 0, "eof_without_done": 0,
-                          "header_retries": 0},
+                          "header_retries": 0,
+                          "tokens_prompt": 0, "tokens_completion": 0,
+                          "bytes_out": 0, "stream_requests": 0,
+                          "ttfb_sum_ms": 0, "ttfb_count": 0,
+                          "outcome_ok": 0, "outcome_degraded": 0,
+                          "outcome_failed": 0},
                          "missing fields must be filled with 0")
         # 用例 5：单日 40 模型 → 读回恰 32（文件出现序前 32）
         with open(path, "w", encoding="utf-8") as fh:
@@ -3903,13 +3923,16 @@ class P1ConstantsTest(unittest.TestCase):
         self.assertEqual(mod.PROBE_MIN_INTERVAL_S, 10)
         self.assertEqual(mod.PROBE_FAILURE_THRESHOLD, 3)
         self.assertEqual(mod.PROBE_ALERT_DEBOUNCE_S, 300)
+        # v2 P3 起 _DAILY_FIELDS 即 DAILY_V2_FIELDS（16 字段，同一 tuple）：
+        # 契约按 16 字段字面精确断言，不再写成 "旧 7 字段 + 9 新字段" 的增量式。
         self.assertEqual(
             mod.DAILY_V2_FIELDS,
-            mod._DAILY_FIELDS + ("tokens_prompt", "tokens_completion",
-                                 "bytes_out", "stream_requests",
-                                 "ttfb_sum_ms", "ttfb_count",
-                                 "outcome_ok", "outcome_degraded",
-                                 "outcome_failed"))
+            ("requests", "filtered", "errors_proxy", "errors_upstream",
+             "retries", "eof_without_done", "header_retries",
+             "tokens_prompt", "tokens_completion",
+             "bytes_out", "stream_requests",
+             "ttfb_sum_ms", "ttfb_count",
+             "outcome_ok", "outcome_degraded", "outcome_failed"))
 
 
 class UsageExtractTest(unittest.TestCase):
@@ -3977,6 +4000,108 @@ class UsageExtractTest(unittest.TestCase):
             self.assertEqual(mod.sse_line_has_usage(line),
                              mod.sse_line_extract_usage(line) is not None,
                              "has_usage/extract must agree on %r" % line)
+
+
+class DailyV2CompatTest(unittest.TestCase):
+    """P3 Token期：daily_by_model v2 向后兼容双向 degrade（R2 锁死）。
+
+    旧 7 字段 JSON → 16 字段内存桶零值补齐；
+    新 16 字段 JSON → 7 字段加载函数（模拟旧版二进制）只取 7 字段不崩。
+    """
+
+    def test_legacy_7_field_load_fills_new_fields_with_zero(self) -> None:
+        mod = load_proxy_module()
+        tmp = tempfile.mkdtemp(prefix="ctyun-proxy-p3compat-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        path = os.path.join(tmp, "settings.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"stats": {"daily": {
+                "2026-01-02": {"requests": 5, "filtered": 1, "errors_proxy": 0,
+                               "errors_upstream": 2, "retries": 1,
+                               "eof_without_done": 0, "header_retries": 0}},
+                "daily_by_model": {
+                    "2026-01-02": {"m1": {"requests": 3, "filtered": 0,
+                                          "errors_proxy": 0, "errors_upstream": 0,
+                                          "retries": 0, "eof_without_done": 0,
+                                          "header_retries": 0}}}}}, fh)
+        buckets = mod.load_daily_buckets(path)
+        self.assertEqual(buckets["2026-01-02"]["requests"], 5)
+        self.assertEqual(set(buckets["2026-01-02"]), set(mod.DAILY_V2_FIELDS),
+                         "legacy 7-field bucket must load with 16-field zero-fill")
+        self.assertEqual(buckets["2026-01-02"]["tokens_prompt"], 0)
+        self.assertEqual(buckets["2026-01-02"]["stream_requests"], 0)
+        dbm = mod.load_daily_by_model_buckets(path)
+        self.assertEqual(set(dbm["2026-01-02"]["m1"]), set(mod.DAILY_V2_FIELDS),
+                         "legacy 7-field dm entry must load with 16-field zero-fill")
+        self.assertEqual(dbm["2026-01-02"]["m1"]["tokens_completion"], 0)
+
+    def test_new_16_field_downgrade_reads_7_fields_without_crash(self) -> None:
+        """降级演练：16 字段 JSON 被'旧版 7 字段白名单'加载函数读入 → 只返 7 字段不崩。"""
+        mod = load_proxy_module()
+        tmp = tempfile.mkdtemp(prefix="ctyun-proxy-p3compat-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        path = os.path.join(tmp, "settings.json")
+        entry16 = dict.fromkeys(mod.DAILY_V2_FIELDS, 0)
+        entry16.update({"requests": 4, "tokens_prompt": 11, "tokens_completion": 7,
+                        "stream_requests": 2, "bytes_out": 999})
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"stats": {"daily_by_model": {
+                "2026-01-02": {"m1": entry16}}}}, fh)
+        legacy_7 = ("requests", "filtered", "errors_proxy", "errors_upstream",
+                    "retries", "eof_without_done", "header_retries")
+
+        def legacy_loader(raw) -> dict:
+            # 模拟旧版二进制：_DAILY_FIELDS 7 字段白名单迭代
+            return {k: raw.get(k, 0) for k in legacy_7}
+
+        raw_entry = json.loads(open(path, encoding="utf-8").read())[
+            "stats"]["daily_by_model"]["2026-01-02"]["m1"]
+        out = legacy_loader(raw_entry)
+        self.assertEqual(out["requests"], 4)
+        self.assertEqual(set(out), set(legacy_7),
+                         "old 7-field whitelist must silently drop the 9 new fields")
+        self.assertNotIn("tokens_prompt", out)
+
+    def test_roundtrip_16_field_full_equality(self) -> None:
+        """16 字段桶 save→load 全等（含新字段值）。"""
+        mod = load_proxy_module()
+        tmp = tempfile.mkdtemp(prefix="ctyun-proxy-p3compat-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        path = os.path.join(tmp, "settings.json")
+        orig = mod.STATS["daily_by_model"]
+        try:
+            mod.STATS["daily_by_model"] = {}
+            mod._record_request("POST", "/x", 200, 3.0, 0, model="m-a", stream=1,
+                                ttfb_ms=120.0, outcome=mod.CLASS_OK,
+                                tokens_prompt=11, tokens_completion=7,
+                                tokens=18, bytes_out=500, chunks=2)
+            entry = mod.STATS["daily_by_model"][mod.today_key()]["m-a"]
+            self.assertEqual(entry["tokens_prompt"], 11)
+            self.assertEqual(entry["tokens_completion"], 7)
+            self.assertEqual(entry["stream_requests"], 1)
+            self.assertEqual(entry["bytes_out"], 500)
+            self.assertEqual(entry["ttfb_sum_ms"], 120)
+            self.assertEqual(entry["ttfb_count"], 1)
+            self.assertEqual(entry["outcome_ok"], 1)
+            self.assertEqual(entry["outcome_degraded"], 0)
+            self.assertEqual(entry["outcome_failed"], 0)
+            mod.save_stats_counters(path)
+            self.assertEqual(mod.load_daily_by_model_buckets(path),
+                             mod.STATS["daily_by_model"],
+                             "16-field buckets must roundtrip verbatim")
+        finally:
+            mod.STATS["daily_by_model"] = orig
+
+    def test_outcome_tri_state_mapping(self) -> None:
+        """_outcome_tri_state 映射矩阵（P4 正式化前的 P3 落桶口径）。"""
+        mod = load_proxy_module()
+        f = mod._outcome_tri_state
+        self.assertEqual(f(mod.CLASS_OK), "ok")
+        self.assertEqual(f(mod.CLASS_POISON_FIXED), "degraded")
+        self.assertEqual(f(mod.CLASS_CLIENT_ABORT), "degraded")
+        self.assertEqual(f(mod.CLASS_UPSTREAM_FAULT), "failed")
+        self.assertEqual(f(mod.CLASS_BODY_ERROR), "failed")
+        self.assertEqual(f(mod.CLASS_REQUEST_FAULT), "failed")
 
 
 class RequestIdTest(unittest.TestCase):

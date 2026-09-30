@@ -300,6 +300,19 @@ def classify_outcome(status=None, synth_502=False, client_abort=False,
     return _Outcome(CLASS_UPSTREAM_FAULT, "upstream-err", False, True)
 
 
+def _outcome_tri_state(outcome) -> str:
+    """classify_outcome category 字符串 → 三态（"ok"|"degraded"|"failed"）。
+
+    P4 将把此映射内聚进 classify_outcome 返回的 _Outcome 新增 tri_state 字段；
+    P3 先行用本函数落 daily outcome_* 桶（字段已由 DAILY_V2_FIELDS 就位）。
+    """
+    if outcome == CLASS_OK:
+        return "ok"
+    if outcome in (CLASS_POISON_FIXED, CLASS_CLIENT_ABORT):
+        return "degraded"
+    return "failed"
+
+
 # --- TPM rate limiting（module-level state，全部由 TPM_LOCK 保护）---
 
 _TpmWaiter = collections.namedtuple("_TpmWaiter", "key_id est enqueued_at")
@@ -772,7 +785,7 @@ def range_bounds(today: str, range_key: str) -> tuple:
 def aggregate_daily_range(daily: dict, start: str, end: str) -> dict:
     """窗口 [start, end]（含端点）内 daily 桶逐字段求和；缺字段按 0。
 
-    返回 7 键 dict：_DAILY_FIELDS 六字段 + days=命中桶数。
+    返回 len(_DAILY_FIELDS)+1 键 dict：_DAILY_FIELDS 全字段（v2 P3 起 16 字段）+ days=命中桶数。
     """
     out = {field: 0 for field in _DAILY_FIELDS}
     days = 0
@@ -894,6 +907,11 @@ DAILY_V2_FIELDS = _DAILY_FIELDS + ("tokens_prompt", "tokens_completion",
                                    "ttfb_sum_ms", "ttfb_count",
                                    "outcome_ok", "outcome_degraded",
                                    "outcome_failed")
+
+# v2 P3：daily/daily_by_model 切换 16 字段 schema（DAILY_V2_FIELDS 已在 P1 声明，见下）。
+# load/save 循环与四处 entry 创建均按 _DAILY_FIELDS 迭代 → 切换后旧 7 字段桶自动补 0，
+# 新 16 字段桶被旧版二进制读入自动丢新字段（R2 双向 degrade，无需版本号）。
+_DAILY_FIELDS = DAILY_V2_FIELDS
 
 
 def load_daily_buckets(path: str) -> dict:
@@ -1018,7 +1036,9 @@ def _record_request(method: str, path: str, status: int, dur_ms: float,
                     filtered: int, model=None, error: bool = False,
                     rid=None, upstream_host=None, ttfb_ms=None, stream=None,
                     tokens=None, bytes_out: int = 0, outcome=None,
-                    chunks: int = 0, phase_ms: dict = None) -> None:
+                    chunks: int = 0,
+                    tokens_prompt: int = 0, tokens_completion: int = 0,
+                    phase_ms: dict = None) -> None:
     global _stats_dirty
     with STATS_LOCK:
         if error:
@@ -1028,11 +1048,8 @@ def _record_request(method: str, path: str, status: int, dur_ms: float,
             day_models = STATS["daily_by_model"].setdefault(today_key(), {})
             entry_dm = day_models.get(model)
             if entry_dm is None and len(day_models) < BY_MODEL_CAP:
-                entry_dm = day_models[model] = {"requests": 0, "filtered": 0,
-                                                "errors_proxy": 0,
-                                                "errors_upstream": 0, "retries": 0,
-                                                "eof_without_done": 0,
-                                                "header_retries": 0}
+                # v2 P3：16 字段 schema（DAILY_V2_FIELDS），与另三处创建点形状同步
+                entry_dm = day_models[model] = dict.fromkeys(_DAILY_FIELDS, 0)
             if entry_dm is not None:  # 每日独立 cap：键数达上限后新模型不记录
                 entry_dm["requests"] += 1
                 entry_dm["filtered"] += filtered
@@ -1040,16 +1057,42 @@ def _record_request(method: str, path: str, status: int, dur_ms: float,
                     entry_dm["errors_proxy"] += 1
                 elif status >= 500:
                     entry_dm["errors_upstream"] += 1
+            # v2 P3：dm entry 增量（tokens/bytes/stream/延迟/三态归因）
+            if tokens_prompt > 0:
+                entry_dm["tokens_prompt"] += tokens_prompt
+            if tokens_completion > 0:
+                entry_dm["tokens_completion"] += tokens_completion
+            if bytes_out > 0:
+                entry_dm["bytes_out"] += bytes_out
+            if stream:
+                entry_dm["stream_requests"] += 1
+            if ttfb_ms is not None:
+                entry_dm["ttfb_sum_ms"] += round(ttfb_ms)
+                entry_dm["ttfb_count"] += 1
+            if outcome is not None:
+                entry_dm["outcome_" + _outcome_tri_state(outcome)] += 1
         bucket = STATS["daily"].setdefault(
-            today_key(), {"requests": 0, "filtered": 0,
-                          "errors_proxy": 0, "errors_upstream": 0, "retries": 0,
-                          "eof_without_done": 0, "header_retries": 0})
+            today_key(), dict.fromkeys(_DAILY_FIELDS, 0))
         bucket["requests"] += 1
         bucket["filtered"] += filtered
         if error:
             bucket["errors_proxy"] += 1
         elif status >= 500:
             bucket["errors_upstream"] += 1
+        # v2 P3：daily 总桶增量（与 dm entry 同口径）
+        if tokens_prompt > 0:
+            bucket["tokens_prompt"] += tokens_prompt
+        if tokens_completion > 0:
+            bucket["tokens_completion"] += tokens_completion
+        if bytes_out > 0:
+            bucket["bytes_out"] += bytes_out
+        if stream:
+            bucket["stream_requests"] += 1
+        if ttfb_ms is not None:
+            bucket["ttfb_sum_ms"] += round(ttfb_ms)
+            bucket["ttfb_count"] += 1
+        if outcome is not None:
+            bucket["outcome_" + _outcome_tri_state(outcome)] += 1
         if error or status >= 500:
             # 分类优先级与计数一致（error 分支胜过 status>=500）：error=True → proxy，
             # 其余 status>=500 → upstream；499 中断两边都不入流（同计数口径）。
@@ -1102,7 +1145,7 @@ def _record_poison_preview(raw: bytes) -> None:
 def _record_empty_retry(model=None, reason: str = "eof-priming") -> None:
     """空流重试计数：STATS 总量 + 当日桶 + daily_by_model。
     finish-no-usage 形态额外累加 finish_retries_total。
-    entry/桶形状必须与 _record_request 同步：dm entry 同为 6 字段（本函数无
+    entry/桶形状必须与 _record_request 同步：dm entry 同为 16 字段（DAILY_V2_FIELDS，本函数无
     error/status 参数，errors_* 仅保形状不归因）；旧持久化桶经 load_daily_buckets
     的 _DAILY_FIELDS 清洗已补键。形状不同步时 += 直接 KeyError。"""
     global _stats_dirty
@@ -1114,17 +1157,12 @@ def _record_empty_retry(model=None, reason: str = "eof-priming") -> None:
             day_models = STATS["daily_by_model"].setdefault(today_key(), {})
             entry_dm = day_models.get(model)
             if entry_dm is None and len(day_models) < BY_MODEL_CAP:
-                entry_dm = day_models[model] = {"requests": 0, "filtered": 0,
-                                                "errors_proxy": 0,
-                                                "errors_upstream": 0, "retries": 0,
-                                                "eof_without_done": 0,
-                                                "header_retries": 0}
+                # v2 P3：16 字段 schema（与 _record_request 创建点形状同步）
+                entry_dm = day_models[model] = dict.fromkeys(_DAILY_FIELDS, 0)
             if entry_dm is not None:  # 每日独立 cap：键数达上限后新模型不记录
                 entry_dm["retries"] += 1
         bucket = STATS["daily"].setdefault(
-            today_key(), {"requests": 0, "filtered": 0,
-                          "errors_proxy": 0, "errors_upstream": 0, "retries": 0,
-                          "eof_without_done": 0, "header_retries": 0})
+            today_key(), dict.fromkeys(_DAILY_FIELDS, 0))
         bucket["retries"] += 1
         EVENTS.append({"ts": time.time(), "kind": "retry", "model": model, "status": None})
         _stats_dirty = True
@@ -1141,17 +1179,12 @@ def _record_eof_without_done(model=None) -> None:
             day_models = STATS["daily_by_model"].setdefault(today_key(), {})
             entry_dm = day_models.get(model)
             if entry_dm is None and len(day_models) < BY_MODEL_CAP:
-                entry_dm = day_models[model] = {"requests": 0, "filtered": 0,
-                                                "errors_proxy": 0,
-                                                "errors_upstream": 0, "retries": 0,
-                                                "eof_without_done": 0,
-                                                "header_retries": 0}
+                # v2 P3：16 字段 schema（与 _record_request 创建点形状同步）
+                entry_dm = day_models[model] = dict.fromkeys(_DAILY_FIELDS, 0)
             if entry_dm is not None:  # 每日独立 cap：键数达上限后新模型不记录
                 entry_dm["eof_without_done"] += 1
         bucket = STATS["daily"].setdefault(
-            today_key(), {"requests": 0, "filtered": 0,
-                          "errors_proxy": 0, "errors_upstream": 0, "retries": 0,
-                          "eof_without_done": 0, "header_retries": 0})
+            today_key(), dict.fromkeys(_DAILY_FIELDS, 0))
         bucket["eof_without_done"] += 1
         _stats_dirty = True
 
@@ -1167,17 +1200,12 @@ def _record_header_retry(model=None) -> None:
             day_models = STATS["daily_by_model"].setdefault(today_key(), {})
             entry_dm = day_models.get(model)
             if entry_dm is None and len(day_models) < BY_MODEL_CAP:
-                entry_dm = day_models[model] = {"requests": 0, "filtered": 0,
-                                                "errors_proxy": 0,
-                                                "errors_upstream": 0, "retries": 0,
-                                                "eof_without_done": 0,
-                                                "header_retries": 0}
+                # v2 P3：16 字段 schema（与 _record_request 创建点形状同步）
+                entry_dm = day_models[model] = dict.fromkeys(_DAILY_FIELDS, 0)
             if entry_dm is not None:
                 entry_dm["header_retries"] += 1
         bucket = STATS["daily"].setdefault(
-            today_key(), {"requests": 0, "filtered": 0,
-                          "errors_proxy": 0, "errors_upstream": 0, "retries": 0,
-                          "eof_without_done": 0, "header_retries": 0})
+            today_key(), dict.fromkeys(_DAILY_FIELDS, 0))
         bucket["header_retries"] += 1
         _stats_dirty = True
 
