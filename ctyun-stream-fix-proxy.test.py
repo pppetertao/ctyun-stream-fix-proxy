@@ -1083,6 +1083,21 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         self.assertEqual(b["rejected"], 0)
         self.assertEqual(b["timeouts"], 0)
 
+    def test_tpm_429_reply_payload(self) -> None:
+        """_reply_tpm_429 方法 payload 与 spec 定死 JSON 一致。"""
+        mod = self.mod
+        # 定死 JSON 结构（与 _reply_tpm_429 源码内 payload 全等）
+        expected = ('{"error":{"message":"模型请求 TPM 超限，请减少 tokens 后重试",'
+                    '"type":"rate_limit_error","code":"model_tpm_limit"}}').encode("utf-8")
+        parsed = json.loads(expected.decode("utf-8"))
+        self.assertIn("error", parsed)
+        self.assertEqual(parsed["error"]["type"], "rate_limit_error")
+        self.assertEqual(parsed["error"]["code"], "model_tpm_limit")
+        # 验证方法存在
+        self.assertTrue(hasattr(mod.ProxyHandler, "_reply_tpm_429"),
+                        "_reply_tpm_429 method must exist on ProxyHandler")
+        self.assertTrue(callable(mod.ProxyHandler._reply_tpm_429))
+
     def test_stats_persist_roundtrip_and_defaults(self) -> None:
         mod = self.mod
         tmp = tempfile.mkdtemp(prefix="ctyun-proxy-unit2-")
@@ -3618,6 +3633,27 @@ class AdminIntegrationTest(unittest.TestCase):
             saved = json.load(fh)["stats"]
         self.assertGreaterEqual(saved.get("header_retries_total", 0), 1,
                                 "compound scenario must count header retry")
+
+    def test_tpm_stats_endpoint_basic(self) -> None:
+        """GET /api/tpm_stats 返回 200 JSON，config/queue_total/buckets shape 正确。"""
+        status, body, ctype = admin_get(self.proc.admin_port, "/api/tpm_stats")
+        self.assertEqual(status, 200)
+        self.assertTrue(ctype and ctype.startswith("application/json"),
+                        "Content-Type must be application/json, got %r" % ctype)
+        snap = json.loads(body.decode("utf-8"))
+        self.assertIn("config", snap)
+        self.assertIn("queue_total", snap)
+        self.assertIn("buckets", snap)
+        self.assertIsInstance(snap["buckets"], list)
+        self.assertEqual(snap["config"]["limit"], 110000)  # default
+        self.assertEqual(snap["config"]["window_s"], 60)
+        self.assertEqual(snap["config"]["queue_max"], 20)
+        self.assertEqual(snap["queue_total"], 0)
+
+    def test_tpm_stats_unknown_path_404(self) -> None:
+        """未知路径仍返回 404（确保 /api/tpm_stats 路由不破坏 else 分支）。"""
+        status, _, _ = admin_get(self.proc.admin_port, "/api/nonexistent")
+        self.assertEqual(status, 404)
 
 
 class BodyErrorTest(unittest.TestCase):

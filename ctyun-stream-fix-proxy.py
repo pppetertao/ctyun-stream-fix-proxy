@@ -1471,24 +1471,45 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(payload)
         self.close_connection = True
 
+    def _reply_tpm_429(self, reason: str) -> None:
+        """合成 429 响应（镜像 _reply_502 定死 body + close_connection=True）。
+
+        reason: "full"（队列满/est 超预算）或 "timeout"（排队超时）——用于日志分类。
+        """
+        payload = ('{"error":{"message":"模型请求 TPM 超限，请减少 tokens 后重试",'
+                   '"type":"rate_limit_error","code":"model_tpm_limit"}}').encode("utf-8")
+        self.send_response(429)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("X-Request-Id", self._req_id)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(payload)
+        self.close_connection = True
+
     def _log(self, started: float, status: int, result: str, filtered: int, model=None,
              retried: int = 0, retry_reason: str = "", exc=None,
              rid=None, upstream_host=None, ttfb_ms=None, stream=None,
-             outcome=None) -> None:
+             outcome=None, qwait_ms=None, tpm_used=None) -> None:
         exc_field = "-"
         if exc is not None:
             exc_field = re.sub(r"\s+", "_",
                                ("%s: %s" % (type(exc).__name__, exc)).strip())[:200]
         ttfb_field = "%.1fms" % ttfb_ms if ttfb_ms is not None else "-"
+        extra = ""
+        if qwait_ms is not None:
+            extra += " qwait=%dms" % qwait_ms
+        if tpm_used is not None:
+            extra += " tpm=%d" % tpm_used
         _safe_log_stderr("REQ %s %s -> %d dur=%.1fs result=%s filtered=%d "
                          "model=%s retried=%d retry_reason=%s exc=%s "
-                         "rid=%s host=%s ttfb=%s stream=%s outcome=%s ts=%s"
+                         "rid=%s host=%s ttfb=%s stream=%s outcome=%s%s ts=%s"
                          % (self.command, self.path, status, time.time() - started,
                             result, filtered, model or "-", retried,
                             retry_reason or "-", exc_field,
                             rid or "-", upstream_host or "-", ttfb_field,
                             "-" if stream is None else ("1" if stream else "0"),
-                            outcome or "-",
+                            outcome or "-", extra,
                             time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime())))
 
 
@@ -1503,6 +1524,8 @@ class AdminHandler(http.server.BaseHTTPRequestHandler):
             self._send(200, "image/x-icon", FAVICON_ICO)
         elif path == "/api/stats":
             self._send_json(200, stats_snapshot())
+        elif path == "/api/tpm_stats":
+            self._send_json(200, tpm_snapshot())
         elif path == "/api/config":
             with _CFG_LOCK:
                 payload = {"upstream_base": UPSTREAM_BASE, "source": _upstream_source,
