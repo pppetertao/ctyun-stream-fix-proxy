@@ -935,8 +935,10 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             retried = header_retried
             retry_reason = header_retry_reason
             try:
+                self._body_err_line = None
                 filtered, truncated = self._relay_sse(resp,
                     final=not empty_stream_should_retry(EMPTY_RETRY_MAX))
+                body_error = self._body_err_line is not None
             except _EmptyStream as exc:
                 filtered = exc.filtered  # attempt-1 已滤毒缓冲随重试丢弃，filtered 只计交付流
                 retried = header_retried + 1
@@ -960,17 +962,22 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                                        exc=retry_exc, body=body,
                                        retried=1, retry_reason=retry_reason)
                     return
+                self._body_err_line = None
                 filtered, truncated = self._relay_sse(resp, final=True)
-            outcome = classify_outcome(status=resp.status, poison_filtered=filtered)
+                body_error = self._body_err_line is not None
+            outcome = classify_outcome(status=resp.status, poison_filtered=filtered,
+                                       body_error=body_error)
             result = outcome.log_result  # 重试后按实际 resp 重算
             if truncated and result == "ok":
-                # 仅覆盖 ok：upstream-err（status≥400 更有信息量）与 aborted（异常
-                # 路径不经此处）不误标；priming EOF 由 retries 计数承载，避免双计数
+                # 仅覆盖 ok：body-err/upstream-err（status>=400 更有信息量）与 aborted
+                # （异常路径不经此处）不误标；priming EOF 由 retries 计数承载，避免双计数
                 result = "eof-without-done"
                 outcome = classify_outcome(eof_without_done=True)
                 _record_eof_without_done(model)
             if outcome.capture:
-                if outcome.category == CLASS_POISON_FIXED:
+                if body_error:
+                    kind = ERR_KIND_BODY_ERROR
+                elif outcome.category == CLASS_POISON_FIXED:
                     kind = ERR_KIND_POISON
                 elif result == "eof-without-done":
                     kind = ERR_KIND_EOF_NO_DONE
@@ -981,7 +988,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 record_error_event(kind, model=model, path=self.path,
                                    upstream_status=(resp.status
                                                     if resp.status >= 400 else None),
-                                   body=body, filtered=filtered)
+                                   body=body, filtered=filtered,
+                                   response=self._body_err_line if body_error else None)
             self._log(started, resp.status, result, filtered, model=model, retried=retried,
                       retry_reason=retry_reason)
             _record_request(self.command, self.path, resp.status,
@@ -1059,6 +1067,10 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     # b"\n"/b"\r\n" = record 终结；b"" = EOF（残留 record 同规则收尾）
                     kinds = [sse_data_line_kind(buf_line) for buf_line in pending]
                     saw_done = saw_done or ("done" in kinds)
+                    if self._body_err_line is None:
+                        hit = next((l for l in pending if sse_line_body_error(l)), None)
+                        if hit is not None:
+                            self._body_err_line = hit
                     if poisoned:
                         filtered += 1  # 整 record（含终结空行）丢弃，不损伤相邻字节（priming 期不进 primed）
                         _record_poison_preview(b"".join(pending))

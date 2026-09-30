@@ -36,6 +36,7 @@ SSE_A = b'data: {"choices":[{"delta":{"content":"A"}}]}\n\n'
 SSE_B = b'data: {"choices":[{"delta":{"content":"B"}}]}\n\n'
 SSE_POISON = b"data:null\n\n"
 SSE_DONE = b"data: [DONE]\n\n"
+SSE_ERROR_FRAME = b'data: {"error":{"message":"\u6a21\u578b\u8bf7\u6c42 TPM \u8d85\u9650\uff0c\u8bf7\u51cf\u5c11 tokens \u540e\u91cd\u8bd5","type":"rate_limit_error","code":"model_tpm_limit"}}\n\n'
 SSE_REASONING = b'data: {"choices":[{"delta":{"reasoning_content":"th"}}]}\n\n'
 SSE_FINISH = b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
 SSE_USAGE = b'data: {"id":"u","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}\n\n'
@@ -3321,6 +3322,72 @@ class AdminIntegrationTest(unittest.TestCase):
             saved = json.load(fh)["stats"]
         self.assertGreaterEqual(saved.get("header_retries_total", 0), 1,
                                 "compound scenario must count header retry")
+
+
+class BodyErrorTest(unittest.TestCase):
+    """body error observability 集成测试（SSE error 帧 + 非流式 error JSON）。
+    对齐 AdminIntegrationTest 模式：每用例独立假上游 + 代理子进程。"""
+
+    def setUp(self) -> None:
+        self.upstream_port = make_fake_upstream(False)
+        self.proxy_port = free_port()
+        self.proc = start_proxy(self.upstream_port, self.proxy_port)
+
+    def tearDown(self) -> None:
+        if self.proc:
+            self.proc.terminate()
+            self.proc.wait(timeout=5)
+            stderr_text(self.proc)
+            shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+            stop_fake_upstreams()
+
+    def test_sse_body_error_classified_and_logged(self) -> None:
+        """SSE error 帧 -> stderr REQ 行 result=body-err + /api/stats errors_total +1。"""
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_fake_upstreams()
+        body = SSE_A + SSE_ERROR_FRAME + SSE_DONE
+        upstream_port, calls = make_scripted_upstream(body_override=body)
+        self.proc = start_proxy(upstream_port, free_port())
+        data = post_sse(self.proc.proxy_port)
+        # error 帧原样透传（不剥离）
+        self.assertEqual(data, body,
+                         "error frame must be relayed to client intact, got %r" % data[:200])
+        _, body_bytes, _ = admin_get(self.proc.admin_port, "/api/stats")
+        snap = json.loads(body_bytes.decode("utf-8"))
+        self.assertGreaterEqual(snap["errors_total"], 1,
+                                "errors_total must increment for body error")
+        today = time.strftime("%Y-%m-%d")
+        self.assertGreaterEqual(snap["daily"][today]["errors_proxy"], 1,
+                                "daily errors_proxy must increment for body error")
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr = stderr_text(self.proc)
+        self.assertIn("result=body-err", stderr,
+                      "REQ line must carry result=body-err, stderr:\n" + stderr)
+
+    def test_body_error_no_retry(self) -> None:
+        """SSE error 帧流不触发空流重试（calls==1）。"""
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_fake_upstreams()
+        body = SSE_ERROR_FRAME + SSE_DONE
+        upstream_port, calls = make_scripted_upstream(body_override=body)
+        self.proc = start_proxy(upstream_port, free_port())
+        data = post_sse(self.proc.proxy_port)
+        self.assertEqual(len(calls), 1,
+                         "error frame stream must not trigger retry, calls=%d" % len(calls))
+        self.assertEqual(data, body,
+                         "error-only stream must relay as-is, got %r" % data[:200])
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr = stderr_text(self.proc)
+        self.assertIn("result=body-err", stderr,
+                      "error-only stream must carry result=body-err, stderr:\n" + stderr)
 
 
 if __name__ == "__main__":
