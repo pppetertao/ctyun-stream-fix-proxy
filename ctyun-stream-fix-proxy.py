@@ -50,6 +50,15 @@ POISON_RE = re.compile(rb"^data:\s*null\s*$")
 DONE_RE = re.compile(rb"^data:\s*\[DONE\]\s*$")
 EMPTY_RETRY_MAX = int(os.environ.get("CTYUN_EMPTY_RETRY", "1"))  # env seam，惯例同 SEND_TIMEOUT_S
 HEADER_RETRY_MAX = max(0, int(os.environ.get("CTYUN_HEADER_RETRY", "1")))
+
+# TPM rate limiting（per-key 滚动窗口 + FIFO 排队）
+TPM_LIMIT = int(os.environ.get("CTYUN_TPM_LIMIT", "110000"))
+TPM_WINDOW_S = int(os.environ.get("CTYUN_TPM_WINDOW_S", "60"))
+TPM_QUEUE_MAX = int(os.environ.get("CTYUN_TPM_QUEUE_MAX", "20"))
+TPM_QUEUE_TIMEOUT_S = float(os.environ.get("CTYUN_TPM_QUEUE_TIMEOUT_S", "120"))
+TPM_TOKEN_RATIO = float(os.environ.get("CTYUN_TPM_TOKEN_RATIO", "0.55"))
+TPM_KEY_CAP = int(os.environ.get("CTYUN_TPM_KEY_CAP", "64"))
+
 PRIMED_TAIL_CAP = 262144  # finish hold 尾段缓冲上限（超限 fail-open 防内存膨胀）
 
 # observability v2 常量（P1 先声明；HIST_BUCKETS_MS P2 起用、PROBE_* P4 起用）
@@ -72,6 +81,7 @@ CLASS_CLIENT_ABORT = "client_abort"
 CLASS_REQUEST_FAULT = "request_fault"
 CLASS_UPSTREAM_FAULT = "upstream_fault"
 CLASS_POISON_FIXED = "poison_fixed"
+CLASS_TPM_LIMITED = "tpm_limited"
 
 ERR_KIND_POISON = "poison_hit"
 ERR_KIND_EMPTY_RETRY = "empty_retry"
@@ -80,6 +90,8 @@ ERR_KIND_SYNTH_502 = "synth_502"
 ERR_KIND_UPSTREAM_5XX = "upstream_5xx"
 ERR_KIND_REQUEST_4XX = "request_4xx"
 ERR_KIND_HEADER_TIMEOUT = "header_timeout"
+ERR_KIND_TPM_QUEUE_FULL = "tpm_queue_full"
+ERR_KIND_TPM_QUEUE_TIMEOUT = "tpm_queue_timeout"
 
 CLASS_BODY_ERROR = "body_error"
 ERR_KIND_BODY_ERROR = "body_error"
@@ -93,6 +105,8 @@ _KIND_CATEGORY = {
     ERR_KIND_REQUEST_4XX: CLASS_REQUEST_FAULT,
     ERR_KIND_HEADER_TIMEOUT: CLASS_UPSTREAM_FAULT,
     ERR_KIND_BODY_ERROR: CLASS_BODY_ERROR,
+    ERR_KIND_TPM_QUEUE_FULL: CLASS_TPM_LIMITED,
+    ERR_KIND_TPM_QUEUE_TIMEOUT: CLASS_TPM_LIMITED,
 }
 
 
@@ -158,6 +172,26 @@ def sse_line_has_usage(line: bytes) -> bool:
         return False
     usage = data.get("usage")
     return isinstance(usage, dict) and bool(usage)
+
+
+def sse_line_usage(line: bytes):
+    """返回 SSE data 行中的 usage dict，无 usage 帧返回 None。
+
+    解析逻辑与 sse_line_has_usage 同序：非 data: 前缀/[DONE]/非 JSON/非 dict →
+    None；usage 非空 dict → 返回该 dict；其余 → None。
+    独立 usage 帧（choices=[]）与 ride-on finish 帧均覆盖。
+    """
+    stripped = line.rstrip(b"\r\n")
+    if not stripped.startswith(b"data:") or DONE_RE.match(stripped):
+        return None
+    try:
+        data = json.loads(stripped[5:].strip().decode("utf-8", "replace"))
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    usage = data.get("usage")
+    return usage if isinstance(usage, dict) and usage else None
 
 
 def sse_line_body_error(line: bytes) -> bool:

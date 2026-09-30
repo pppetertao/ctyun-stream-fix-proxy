@@ -830,6 +830,76 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         # non-dict JSON -> False
         self.assertFalse(f(b'data: [1,2,3]\n'))
 
+    def test_sse_line_usage_matrix(self) -> None:
+        f = self.mod.sse_line_usage
+        # 独立 usage 帧（choices=[]）→ 返回 usage dict
+        result = f(b'data: {"id":"u","choices":[],'
+                   b'"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}\n')
+        self.assertIsInstance(result, dict)
+        self.assertEqual(result, {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})
+        # ride-on finish 帧（choices 有 finish + usage 顶层）→ 返回 usage dict
+        result2 = f(b'data: {"id":"x","choices":[{"delta":{},"finish_reason":"stop"}],'
+                    b'"usage":{"prompt_tokens":10,"completion_tokens":3,"total_tokens":13}}\n')
+        self.assertEqual(result2, {"prompt_tokens": 10, "completion_tokens": 3, "total_tokens": 13})
+        # 空 usage {} → None
+        self.assertIsNone(f(b'data: {"id":"e","choices":[],"usage":{}}\n'))
+        # usage: null → None
+        self.assertIsNone(f(b'data: {"id":"n","choices":[],"usage":null}\n'))
+        # [DONE] → None
+        self.assertIsNone(f(b"data: [DONE]\n"))
+        # 非 JSON → None
+        self.assertIsNone(f(b"data: {not json\n"))
+        # 非 data 行 → None
+        self.assertIsNone(f(b": keep-alive\n"))
+        # usage 非 dict（如列表）→ None
+        self.assertIsNone(f(b'data: {"usage":[1,2,3],"choices":[]}\n'))
+        # 普通 content 帧 → None
+        self.assertIsNone(f(b'data: {"choices":[{"delta":{"content":"hi"}}]}\n'))
+
+    def test_tpm_constants_load(self) -> None:
+        """TPM 常量通过 load_proxy_module 可见且取值正确。"""
+        mod = self.mod
+        self.assertEqual(mod.TPM_LIMIT, 110000)
+        self.assertEqual(mod.TPM_WINDOW_S, 60)
+        self.assertEqual(mod.TPM_QUEUE_MAX, 20)
+        self.assertEqual(mod.TPM_QUEUE_TIMEOUT_S, 120)
+        self.assertEqual(mod.TPM_TOKEN_RATIO, 0.55)
+        self.assertEqual(mod.TPM_KEY_CAP, 64)
+        self.assertEqual(mod.CLASS_TPM_LIMITED, "tpm_limited")
+        self.assertEqual(mod.ERR_KIND_TPM_QUEUE_FULL, "tpm_queue_full")
+        self.assertEqual(mod.ERR_KIND_TPM_QUEUE_TIMEOUT, "tpm_queue_timeout")
+        self.assertIn(mod.ERR_KIND_TPM_QUEUE_FULL, mod._KIND_CATEGORY)
+        self.assertIn(mod.ERR_KIND_TPM_QUEUE_TIMEOUT, mod._KIND_CATEGORY)
+        self.assertEqual(mod._KIND_CATEGORY[mod.ERR_KIND_TPM_QUEUE_FULL],
+                         mod.CLASS_TPM_LIMITED)
+        self.assertEqual(mod._KIND_CATEGORY[mod.ERR_KIND_TPM_QUEUE_TIMEOUT],
+                         mod.CLASS_TPM_LIMITED)
+
+    def test_tpm_constants_env_seam(self) -> None:
+        """TPM 常量从环境变量读取（用 subprocess 验证 env seam）。"""
+        import subprocess
+        code = (
+            "import os; "
+            "os.environ['CTYUN_TPM_LIMIT']='50000'; "
+            "os.environ['CTYUN_TPM_WINDOW_S']='30'; "
+            "os.environ['CTYUN_TPM_QUEUE_MAX']='5'; "
+            "os.environ['CTYUN_TPM_QUEUE_TIMEOUT_S']='10'; "
+            "os.environ['CTYUN_TPM_TOKEN_RATIO']='0.3'; "
+            "os.environ['CTYUN_TPM_KEY_CAP']='8'; "
+            "import importlib.util, sys; "
+            "spec = importlib.util.spec_from_file_location('m', %r); "
+            "m = importlib.util.module_from_spec(spec); "
+            "spec.loader.exec_module(m); "
+            "print(m.TPM_LIMIT, m.TPM_WINDOW_S, m.TPM_QUEUE_MAX, "
+            "m.TPM_QUEUE_TIMEOUT_S, m.TPM_TOKEN_RATIO, m.TPM_KEY_CAP)"
+        ) % PROXY_SCRIPT
+        proc = subprocess.run([sys.executable, "-c", code],
+                              capture_output=True, text=True, timeout=10)
+        self.assertEqual(proc.returncode, 0,
+                         "env seam subprocess failed stderr:\n" + proc.stderr)
+        parts = proc.stdout.strip().split()
+        self.assertEqual(parts, ["50000", "30", "5", "10.0", "0.3", "8"])
+
     def test_stats_persist_roundtrip_and_defaults(self) -> None:
         mod = self.mod
         tmp = tempfile.mkdtemp(prefix="ctyun-proxy-unit2-")
@@ -1913,8 +1983,8 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         self.assertEqual(mod._KIND_CATEGORY.get(mod.ERR_KIND_BODY_ERROR),
                          mod.CLASS_BODY_ERROR,
                          "body_error must map to body_error category")
-        self.assertEqual(len(mod._KIND_CATEGORY), 8,
-                         "must have exactly 8 kind-category mappings")
+        self.assertEqual(len(mod._KIND_CATEGORY), 10,
+                         "must have exactly 10 kind-category mappings")
 
     def test_header_timeout_kind_category_and_classify_regression(self) -> None:
         mod = self.mod
