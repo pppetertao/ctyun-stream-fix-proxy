@@ -9,6 +9,11 @@
     <string>/usr/bin/python3</string>
     <string>/usr/local/bin/ctyun-stream-fix-proxy.py</string>
   </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+      <key>CTYUN_LISTEN_HOST</key>
+      <string>0.0.0.0</string>
+    </dict>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>

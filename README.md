@@ -11,7 +11,7 @@
 ## 功能
 
 - **record 级剥行**：按空行切分 SSE record，毒 record 整弃，其余逐 record flush 转发；SSE 下游 close-delimited，非 SSE 请求原样透传
-- **双端口**：转发代理 `127.0.0.1:7920` + 同进程内嵌监控台 `0.0.0.0:7921`
+- **双端口**：转发代理 `:7920`（默认绑 `127.0.0.1`；`CTYUN_LISTEN_HOST=0.0.0.0` 开放局域网）+ 同进程内嵌监控台 `0.0.0.0:7921`
 - **监控 dashboard**（浏览器运行台，深石板蓝+琥珀，零外部依赖，2s 轮询 `/api/stats`）：
   - 实时统计：按所选时间段（近3天/近7天/本月/上月）聚合的请求数 / 剥行 / 毒行率 / 错误数；活跃连接恒实时
   - 「最近请求」最近 100 条（含模型列、耗时、剥行数；跨天时自动按日期分组显示）
@@ -40,12 +40,15 @@ cp ctyun-stream-fix-proxy.py ~/.local/bin/ctyun-stream-fix-proxy.py
 launchctl kickstart -k gui/$UID/com.ctyun-stream-fix-proxy
 ```
 
+仓库 plist 模板已内置 `EnvironmentVariables.CTYUN_LISTEN_HOST=0.0.0.0`：live plist（~/Library/LaunchAgents/）同步该键并 kickstart -k 后转发端口 LAN 可达；不需要时删键或改回 `127.0.0.1`。
+
 首次安装：1. `mkdir -p ~/.local/bin` + cp + `chmod +x`；2. 按目标机调整仓库 plist 模板（脚本/日志路径）拷入 `~/Library/LaunchAgents/`；3. `launchctl load ~/Library/LaunchAgents/com.ctyun-stream-fix-proxy.plist`；4. 浏览器打开 `http://127.0.0.1:7921/`。
 
 ### 环境变量（seam）
 
 | 变量 | 默认 | 说明 |
 |------|------|------|
+| `CTYUN_LISTEN_HOST` | `127.0.0.1` | 转发代理监听地址；`0.0.0.0` 开放局域网（转发端口无鉴权，仅可信网段） |
 | `CTYUN_ADMIN_HOST` | `0.0.0.0` | 监控台监听地址 |
 | `CTYUN_ADMIN_PORT` | `7921` | 监控台端口 |
 | `CTYUN_ADMIN_TOKEN` | 空 | 局域网访问 `POST /api/config` 所需 token（未设则 LAN 只读） |
@@ -78,7 +81,7 @@ capture_errors 开关：
 /usr/bin/python3 ctyun-stream-fix-proxy.test.py
 ```
 
-117 个用例。**必须用 `/usr/bin/python3`**：Homebrew 的 Python 3.14 `http.server.HTTPServer` 构造会挂死（进程存活但不 LISTEN、零报错）。
+118 个用例。**必须用 `/usr/bin/python3`**：Homebrew 的 Python 3.14 `http.server.HTTPServer` 构造会挂死（进程存活但不 LISTEN、零报错）。
 
 ## 计数口径
 
