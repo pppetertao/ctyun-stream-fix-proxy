@@ -997,19 +997,31 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                             error=outcome.counts_error)
         else:
             relayed_data = self._relay_buffered(resp)
-            outcome = classify_outcome(status=resp.status)
+            body_error = False
+            if relayed_data:
+                try:
+                    parsed = json.loads(relayed_data.decode("utf-8", "replace"))
+                    body_error = body_has_error(parsed)
+                except ValueError:
+                    pass  # non-JSON body -> no body error, fail-open
+            outcome = classify_outcome(status=resp.status, body_error=body_error)
             self._log(started, resp.status, outcome.log_result, 0, model=model)
             _record_request(self.command, self.path, resp.status,
                             (time.time() - started) * 1000, 0, model=model,
                             error=outcome.counts_error)
             if outcome.capture:
+                if body_error:
+                    kind = ERR_KIND_BODY_ERROR
+                elif resp.status >= 500:
+                    kind = ERR_KIND_UPSTREAM_5XX
+                else:
+                    kind = ERR_KIND_REQUEST_4XX
                 record_error_event(
-                    ERR_KIND_UPSTREAM_5XX if resp.status >= 500 else ERR_KIND_REQUEST_4XX,
-                    model=model, path=self.path,
+                    kind, model=model, path=self.path,
                     upstream_status=resp.status if resp.status >= 400 else None,
                     body=body,
                     response=relayed_data[:RESPONSE_SNIPPET_CAP]
-                    if resp.status >= 500 else None)
+                    if body_error or resp.status >= 500 else None)
         conn.close()
 
     def _open_upstream(self, method: str, path: str, body, fwd_headers: dict):
@@ -1466,7 +1478,7 @@ footer .inner { color:var(--dim); font-size:12px; padding-top:4px; padding-botto
   日桶保留 90 天，覆盖上月+当月最远 62 天回溯）；
   按天×模型计数同 daily 口径跨重启保留（90 天 prune，副表数值 ≤ 主表，差值=当日无 model 请求，见下行）；
   按天主表含无 model 请求，各行数值 ≥「按天 × 模型」副表合计，差值即当日无 model 请求；
-  最近请求/剥行流带为内存数据；「代理错误」=代理自身错误，「上游5xx」=上游透传 status≥500
+  最近请求/剥行流带为内存数据；「代理错误」=代理自身错误（含 body 内嵌错误：HTTP 200 但 body 顶层 error 对象），「上游5xx」=上游透传 status≥500
   （499 中断两边都不计）。页面每 2s 轮询 /api/stats，切换时间段用缓存零请求重渲染；非本机修改上游需 X-Admin-Token。
 </div></footer>
 <div class="evt-tip" id="evt-tip"></div>

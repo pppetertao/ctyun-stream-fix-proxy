@@ -51,6 +51,7 @@ class FakeUpstreamHandler(BaseHTTPRequestHandler):
     tag = "/plain"  # /plain 响应携带的路径标记，供"上游热切换后路由命中"断言区分
     big = False     # True → 1.2MB 大 SSE 流，供 client-abort 测试把代理写缓冲打穿
     fail_500 = False  # True → do_POST 回 500 JSON（上游 5xx 透传计数测试用）
+    fail_200_error = False  # True -> do_POST 回 200 + JSON error body（非流式 body error 测试用）
     empty_stream = False  # True → 每次 POST 回空流（reasoning 后 EOF，无 [DONE]）
     empty_stream_calls = ()  # 1-based 呼叫序号元组：命中则回空流（同 empty_stream 形态）
     blank_stream = False  # True → 空流形态为零字节 body（200 + SSE 头 + 立即 EOF）
@@ -101,6 +102,15 @@ class FakeUpstreamHandler(BaseHTTPRequestHandler):
             # ConnectionResetError；macOS 要求 8 字节 linger struct，int 直传 EINVAL
             self.request.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
                                     struct.pack("ii", 1, 0))
+            self.close_connection = True
+            return
+        if self.fail_200_error:
+            body = b'{"error":{"message":"model tpm limit","type":"rate_limit_error","code":"model_tpm_limit"}}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
             self.close_connection = True
             return
         if self.fail_500:
@@ -217,7 +227,8 @@ def make_fake_upstream(poison: bool, tag: str = "/plain", big: bool = False,
                        stall_all: bool = False, stall_calls: tuple = (),
                        sleep_stall_all: bool = False, sleep_stall_calls: tuple = (),
                        sleep_stall_seconds: float = 3.0,
-                       rst_all: bool = False, rst_calls: tuple = ()) -> int:
+                       rst_all: bool = False, rst_calls: tuple = (),
+                       fail_200_error: bool = False) -> int:
     attrs = {"poison": poison, "tag": tag, "big": big, "fail_500": fail_500,
              "empty_stream": empty_stream, "empty_stream_calls": empty_stream_calls,
              "blank_stream": blank_stream,
@@ -231,6 +242,7 @@ def make_fake_upstream(poison: bool, tag: str = "/plain", big: bool = False,
              "sleep_stall_seconds": sleep_stall_seconds,
              "rst_all": rst_all,
              "rst_calls": rst_calls,
+             "fail_200_error": fail_200_error,
              "bodies": [] if record_bodies else None}
     if scripted:
         attrs["calls"] = []
@@ -3388,6 +3400,37 @@ class BodyErrorTest(unittest.TestCase):
         stderr = stderr_text(self.proc)
         self.assertIn("result=body-err", stderr,
                       "error-only stream must carry result=body-err, stderr:\n" + stderr)
+
+    def test_buffered_body_error(self) -> None:
+        """非流式 200 + JSON error body -> result=body-err，errors_total +1。"""
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_fake_upstreams()
+        upstream_port = make_fake_upstream(False, fail_200_error=True)
+        self.proc = start_proxy(upstream_port, free_port())
+        conn = http.client.HTTPConnection("127.0.0.1", self.proc.proxy_port, timeout=10)
+        conn.request("POST", "/v1/chat/completions", body=b'{"model":"m"}',
+                     headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        self.assertEqual(resp.status, 200,
+                         "fail_200_error upstream must return 200, got %d" % resp.status)
+        data = resp.read()
+        conn.close()
+        self.assertIn(b"error", data, "response must contain error body")
+        _, body_bytes, _ = admin_get(self.proc.admin_port, "/api/stats")
+        snap = json.loads(body_bytes.decode("utf-8"))
+        self.assertGreaterEqual(snap["errors_total"], 1,
+                                "non-SSE body error must increment errors_total")
+        today = time.strftime("%Y-%m-%d")
+        self.assertGreaterEqual(snap["daily"][today]["errors_proxy"], 1,
+                                "non-SSE body error must increment daily errors_proxy")
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr = stderr_text(self.proc)
+        self.assertIn("result=body-err", stderr,
+                      "non-SSE error must log result=body-err, stderr:\n" + stderr)
 
 
 if __name__ == "__main__":
