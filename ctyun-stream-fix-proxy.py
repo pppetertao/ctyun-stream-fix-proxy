@@ -28,7 +28,7 @@ import urllib.parse
 DEFAULT_UPSTREAM_BASE = "https://eaichat.ctyun.cn/ai/platform/v2/cp"
 UPSTREAM_BASE = DEFAULT_UPSTREAM_BASE  # 运行时可变：main() 启动解析 / POST /api/config 热切换
 _upstream_source = "default"           # "env" | "file" | "default" | "api"
-LISTEN_HOST = "127.0.0.1"
+LISTEN_HOST = os.environ.get("CTYUN_LISTEN_HOST", "127.0.0.1")
 LISTEN_PORT = int(os.environ.get("CTYUN_LISTEN_PORT", "7920"))
 ADMIN_HOST = os.environ.get("CTYUN_ADMIN_HOST", "0.0.0.0")
 ADMIN_PORT = int(os.environ.get("CTYUN_ADMIN_PORT", "7921"))

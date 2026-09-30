@@ -372,6 +372,7 @@ def start_proxy(upstream_port: int, proxy_port: int, extra_env: dict = None,
     env = dict(os.environ)
     env["CTYUN_UPSTREAM_BASE"] = "http://127.0.0.1:%d" % upstream_port
     env["CTYUN_LISTEN_PORT"] = str(proxy_port)
+    env["CTYUN_LISTEN_HOST"] = "127.0.0.1"  # 钉死默认绑定，防 shell env 泄漏 0.0.0.0
     # admin/persist seam：与真实 7921 端口、真实持久化文件（~/.local/etc/）完全隔离
     env["CTYUN_ADMIN_HOST"] = "127.0.0.1"
     admin_port = free_port()
@@ -513,6 +514,45 @@ def admin_post(port: int, path: str, body: bytes, headers: dict = None):
     out = (resp.status, resp.read())
     conn.close()
     return out
+
+
+class ListenHostEnvTest(unittest.TestCase):
+    """CTYUN_LISTEN_HOST seam：0.0.0.0 时非 loopback 本机地址 TCP 可达。
+    默认 127.0.0.1 回归 = 既有全量用例（start_proxy 已显式钉死）。"""
+
+    def test_listen_host_env_binds_lan(self) -> None:
+        upstream_port = make_fake_upstream(False)
+        proxy_port = free_port()
+        proc = start_proxy(upstream_port, proxy_port,
+                           extra_env={"CTYUN_LISTEN_HOST": "0.0.0.0"})
+        try:
+            # 证据 1（主）：启动日志宣告实际绑定地址（py 启动行在 serve_forever 前输出）
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                if ("listening on 0.0.0.0:%d" % proxy_port) in stderr_text(proc):
+                    break
+                time.sleep(0.05)
+            else:
+                self.fail("stderr 未见 0.0.0.0 绑定宣告: %s" % stderr_text(proc))
+            # 证据 2：非 loopback 地址 TCP 可达（UDP connect 不发包，仅取路由源地址）
+            probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                probe.connect(("192.0.2.1", 80))  # TEST-NET-1；UDP connect 零流量
+            except OSError:
+                # 吞掉"无非 loopback 接口/无路由"（沙箱/离线机）：证据 1 已锁绑定
+                # 地址，连通性断言可跳过；try 内仅此一条语句可能抛 OSError。
+                lan_ip = None
+            else:
+                lan_ip = probe.getsockname()[0]
+            probe.close()
+            if lan_ip and not lan_ip.startswith("127."):
+                with socket.create_connection((lan_ip, proxy_port), timeout=5):
+                    pass
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+            shutil.rmtree(proc.persist_dir, ignore_errors=True)
+            stop_fake_upstreams()
 
 
 class ProxyDashboardUnitTest(unittest.TestCase):
