@@ -957,6 +957,21 @@ class StallTailGapTest(unittest.TestCase):
 if __name__ == "__main__":
 ```
 
+**Edit 3.9** — 测试：P1 占位断言过期修正（P2 起 bytes_out 为真实值）。RequestIdTest.test_recent_entry_carries_rid_host_ttfb_stream_outcome 末尾：
+
+old_string:
+```
+        # P3 前占位字段
+        self.assertIsNone(entry["tokens"])
+        self.assertEqual(entry["bytes_out"], 0)
+```
+new_string:
+```
+        # tokens 为 P3 前占位；bytes_out 自 P2 起为真实下发字节数（fake 流 >0）
+        self.assertIsNone(entry["tokens"])
+        self.assertGreater(entry["bytes_out"], 0)
+```
+
 ### 验证命令（卡 3）
 
 单类：
