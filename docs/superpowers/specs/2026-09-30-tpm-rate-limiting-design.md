@@ -6,7 +6,7 @@
 
 ## 设计决策（定死）
 
-1. **准入估算**：`estimate_request_tokens(body)` = `max(1, int(len(body) * TPM_TOKEN_RATIO))`；body 可解析为 JSON 且含 int `max_tokens` 时再累加该值（输出预留）。比率默认 0.3 tok/byte（实测：中文重 body 33,777 bytes → 8,008 prompt_tokens = 0.2371 tok/byte；英文重 body 13,677 bytes → 3,088 prompt_tokens = 0.2258 tok/byte；deepseek-v4-pro，2026-09-30，stream_options include_usage 读 prompt_tokens）。（rev 2026-09-30：实测校准 0.226-0.237 tok/byte，默认 0.3 含保守余量——finding 3 单位错位修正）。非 JSON body 按裸长度估，fail-open。
+1. **准入估算**：`estimate_request_tokens(body)` = `max(1, int(len(body) * TPM_TOKEN_RATIO))`；body 可解析为 JSON 且含 int `max_tokens` 时再累加该值（输出预留）。比率默认 0.25 tok/byte（实测：中文重 body 33,777 bytes → 8,008 prompt_tokens = 0.2371 tok/byte；英文重 body 13,677 bytes → 3,088 prompt_tokens = 0.2258 tok/byte；deepseek-v4-pro，2026-09-30，stream_options include_usage 读 prompt_tokens）。（rev 2026-09-30：实测校准 0.226-0.237 tok/byte，默认 0.3 含保守余量——finding 3 单位错位修正）。（rev 2026-09-30#2：上线 6 分钟真实流量 5/7 被 est>limit 硬拒——0.3 余量过紧，降 0.25，硬拒阈值 ~440KB）。非 JSON body 按裸长度估，fail-open。
 2. **窗口结构**：每 key 一个 `collections.deque[(ts, tokens)]` + 增量 `used` 计数；准入/settle 时 prune 掉 `now - 60s` 之前条目。settle 校正以追加 `(now, delta)` 条目实现（delta 可为负）。存储层不变量：`used` 恒等于 deque 条目之和，不钳位——`used` 可为负（负值 = 窗口欠账，随负 settle 条目过期 prune 自愈，有界）；钳位只发生在 `tpm_snapshot` 展示层（`max(0, bucket.used)`）。`TPM_BUCKETS` dict 上限 `TPM_KEY_CAP=64`，仅当桶窗口空且无排队时惰性驱逐。（rev 2026-09-30：评审修正，存储层去钳位防幽灵 token——reviewer conf 95）
 3. **排队**：单个 `threading.Condition`（`TPM_LOCK`）护 `TPM_BUCKETS` + 全局 FIFO `TPM_WAITERS`（deque of `_TpmWaiter(key_id, est)`）。准入与入队同在锁内 → 原子。仅队首 waiter 可被准入（严格 FIFO，防惊群）；wait 循环 `TPM_LOCK.wait(timeout=min(1.0, remaining))` + deadline 检查，窗口过期靠 1s 粒度轮询，settle 时 `notify_all()`。排队期间不持有任何上游连接（hook 点在 `_open_upstream` 之前）。`est > TPM_LIMIT` 单请求直接拒（永远等不到）。
 4. **429 合成**：新增 `_reply_tpm_429(reason)`，镜像 `_reply_502`（:1161）模式：status 429 + `Content-Type: application/json` + 定死 body `{"error":{"message":"模型请求 TPM 超限，请减少 tokens 后重试","type":"rate_limit_error","code":"model_tpm_limit"}}` + `close_connection=True`。日志 result 用新值 `tpm-queue-full` / `tpm-queue-timeout`；**不改 `classify_outcome` 优先级链**（429 路径无上游 status 可分类，与 synth_502 一样在调用点直接记）；新增 `ERR_KIND_TPM_QUEUE_FULL` / `ERR_KIND_TPM_QUEUE_TIMEOUT` 入 `_KIND_CATEGORY`（:79），映射到新 `CLASS_TPM_LIMITED = "tpm_limited"`；`_record_request(..., status=429, error=True)`（与 synth_502 同口径计代理错误）。
@@ -14,7 +14,7 @@
 
 ## Files to Change
 
-- `ctyun-stream-fix-proxy.py:51`（常量区，`EMPTY_RETRY_MAX` 旁）— 新增 `TPM_LIMIT`（env `CTYUN_TPM_LIMIT` 默认 110000）、`TPM_WINDOW_S`（60）、`TPM_QUEUE_MAX`（20）、`TPM_QUEUE_TIMEOUT_S`（120）、`TPM_TOKEN_RATIO`（0.3）、`TPM_KEY_CAP=64`；env 均作测试 seam（惯例同 :43 `SEND_TIMEOUT_S`）。
+- `ctyun-stream-fix-proxy.py:51`（常量区，`EMPTY_RETRY_MAX` 旁）— 新增 `TPM_LIMIT`（env `CTYUN_TPM_LIMIT` 默认 110000）、`TPM_WINDOW_S`（60）、`TPM_QUEUE_MAX`（20）、`TPM_QUEUE_TIMEOUT_S`（120）、`TPM_TOKEN_RATIO`（0.25）、`TPM_KEY_CAP=64`；env 均作测试 seam（惯例同 :43 `SEND_TIMEOUT_S`）。
 - `ctyun-stream-fix-proxy.py:79 _KIND_CATEGORY` — 加 `CLASS_TPM_LIMITED` 常量与两条 kind 映射。
 - `ctyun-stream-fix-proxy.py:139 sse_line_has_usage()` — 新增兄弟函数 `sse_line_usage(line: bytes) -> dict|None`（同解析序，返回 usage dict 而非 bool）。
 - `ctyun-stream-fix-proxy.py:197 classify_outcome()` 之后 — 新增模块态 `TPM_LOCK = threading.Condition()`、`TPM_BUCKETS = {}`、`TPM_WAITERS = collections.deque()` 与函数：`tpm_key_id(auth_header: str|None) -> str|None`（无 Authorization → None = 不限流直通）、`estimate_request_tokens(body) -> int`、`_tpm_prune(bucket, now)`、`tpm_admit(key_id, est) -> (status, qwait_ms)`（"ok"/"full"/"timeout"，逻辑见决策 3）、`tpm_settle(key_id, est, actual)`、`tpm_snapshot() -> dict`。
@@ -41,8 +41,8 @@
 ## Risks
 
 - 严格全局 FIFO 存在跨 key 队头阻塞：key A 的大请求占队首时 key B 即使有预算也等。可接受（队列上限 20、窗口 60s），不做得按 key 出队的复杂度。
-- 估算偏差：默认 0.3 tok/byte 由实测 0.226-0.237 加 ~25-30% 保守余量（保守方向，可接受）；`max_tokens` 缺失时输出侧欠估，由 usage settle 校正兜底，但窗口内可能瞬时超预算——方向与上游限流一致（宁可本地 429）。
-- `est > TPM_LIMIT` 单请求硬拒阈值 = `(TPM_LIMIT − max_tokens) / ratio`；ratio=0.3 且 body 无 `max_tokens` 时约 366KB body（110000 / 0.3）即被永久硬拒（排队无意义，直接 429）。kimi-k3-oc tokenizer 未实测（该 key 不含此模型），如实际偏差大用 env `CTYUN_TPM_TOKEN_RATIO` 调参（不改代码）。
+- 估算偏差：默认 0.25 tok/byte 由实测上限 0.2371 加 ~5% 余量（保守方向，可接受）；`max_tokens` 缺失时输出侧欠估，由 usage settle 校正兜底，但窗口内可能瞬时超预算——方向与上游限流一致（宁可本地 429）。
+- `est > TPM_LIMIT` 单请求硬拒阈值 = `(TPM_LIMIT − max_tokens) / ratio`；ratio=0.25 且 body 无 `max_tokens` 时约 440KB body（110000 / 0.25）即被永久硬拒（排队无意义，直接 429）。kimi-k3-oc tokenizer 未实测（该 key 不含此模型），如实际偏差大用 env `CTYUN_TPM_TOKEN_RATIO` 调参（不改代码）。
 - 排队期间客户端断连不可检测（线程阻塞在 `Condition.wait`）：唤醒后上游请求白打一次再撞 client_abort（:865 既有路径兜底）。概率低、代价小，不处理。
 - 准入 hook 在 `_proxy_relay`（:879），与 header 重试（:909）/空流重试（:942）交互：重试不重复 charge 是关键正确性点，测试必须锁死（scripted upstream `calls` 计数）。
 - `TPM_LOCK` 与 `STATS_LOCK`/`ERROR_LOCK` 锁序：tpm 路径内调 `_record_request`/`record_error_event` 必须在 `TPM_LOCK` 释放后（429 分支先 return 再记录），防锁序反转。
