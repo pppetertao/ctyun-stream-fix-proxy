@@ -345,7 +345,8 @@ new_string:
                         primed.extend(pending)
                         if line:
                             primed.append(line)
-                        self._relay_chunks += 1  # v2 P2：每非毒 record 计一 chunk（毒 record 已在上面 filtered 分支）
+                        if pending or line:
+                            self._relay_chunks += 1  # v2 P2：每非毒 record 计一 chunk（毒 record 已在 filtered 分支；纯 EOF 迭代不计——fix-loop-1）
 ```
 
 ### Edit 2.7 — 生产：非 priming 写路径 stall 检测 + 字节/chunk 累计
@@ -367,22 +368,24 @@ old_string:
 new_string:
 ```
                     else:
-                        now = time.monotonic()
-                        if self._t_last_record is not None \
-                                and now - self._t_last_record > STALL_THRESHOLD_S:
-                            # v2 P2：stall 自增是热循环内唯一持锁点，且仅跨阈值间隙命中
-                            # （正常流相邻 record 间隔 << 阈值，<0.1% 命中；R1 纪律）
-                            with STATS_LOCK:
-                                STATS["stalls_total"] += 1
-                        self._t_last_record = now
-                        for buf_line in pending:
-                            self.wfile.write(buf_line)
-                            self._relay_bytes += len(buf_line)
-                        if line:
-                            self.wfile.write(line)
-                            self._relay_bytes += len(line)
-                        self.wfile.flush()
-                        self._relay_chunks += 1
+                        if pending or line:  # 纯 EOF 迭代（pending 空 + line 空）不计 chunk、不做 stall 检测：
+                            # 否则"最后 record→EOF 尾间隙"会被当相邻 record 间隔误报 stall（fix-loop-1）
+                            now = time.monotonic()
+                            if self._t_last_record is not None \
+                                    and now - self._t_last_record > STALL_THRESHOLD_S:
+                                # v2 P2：stall 自增是热循环内唯一持锁点，且仅跨阈值间隙命中
+                                # （正常流相邻 record 间隔 << 阈值，<0.1% 命中；R1 纪律）
+                                with STATS_LOCK:
+                                    STATS["stalls_total"] += 1
+                            self._t_last_record = now
+                            for buf_line in pending:
+                                self.wfile.write(buf_line)
+                                self._relay_bytes += len(buf_line)
+                            if line:
+                                self.wfile.write(line)
+                                self._relay_bytes += len(line)
+                            self.wfile.flush()
+                            self._relay_chunks += 1
                     pending = []
                     poisoned = False
 ```
@@ -407,7 +410,34 @@ new_string:
         self._relay_chunks = 1           # 非流式 = 单 chunk
 ```
 
-### 验证命令（卡 2）
+### fix-loop-1（review finding 85：EOF 迭代幽灵 chunk / 尾间隙误报 stall）
+
+生产文件已在 commit 68a2e50 落了**无守卫版** Edit 2.6/2.7；修复 delta 以当前文件为锚：
+
+**Edit F1** — 生产：priming 分支 chunk 守卫（old = 68a2e50 现状）：
+```
+                        self._relay_chunks += 1  # v2 P2：每非毒 record 计一 chunk（毒 record 已在上面 filtered 分支）
+```
+→
+```
+                        if pending or line:
+                            self._relay_chunks += 1  # v2 P2：每非毒 record 计一 chunk（毒 record 已在 filtered 分支；纯 EOF 迭代不计——fix-loop-1）
+```
+
+**Edit F2** — 生产：非 priming 分支整体缩进进 `if pending or line:` 守卫（old = 68a2e50 现状，new = 上方 Edit 2.7 守卫版全文）。
+
+**Edit F3** — 测试：FakeUpstreamHandler 类属性（`rst_all` 行上方插入）：
+```
+    tail_delay_after_done_s = 0.0  # >0 → 正常流写完后 flush+sleep 再关连接（模拟"发完 [DONE] 滞留"的 EOF 尾间隙）
+```
+
+**Edit F4** — 测试：do_POST 正常路径 try 块内加尾延迟（old = `self.wfile.write(body)` + 既有 ConnectionError 注释块；new 在 write 后插入 `if self.tail_delay_after_done_s: self.wfile.flush(); time.sleep(...)`）。
+
+**Edit F5** — 测试：make_fake_upstream 签名加 `tail_delay_after_done_s: float = 0.0`（在 `fail_200_error: bool = False` 后）+ attrs dict 加 `"tail_delay_after_done_s": tail_delay_after_done_s,`（`"fail_200_error"` 行后）。
+
+EOF 尾间隙/stall 的行为断言（`StallTailGapTest`）与 chunks 精确断言（==3）在卡 3 落地（依赖 perf 节与 RECENT chunks 字段）。
+
+### 验证命令（卡 2 + fix-loop-1）
 
 ```
 cd /Users/peter/Documents/project/ctyun-stream-fix-proxy/.worktrees/observability-v2-p2 && /usr/bin/python3 ctyun-stream-fix-proxy.test.py PoisonStreamTest PassThroughTest BodyErrorTest RequestIdTest 2>&1 | tail -3 ; echo "exit=$?"
@@ -582,7 +612,7 @@ new_string:
                                 "rid": rid, "upstream_host": upstream_host,
                                 "ttfb_ms": ttfb_ms, "stream": stream,
                                 "tokens": tokens, "bytes_out": bytes_out,
-                                "outcome": outcome})
+                                "chunks": chunks, "outcome": outcome})
         # v2 P2：histogram 桶更新与 60s rates 窗口滚动（每请求一次，均在本锁内；R1/R4）
         if ttfb_ms is not None and model:
             ttfb_hist = STATS["ttfb_hist"]
@@ -610,6 +640,17 @@ new_string:
             rates["tokens_total"] += tokens
             rates["window_tokens"] += tokens
         _stats_dirty = True
+```
+
+**Edit 3.4b** — 生产：RECENT_REQUESTS 模块注释补 "chunks" 字段（fix-loop-1 起条目含 chunks）：
+
+old_string:
+```
+RECENT_REQUESTS = collections.deque(maxlen=100)  # {"ts","method","path","status","dur_ms","filtered","model","rid","upstream_host","ttfb_ms","stream","tokens","bytes_out","outcome"}
+```
+new_string:
+```
+RECENT_REQUESTS = collections.deque(maxlen=100)  # {"ts","method","path","status","dur_ms","filtered","model","rid","upstream_host","ttfb_ms","stream","tokens","bytes_out","chunks","outcome"}
 ```
 
 ### Edit 3.5 — 生产：`stats_snapshot` perf 节
@@ -741,7 +782,8 @@ old_string:
                        sleep_stall_all: bool = False, sleep_stall_calls: tuple = (),
                        sleep_stall_seconds: float = 3.0,
                        rst_all: bool = False, rst_calls: tuple = (),
-                       fail_200_error: bool = False) -> int:
+                       fail_200_error: bool = False,
+                       tail_delay_after_done_s: float = 0.0) -> int:
     attrs = {"poison": poison, "tag": tag, "big": big, "fail_500": fail_500,
 ```
 
@@ -752,7 +794,8 @@ new_string:
                        rst_all: bool = False, rst_calls: tuple = (),
                        fail_200_error: bool = False,
                        latency_s: float = 0.0,
-                       stall_mid_stream_s: float = 0.0) -> int:
+                       stall_mid_stream_s: float = 0.0,
+                       tail_delay_after_done_s: float = 0.0) -> int:
     attrs = {"poison": poison, "tag": tag, "big": big, "fail_500": fail_500,
 ```
 
@@ -763,6 +806,7 @@ old_string:
              "rst_all": rst_all,
              "rst_calls": rst_calls,
              "fail_200_error": fail_200_error,
+             "tail_delay_after_done_s": tail_delay_after_done_s,
              "bodies": [] if record_bodies else None}
 ```
 
@@ -773,6 +817,7 @@ new_string:
              "fail_200_error": fail_200_error,
              "latency_s": latency_s,
              "stall_mid_stream_s": stall_mid_stream_s,
+             "tail_delay_after_done_s": tail_delay_after_done_s,
              "bodies": [] if record_bodies else None}
 ```
 
@@ -844,6 +889,9 @@ class TtfbStreamTest(unittest.TestCase):
                              "ttfb 必须 ≤ 500ms（本地回环 100ms sleep），got %r" % entry["ttfb_ms"])
         self.assertGreater(entry["bytes_out"], 0,
                            "流式 bytes_out 必须 > 0")
+        self.assertEqual(entry["chunks"], 3,
+                         "chunks 必须精确等于 3（SSE_A+SSE_B+SSE_DONE 三条 record；"
+                         "无 EOF 幽灵 chunk——fix-loop-1 回归锁）")
         self.assertIn(self.MODEL, perf["ttfb_p50_ms_by_model"],
                       "ttfb P50 必须按模型出现；got %r"
                       % sorted(perf["ttfb_p50_ms_by_model"].keys()))
@@ -882,6 +930,30 @@ class TtfbStreamTest(unittest.TestCase):
                                 "中途 1s 间隙（阈值 0.5s）必须计 ≥1 次 stall；perf=%r" % perf)
 
 
+class StallTailGapTest(unittest.TestCase):
+    """P2 fix-loop-1：上游发完 [DONE] 后滞留 >阈值 再关连接（EOF 尾间隙）不得计 stall；
+    纯 EOF 迭代不得计 chunk（chunks==3 断言在 TtfbStreamTest，经 RECENT 锁定）。"""
+
+    def test_tail_eof_gap_not_counted_as_stall(self) -> None:
+        upstream_port = make_fake_upstream(False, tail_delay_after_done_s=1.0)
+        proxy_port = free_port()
+        proc = start_proxy(upstream_port, proxy_port,
+                           extra_env={"CTYUN_STALL_THRESHOLD_S": "0.5"})
+        try:
+            post_sse(proxy_port)
+            _, body, _ = admin_get(proc.admin_port, "/api/stats")
+            snap = json.loads(body.decode("utf-8"))
+            perf = snap["perf"]
+            self.assertEqual(perf["stalls_total"], 0,
+                             "EOF 尾间隙不是相邻 record 间隔，不得计 stall；perf=%r" % perf)
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+            stderr_text(proc)
+            shutil.rmtree(proc.persist_dir, ignore_errors=True)
+            stop_fake_upstreams()
+
+
 if __name__ == "__main__":
 ```
 
@@ -889,7 +961,7 @@ if __name__ == "__main__":
 
 单类：
 ```
-cd /Users/peter/Documents/project/ctyun-stream-fix-proxy/.worktrees/observability-v2-p2 && /usr/bin/python3 ctyun-stream-fix-proxy.test.py PerfHistTest TtfbStreamTest 2>&1 | tail -3 ; echo "exit=$?"
+cd /Users/peter/Documents/project/ctyun-stream-fix-proxy/.worktrees/observability-v2-p2 && /usr/bin/python3 ctyun-stream-fix-proxy.test.py PerfHistTest TtfbStreamTest StallTailGapTest 2>&1 | tail -3 ; echo "exit=$?"
 ```
 全量收尾：
 ```
