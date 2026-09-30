@@ -2264,6 +2264,7 @@ class AdminIntegrationTest(unittest.TestCase):
                       r"retried=\d+ "
                       r"retry_reason=\S+ "
                       r"exc=\S+ "
+                      r"rid=\S+ host=\S+ ttfb=\S+ stream=\d+ outcome=\S+ "
                       r"ts=(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{4})$",
                       stderr, re.M)
         self.assertIsNotNone(m, "REQ 行必须带 model= / retry_reason= / exc= / ts= 字段，stderr:\n" + stderr)
@@ -2286,7 +2287,7 @@ class AdminIntegrationTest(unittest.TestCase):
         proc.wait(timeout=5)
         stderr = stderr_text(proc)
         m = re.search(r"^REQ POST /v1/chat/completions -> 502 dur=\d+\.\ds "
-                      r"result=error .*? exc=(\S+)\s+ts=", stderr, re.M)
+                      r"result=error .*? exc=(\S+)\s+rid=", stderr, re.M)
         self.assertIsNotNone(m, "error 502 REQ 行必须带 exc= 字段，stderr:\n" + stderr)
         self.assertNotEqual(m.group(1), "-",
                             "exc 字段不得是占位符，stderr:\n" + stderr)
@@ -3557,6 +3558,20 @@ class RequestIdTest(unittest.TestCase):
         # P3 前占位字段
         self.assertIsNone(entry["tokens"])
         self.assertEqual(entry["bytes_out"], 0)
+
+    def test_req_line_carries_rid_host_ttfb_stream_outcome(self) -> None:
+        """REQ 行含 rid=r-N / host= / ttfb=<num>ms / stream=1 / outcome=ok。"""
+        post_sse(self.proxy_port)
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr = stderr_text(self.proc)
+        m = re.search(
+            r"rid=(r-\d+) host=127\.0\.0\.1:%d "
+            r"ttfb=\d+\.\dms stream=1 outcome=ok ts=" % self.upstream_port,
+            stderr, re.M)
+        self.assertIsNotNone(m,
+            "REQ 行必须带 rid/host/ttfb/stream/outcome 字段，stderr:\n" + stderr)
+        self.assertEqual(m.group(1), "r-1")
 
 
 if __name__ == "__main__":

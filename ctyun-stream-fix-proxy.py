@@ -907,7 +907,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             # 处也无需区分）。不重抛：再抛只进 handle_error 打 20+ 行 traceback 且
             # 无 status 记录；不计 errors_total。status 取 499（nginx 客户端中断惯例）。
             outcome = classify_outcome(client_abort=True)
-            self._log(started, 499, outcome.log_result, 0)
+            self._log(started, 499, outcome.log_result, 0,
+                      rid=self._req_id, upstream_host=self._upstream_host,
+                      outcome=outcome.category)
             _record_request(self.command, self.path, 499,
                             (time.time() - started) * 1000, 0, model=None,
                             rid=self._req_id, upstream_host=self._upstream_host,
@@ -965,7 +967,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self._reply_502(exc)
             outcome = classify_outcome(synth_502=True)
             self._log(started, 502, outcome.log_result, 0, model=model, exc=exc,
-                      retried=header_retried, retry_reason=header_retry_reason)
+                      retried=header_retried, retry_reason=header_retry_reason,
+                      rid=self._req_id, upstream_host=self._upstream_host,
+                      outcome=outcome.category)
             _record_request(self.command, self.path, 502,
                             (time.time() - started) * 1000, 0,
                             model=model, error=outcome.counts_error,
@@ -1003,7 +1007,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     self._reply_502(retry_exc)  # 客户端尚未收到字节，502 语义与既有路径一致
                     outcome = classify_outcome(synth_502=True)
                     self._log(started, 502, outcome.log_result, 0, model=model, retried=1,
-                              retry_reason=retry_reason, exc=retry_exc)
+                              retry_reason=retry_reason, exc=retry_exc,
+                              rid=self._req_id, upstream_host=self._upstream_host,
+                              outcome=outcome.category)
                     _record_request(self.command, self.path, 502,
                                     (time.time() - started) * 1000, 0, model=model,
                                     error=outcome.counts_error,
@@ -1043,7 +1049,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                                    body=body, filtered=filtered,
                                    response=self._body_err_line if body_error else None)
             self._log(started, resp.status, result, filtered, model=model, retried=retried,
-                      retry_reason=retry_reason)
+                      retry_reason=retry_reason,
+                      rid=self._req_id, upstream_host=self._upstream_host,
+                      ttfb_ms=ttfb_ms, stream=1, outcome=outcome.category)
             _record_request(self.command, self.path, resp.status,
                             (time.time() - started) * 1000, filtered, model=model,
                             error=outcome.counts_error,
@@ -1060,7 +1068,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 else:
                     body_error = body_has_error(parsed)
             outcome = classify_outcome(status=resp.status, body_error=body_error)
-            self._log(started, resp.status, outcome.log_result, 0, model=model)
+            self._log(started, resp.status, outcome.log_result, 0, model=model,
+                      rid=self._req_id, upstream_host=self._upstream_host,
+                      ttfb_ms=ttfb_ms, stream=0, outcome=outcome.category)
             _record_request(self.command, self.path, resp.status,
                             (time.time() - started) * 1000, 0, model=model,
                             error=outcome.counts_error,
@@ -1225,16 +1235,23 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         self.close_connection = True
 
     def _log(self, started: float, status: int, result: str, filtered: int, model=None,
-             retried: int = 0, retry_reason: str = "", exc=None) -> None:
+             retried: int = 0, retry_reason: str = "", exc=None,
+             rid=None, upstream_host=None, ttfb_ms=None, stream=None,
+             outcome=None) -> None:
         exc_field = "-"
         if exc is not None:
             exc_field = re.sub(r"\s+", "_",
                                ("%s: %s" % (type(exc).__name__, exc)).strip())[:200]
+        ttfb_field = "%.1fms" % ttfb_ms if ttfb_ms is not None else "-"
         _safe_log_stderr("REQ %s %s -> %d dur=%.1fs result=%s filtered=%d "
-                         "model=%s retried=%d retry_reason=%s exc=%s ts=%s"
+                         "model=%s retried=%d retry_reason=%s exc=%s "
+                         "rid=%s host=%s ttfb=%s stream=%s outcome=%s ts=%s"
                          % (self.command, self.path, status, time.time() - started,
                             result, filtered, model or "-", retried,
                             retry_reason or "-", exc_field,
+                            rid or "-", upstream_host or "-", ttfb_field,
+                            "-" if stream is None else ("1" if stream else "0"),
+                            outcome or "-",
                             time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime())))
 
 
