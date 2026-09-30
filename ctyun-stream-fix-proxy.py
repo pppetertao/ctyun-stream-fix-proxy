@@ -1158,6 +1158,29 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         model = extract_model(body)
         body = normalize_null_assistant_content(body)
 
+        # --- TPM 准入 hook（_open_upstream 之前；重试复用本次准入不重复 charge）---
+        tpm_key = tpm_key_id(self.headers.get("Authorization"))
+        tpm_est = 0
+        tpm_qwait_ms = None
+        tpm_final_used = None
+        if tpm_key is not None:
+            tpm_est = estimate_request_tokens(body)
+            tpm_status, tpm_qwait_ms = tpm_admit(tpm_key, tpm_est)
+            if tpm_status in ("full", "timeout"):
+                # 锁外记录（tpm_admit 已释放 TPM_LOCK，锁序安全）
+                self._reply_tpm_429(tpm_status)
+                result = ("tpm-queue-full" if tpm_status == "full"
+                          else "tpm-queue-timeout")
+                self._log(started, 429, result, 0, model=model, qwait_ms=tpm_qwait_ms)
+                _record_request(self.command, self.path, 429,
+                                (time.time() - started) * 1000, 0,
+                                model=model, error=True)
+                record_error_event(
+                    ERR_KIND_TPM_QUEUE_FULL if tpm_status == "full"
+                    else ERR_KIND_TPM_QUEUE_TIMEOUT,
+                    model=model, path=self.path, body=body)
+                return
+
         fwd_headers = {}
         for key, value in self.headers.items():
             lk = key.lower()
@@ -1199,11 +1222,16 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 t_headers_done = time.monotonic()
         except (OSError, http.client.HTTPException) as exc:
             self._reply_502(exc)
+            # TPM 退款：上游不可达/响应头阶段异常 → 全额退款
+            if tpm_key is not None:
+                tpm_settle(tpm_key, tpm_est, 0)
             outcome = classify_outcome(synth_502=True)
             self._log(started, 502, outcome.log_result, 0, model=model, exc=exc,
                       retried=header_retried, retry_reason=header_retry_reason,
                       rid=self._req_id, upstream_host=self._upstream_host,
-                      outcome=outcome.category)
+                      outcome=outcome.category,
+                      qwait_ms=tpm_qwait_ms,
+                      tpm_used=0 if tpm_key is not None else None)
             _record_request(self.command, self.path, 502,
                             (time.time() - started) * 1000, 0,
                             model=model, error=outcome.counts_error,
@@ -1221,6 +1249,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             retry_reason = header_retry_reason
             try:
                 self._body_err_line = None
+                self._tpm_usage = None
                 filtered, truncated = self._relay_sse(resp,
                     final=not empty_stream_should_retry(EMPTY_RETRY_MAX))
                 body_error = self._body_err_line is not None
@@ -1239,11 +1268,16 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     t_headers_done = time.monotonic()
                 except (OSError, http.client.HTTPException) as retry_exc:
                     self._reply_502(retry_exc)  # 客户端尚未收到字节，502 语义与既有路径一致
+                    # TPM 退款：重试仍失败 → 全额退款
+                    if tpm_key is not None:
+                        tpm_settle(tpm_key, tpm_est, 0)
                     outcome = classify_outcome(synth_502=True)
                     self._log(started, 502, outcome.log_result, 0, model=model, retried=1,
                               retry_reason=retry_reason, exc=retry_exc,
                               rid=self._req_id, upstream_host=self._upstream_host,
-                              outcome=outcome.category)
+                              outcome=outcome.category,
+                              qwait_ms=tpm_qwait_ms,
+                              tpm_used=0 if tpm_key is not None else None)
                     _record_request(self.command, self.path, 502,
                                     (time.time() - started) * 1000, 0, model=model,
                                     error=outcome.counts_error,
@@ -1254,6 +1288,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                                        retried=1, retry_reason=retry_reason)
                     return
                 self._body_err_line = None
+                self._tpm_usage = None
                 filtered, truncated = self._relay_sse(resp, final=True)
                 body_error = self._body_err_line is not None
                 ttfb_ms = round((t_headers_done - t_conn_start) * 1000, 1)
@@ -1282,10 +1317,19 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                                                     if resp.status >= 400 else None),
                                    body=body, filtered=filtered,
                                    response=self._body_err_line if body_error else None)
+            # TPM settle：用上游实际 usage 校正窗口占用（无 usage 帧不校正）
+            tpm_final_used = tpm_est if tpm_key is not None else None
+            if tpm_key is not None and self._tpm_usage is not None:
+                total = self._tpm_usage.get("total_tokens")
+                if isinstance(total, int) and total >= 0:
+                    tpm_settle(tpm_key, tpm_est, total)
+                    tpm_final_used = total
             self._log(started, resp.status, result, filtered, model=model, retried=retried,
                       retry_reason=retry_reason,
                       rid=self._req_id, upstream_host=self._upstream_host,
-                      ttfb_ms=ttfb_ms, stream=1, outcome=outcome.category)
+                      ttfb_ms=ttfb_ms, stream=1, outcome=outcome.category,
+                      qwait_ms=tpm_qwait_ms,
+                      tpm_used=tpm_final_used if tpm_key is not None else None)
             _record_request(self.command, self.path, resp.status,
                             (time.time() - started) * 1000, filtered, model=model,
                             error=outcome.counts_error,
@@ -1294,6 +1338,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         else:
             relayed_data = self._relay_buffered(resp)
             body_error = False
+            tpm_final_used = tpm_est if tpm_key is not None else None
             if relayed_data:
                 try:
                     parsed = json.loads(relayed_data.decode("utf-8", "replace"))
@@ -1301,10 +1346,20 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     pass  # non-JSON body -> no body error, fail-open
                 else:
                     body_error = body_has_error(parsed)
+                    # TPM settle：解析 usage.total_tokens 校正（非 dict / 无 usage 不校正）
+                    if tpm_key is not None and isinstance(parsed, dict):
+                        usage = parsed.get("usage")
+                        if isinstance(usage, dict):
+                            total = usage.get("total_tokens")
+                            if isinstance(total, int) and total >= 0:
+                                tpm_settle(tpm_key, tpm_est, total)
+                                tpm_final_used = total
             outcome = classify_outcome(status=resp.status, body_error=body_error)
             self._log(started, resp.status, outcome.log_result, 0, model=model,
                       rid=self._req_id, upstream_host=self._upstream_host,
-                      ttfb_ms=ttfb_ms, stream=0, outcome=outcome.category)
+                      ttfb_ms=ttfb_ms, stream=0, outcome=outcome.category,
+                      qwait_ms=tpm_qwait_ms,
+                      tpm_used=tpm_final_used if tpm_key is not None else None)
             _record_request(self.command, self.path, resp.status,
                             (time.time() - started) * 1000, 0, model=model,
                             error=outcome.counts_error,
@@ -1381,6 +1436,11 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     # b"\n"/b"\r\n" = record 终结；b"" = EOF（残留 record 同规则收尾）
                     kinds = [sse_data_line_kind(buf_line) for buf_line in pending]
                     saw_done = saw_done or ("done" in kinds)
+                    # TPM usage 捕获：本 record 内所有行取最后非空 usage 帧
+                    for buf_line in pending:
+                        usage_hit = sse_line_usage(buf_line)
+                        if usage_hit is not None:
+                            self._tpm_usage = usage_hit
                     if self._body_err_line is None:
                         hit = next((l for l in pending if sse_line_body_error(l)), None)
                         if hit is not None:

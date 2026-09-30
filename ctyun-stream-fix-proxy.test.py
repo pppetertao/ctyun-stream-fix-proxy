@@ -560,6 +560,21 @@ def admin_post(port: int, path: str, body: bytes, headers: dict = None):
     return out
 
 
+def post_sse_auth(port: int, payload: bytes, auth_header: str = None,
+                  timeout: int = 30):
+    """带可选 Authorization 头的 POST /v1/chat/completions。
+    与 post_sse 不同：不断言 status 200，返回 (status, body)。"""
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+    headers = {"Content-Type": "application/json"}
+    if auth_header:
+        headers["Authorization"] = auth_header
+    conn.request("POST", "/v1/chat/completions", body=payload, headers=headers)
+    resp = conn.getresponse()
+    data = resp.read()
+    conn.close()
+    return resp.status, data
+
+
 class ListenHostEnvTest(unittest.TestCase):
     """CTYUN_LISTEN_HOST seam：0.0.0.0 时非 loopback 本机地址 TCP 可达。
     默认 127.0.0.1 回归 = 既有全量用例（start_proxy 已显式钉死）。"""
@@ -3932,6 +3947,40 @@ class RequestIdTest(unittest.TestCase):
         m = re.match(r"^r-\d+$", x_request_id or "")
         self.assertIsNotNone(m,
             "502 响应必须带 X-Request-Id，got %r" % x_request_id)
+
+class TpmAdmitHookTest(unittest.TestCase):
+    """TPM 准入 hook 冒烟：est 超预算的带 key 请求被 429 拦截（不触上游）。"""
+
+    def setUp(self) -> None:
+        self.upstream_port, self.calls = make_scripted_upstream(
+            body_override=SSE_A + SSE_B + SSE_DONE)
+        self.proxy_port = free_port()
+        self.proc = start_proxy(self.upstream_port, self.proxy_port,
+                                extra_env={"CTYUN_TPM_LIMIT": "50"})
+
+    def tearDown(self) -> None:
+        if self.proc:
+            self.proc.terminate()
+            self.proc.wait(timeout=5)
+            stderr_text(self.proc)
+            shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_fake_upstreams()
+
+    def test_oversized_est_rejected_before_upstream(self) -> None:
+        """est > TPM_LIMIT(50) 的请求直接 429，上游 calls 计数不变。"""
+        # len ~200 bytes → est = max(1, 200*0.55) = 110 > 50
+        big = (b'{"model":"x","stream":true,"messages":[{"role":"user","content":"'
+               + b"y" * 140 + b'"}]}')
+        status, data = post_sse_auth(self.proxy_port, big, "Bearer test-key")
+        self.assertEqual(status, 429, "oversized est must be rejected, got body %r"
+                         % data[:120])
+        parsed = json.loads(data.decode("utf-8"))
+        self.assertEqual(parsed["error"]["code"], "model_tpm_limit")
+        self.assertEqual(self.calls, [], "rejected request must not hit upstream")
+        # 无 Authorization 的同体请求直通
+        status2, _ = post_sse_auth(self.proxy_port, big, None)
+        self.assertEqual(status2, 200, "no-auth request must bypass TPM")
+        self.assertEqual(len(self.calls), 1)
 
 
 if __name__ == "__main__":
