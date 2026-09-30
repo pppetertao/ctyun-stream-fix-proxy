@@ -1410,7 +1410,7 @@ class ProxyDashboardUnitTest(unittest.TestCase):
             self.assertGreaterEqual(total, summed,
                                     "daily[%r][%r]=%d < Σ daily_by_model=%d"
                                     % (today, k, total, summed))
-        # v3：_record_empty_retry 的 dm entry 创建点（site-2）同样 6 字段——
+        # v3：_record_empty_retry 的 dm entry 创建点（site-2）同样 16 字段（DAILY_V2_FIELDS）——
         # 用全新日期隔离（真实 today 的键位已被 cap 用例占满 32，新建会被 cap 拒绝）
         orig_today = mod.today_key
         try:

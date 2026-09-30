@@ -1057,20 +1057,22 @@ def _record_request(method: str, path: str, status: int, dur_ms: float,
                     entry_dm["errors_proxy"] += 1
                 elif status >= 500:
                     entry_dm["errors_upstream"] += 1
-            # v2 P3：dm entry 增量（tokens/bytes/stream/延迟/三态归因）
-            if tokens_prompt > 0:
-                entry_dm["tokens_prompt"] += tokens_prompt
-            if tokens_completion > 0:
-                entry_dm["tokens_completion"] += tokens_completion
-            if bytes_out > 0:
-                entry_dm["bytes_out"] += bytes_out
-            if stream:
-                entry_dm["stream_requests"] += 1
-            if ttfb_ms is not None:
-                entry_dm["ttfb_sum_ms"] += round(ttfb_ms)
-                entry_dm["ttfb_count"] += 1
-            if outcome is not None:
-                entry_dm["outcome_" + _outcome_tri_state(outcome)] += 1
+            # v2 P3：dm entry 增量（tokens/bytes/stream/延迟/三态归因）；
+            # 模型数达 BY_MODEL_CAP 时 entry_dm 为 None——增量块必须整体守卫
+            if entry_dm is not None:
+                if tokens_prompt > 0:
+                    entry_dm["tokens_prompt"] += tokens_prompt
+                if tokens_completion > 0:
+                    entry_dm["tokens_completion"] += tokens_completion
+                if bytes_out > 0:
+                    entry_dm["bytes_out"] += bytes_out
+                if stream:
+                    entry_dm["stream_requests"] += 1
+                if ttfb_ms is not None:
+                    entry_dm["ttfb_sum_ms"] += round(ttfb_ms)
+                    entry_dm["ttfb_count"] += 1
+                if outcome is not None:
+                    entry_dm["outcome_" + _outcome_tri_state(outcome)] += 1
         bucket = STATS["daily"].setdefault(
             today_key(), dict.fromkeys(_DAILY_FIELDS, 0))
         bucket["requests"] += 1
