@@ -3912,6 +3912,73 @@ class P1ConstantsTest(unittest.TestCase):
                                  "outcome_failed"))
 
 
+class UsageExtractTest(unittest.TestCase):
+    """P3 Token期：usage 帧数值抽取矩阵（标准/缺 prompt/缺 completion/extra key/非 dict/空 usage/负值）。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        # staticmethod：模块级函数赋类属性默认成 method descriptor，
+        # self.extract(line) 会多传 cls 导致 TypeError。
+        cls.extract = staticmethod(load_proxy_module().sse_line_extract_usage)
+
+    def test_standard_usage_frame(self) -> None:
+        line = (b'data: {"id":"u","choices":[],"usage":'
+                b'{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}\n\n')
+        self.assertEqual(self.extract(line), (10, 5, 15))
+
+    def test_missing_prompt_tokens_defaults_zero(self) -> None:
+        line = b'data: {"usage":{"completion_tokens":5,"total_tokens":10}}\n\n'
+        self.assertEqual(self.extract(line), (0, 5, 10))
+
+    def test_missing_completion_tokens_defaults_zero(self) -> None:
+        line = b'data: {"usage":{"prompt_tokens":3,"total_tokens":8}}\n\n'
+        self.assertEqual(self.extract(line), (3, 0, 8))
+
+    def test_extra_key_ignored(self) -> None:
+        line = (b'data: {"usage":{"prompt_tokens":1,"completion_tokens":2,'
+                b'"total_tokens":3,"extra":"x","nested":{"a":1}}}\n\n')
+        self.assertEqual(self.extract(line), (1, 2, 3))
+
+    def test_non_dict_returns_none(self) -> None:
+        self.assertIsNone(self.extract(b"data: [DONE]\n\n"))
+        self.assertIsNone(self.extract(b'data: "just a string"\n\n'))
+        self.assertIsNone(self.extract(b"not even a data line\n\n"))
+        self.assertIsNone(self.extract(b"data: null\n\n"))
+        self.assertIsNone(self.extract(b"data: 42\n\n"))
+
+    def test_empty_usage_dict_returns_none(self) -> None:
+        # 委托函数 sse_line_usage 对空 usage dict（{} 为 falsy）返回 None——与
+        # sse_line_has_usage 的 bool(usage) 判据同源；extract 透传该 None 语义。
+        line = b'data: {"usage":{}}\n\n'
+        self.assertIsNone(self.extract(line))
+
+    def test_negative_tokens_coerced_zero(self) -> None:
+        line = (b'data: {"usage":{"prompt_tokens":-1,"completion_tokens":5,'
+                b'"total_tokens":10}}\n\n')
+        self.assertEqual(self.extract(line), (0, 5, 10))
+
+    def test_non_int_fields_coerced_zero(self) -> None:
+        line = (b'data: {"usage":{"prompt_tokens":"9","completion_tokens":null,'
+                b'"total_tokens":true}}\n\n')
+        self.assertEqual(self.extract(line), (0, 0, 0))
+
+    def test_ride_on_finish_frame_usage_extracted(self) -> None:
+        line = (b'data: {"choices":[{"delta":{},"finish_reason":"stop"}],'
+                b'"usage":{"prompt_tokens":7,"completion_tokens":2,"total_tokens":9}}\n\n')
+        self.assertEqual(self.extract(line), (7, 2, 9))
+
+    def test_has_usage_bool_consistent_with_extract(self) -> None:
+        """与 sse_line_has_usage 布尔判据一致性：has_usage=True ⟺ extract 非 None。"""
+        mod = load_proxy_module()
+        for line in (SSE_USAGE,
+                     b'data: {"usage":{}}\n\n',
+                     b"data: [DONE]\n\n",
+                     b'data: {"choices":[{"delta":{"content":"A"}}]}\n\n'):
+            self.assertEqual(mod.sse_line_has_usage(line),
+                             mod.sse_line_extract_usage(line) is not None,
+                             "has_usage/extract must agree on %r" % line)
+
+
 class RequestIdTest(unittest.TestCase):
     """P1 地基：request id / upstream host / ttfb / stream / outcome 全链路。
 

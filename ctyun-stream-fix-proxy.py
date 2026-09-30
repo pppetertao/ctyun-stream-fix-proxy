@@ -223,6 +223,38 @@ def sse_line_usage(line: bytes):
     return usage if isinstance(usage, dict) and usage else None
 
 
+def usage_dict_tokens(usage) -> tuple:
+    """从已解析的 usage dict 提取 (prompt_tokens, completion_tokens, total_tokens)。
+
+    非 dict → None；各字段取 int ≥0 原值，缺失/非 int/负数 → 0（best-effort）。
+    零 IO、零 parse：入参必须是 json.loads 已产出的 dict（复用解析一次，R1）。
+    """
+    if not isinstance(usage, dict):
+        return None
+
+    def _int_field(key):
+        value = usage.get(key)
+        if isinstance(value, bool):  # bool 是 int 子类：JSON true/false 不是合法计数，归 0
+            return 0
+        return value if isinstance(value, int) and value >= 0 else 0
+
+    return (_int_field("prompt_tokens"), _int_field("completion_tokens"),
+            _int_field("total_tokens"))
+
+
+def sse_line_extract_usage(line: bytes):
+    """SSE data 行 usage 帧数值抽取：返回 (prompt_tokens, completion_tokens, total_tokens)。
+
+    无 usage 帧（非 data: 前缀 / [DONE] / 非 JSON / 非 dict / usage 空）→ None。
+    解析委托 sse_line_usage（单次 json.loads，与 sse_line_has_usage 同解析路径）；
+    热路径上不重复调用本函数——_relay_sse 直接用 usage_dict_tokens 消费已解析 dict（R1）。
+    """
+    usage = sse_line_usage(line)
+    if usage is None:
+        return None
+    return usage_dict_tokens(usage)
+
+
 def sse_line_body_error(line: bytes) -> bool:
     """判 SSE data 行是否为 body error 帧。rstrip → 非 data: 前缀或 [DONE] →
     False；json.loads ValueError → False（fail-open 同 sse_line_has_usage）；
