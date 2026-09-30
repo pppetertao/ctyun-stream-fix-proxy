@@ -3983,6 +3983,262 @@ class TpmAdmitHookTest(unittest.TestCase):
         self.assertEqual(len(self.calls), 1)
 
 
+class TpmRateLimitTest(unittest.TestCase):
+    """TPM 限流全量集成测试（spec Acceptance ①-⑧ 除部署条）。
+
+    复用 make_scripted_upstream / start_proxy / post_sse / get_plain / admin_get /
+    post_sse_auth（卡 4）/ stderr_text / stop_fake_upstreams；env seam 把 60s 窗口、
+    120s 超时压缩到秒级。唯一时间断言（窗口滚过 ≥1s、settle 放行 <1s、超时 ~2s）
+    全部由 1s 粒度轮询 + seam 余量保证，无 sleep 猜测依赖。
+    """
+
+    def setUp(self) -> None:
+        self.upstream_port, self.calls = make_scripted_upstream(
+            body_override=SSE_A + SSE_B + SSE_DONE)   # 无 usage 帧 → 不 settle
+        self.proxy_port = free_port()
+        self.proc = start_proxy(self.upstream_port, self.proxy_port,
+                                extra_env={"CTYUN_TPM_LIMIT": "200",
+                                           "CTYUN_TPM_WINDOW_S": "2",
+                                           "CTYUN_TPM_QUEUE_TIMEOUT_S": "5",
+                                           "CTYUN_TPM_QUEUE_MAX": "2"})
+
+    def tearDown(self) -> None:
+        if self.proc:
+            self.proc.terminate()
+            self.proc.wait(timeout=5)
+            stderr_text(self.proc)
+            shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_fake_upstreams()
+
+    def test_queue_exhaustion_and_window_roll(self) -> None:
+        """窗口耗尽排队：首发大 body 占满预算（est 191/200）后，第二请求阻塞至
+        窗口滚过（WINDOW_S=2）后放行；stderr 含 qwait=（>0）且 tpm= 数值正确。"""
+        big_body = (b'{"model":"m","stream":true,"messages":[{"role":"user","content":"'
+                    + b"x" * 280 + b'"}]}')   # 349B → est = int(349*0.55) = 191 ≤ 200
+        small_body = b'{"model":"m","stream":true,"messages":[]}'   # 41B → est = 22
+        auth = "Bearer test-key-roll"
+        status1, _ = post_sse_auth(self.proxy_port, big_body, auth)
+        self.assertEqual(status1, 200, "first request must be admitted")
+        # 191+22=213 > 200 → 排队；无 settle，预算保持至窗口滚过（~2s）后放行
+        t0 = time.time()
+        status2, data2 = post_sse_auth(self.proxy_port, small_body, auth)
+        elapsed = time.time() - t0
+        self.assertEqual(status2, 200,
+                         "queued request must be admitted after window roll, got %d"
+                         % status2)
+        self.assertEqual(data2, SSE_A + SSE_B + SSE_DONE)
+        self.assertGreaterEqual(elapsed, 1.0,
+                                "second request must actually queue (≥1s), got %.2fs"
+                                % elapsed)
+        # stderr：qwait= 出现且排队请求 qwait>0；tpm= 与估算公式一致（ratio 0.55）
+        stderr = stderr_text(self.proc)
+        qwait_ms = [int(m) for m in re.findall(r"qwait=(\d+)ms", stderr)]
+        self.assertTrue(any(v > 0 for v in qwait_ms),
+                        "queued request must log qwait>0ms, stderr:\n" + stderr)
+        expected_big = max(1, int(len(big_body) * 0.55))
+        expected_small = max(1, int(len(small_body) * 0.55))
+        self.assertIn("tpm=%d" % expected_big, stderr,
+                      "first REQ line must carry tpm=%d, stderr:\n%s"
+                      % (expected_big, stderr))
+        self.assertIn("tpm=%d" % expected_small, stderr,
+                      "second REQ line must carry tpm=%d, stderr:\n%s"
+                      % (expected_small, stderr))
+
+    def test_queue_timeout_returns_429(self) -> None:
+        """排队超时：预算不释放 → 第二请求 ~2s（seam 值）后收 429，
+        body 字节等于定死 JSON，REQ 行 result=tpm-queue-timeout，且不触上游。"""
+        # 重建代理：小预算 + 短超时 + 长窗口（超时必然先于窗口滚过触发）
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_fake_upstreams()
+        upstream_port, calls = make_scripted_upstream(
+            body_override=SSE_A + SSE_B + SSE_DONE)
+        self.proxy_port = free_port()
+        self.proc = start_proxy(upstream_port, self.proxy_port,
+                                extra_env={"CTYUN_TPM_LIMIT": "60",
+                                           "CTYUN_TPM_WINDOW_S": "60",
+                                           "CTYUN_TPM_QUEUE_TIMEOUT_S": "2",
+                                           "CTYUN_TPM_QUEUE_MAX": "2"})
+        mid_body = (b'{"model":"m","stream":true,"messages":[{"role":"user","content":"'
+                    + b"x" * 20 + b'"}]}')   # 89B → est = int(89*0.55) = 48 ≤ 60
+        small_body = b'{"model":"m","stream":true,"messages":[]}'   # est = 22
+        auth = "Bearer test-key-timeout"
+        status1, _ = post_sse_auth(self.proxy_port, mid_body, auth)
+        self.assertEqual(status1, 200, "first request must be admitted")
+        # 48+22=70 > 60 → 排队；窗口 60s 不滚、无 settle → 2s 超时 → 429
+        t0 = time.time()
+        status2, data2 = post_sse_auth(self.proxy_port, small_body, auth)
+        elapsed = time.time() - t0
+        self.assertEqual(status2, 429,
+                         "queued request must timeout with 429, got %d" % status2)
+        self.assertGreaterEqual(elapsed, 1.0,
+                                "timeout must be seam value (~2s), got %.2fs" % elapsed)
+        # body 字节等于定死 JSON（与 _reply_tpm_429 payload 全等）
+        expected_429 = ('{"error":{"message":"模型请求 TPM 超限，请减少 tokens 后重试",'
+                        '"type":"rate_limit_error","code":"model_tpm_limit"}}').encode("utf-8")
+        self.assertEqual(data2, expected_429,
+                         "429 body must be the fixed JSON, got %r" % data2[:200])
+        parsed = json.loads(data2.decode("utf-8"))
+        self.assertEqual(parsed["error"]["code"], "model_tpm_limit")
+        # REQ 行 result=tpm-queue-timeout；超时请求不触上游（calls 仅首发 1 次）
+        stderr = stderr_text(self.proc)
+        self.assertIn("result=tpm-queue-timeout", stderr,
+                      "REQ line must carry result=tpm-queue-timeout, stderr:\n" + stderr)
+        self.assertEqual(len(calls), 1,
+                         "timed-out request must not hit upstream, calls=%d" % len(calls))
+
+    def test_queue_full_immediate_429(self) -> None:
+        """队列满：QUEUE_MAX=2，3 并发中第 3 个立即 429，REQ 行 result=tpm-queue-full。"""
+        big_body = (b'{"model":"m","stream":true,"messages":[{"role":"user","content":"'
+                    + b"x" * 280 + b'"}]}')   # est = 191/200，占满预算
+        small_body = b'{"model":"m","stream":true,"messages":[]}'   # est = 22
+        auth = "Bearer test-key-qfull"
+        status1, _ = post_sse_auth(self.proxy_port, big_body, auth)
+        self.assertEqual(status1, 200, "first request must be admitted")
+        # 预算已满（无 settle）→ 3 并发全撞队：前 2 个入队（QUEUE_MAX=2），
+        # 第 3 个立即 429（barrier 同步起点，三请求准入竞争窗口 < 窗口滚过 2s）
+        barrier = threading.Barrier(3)
+        results = []
+        lock = threading.Lock()
+        def do_req():
+            barrier.wait()
+            r = post_sse_auth(self.proxy_port, small_body, auth)
+            with lock:
+                results.append(r)
+        threads = [threading.Thread(target=do_req) for _ in range(3)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=15)
+        statuses = sorted(r[0] for r in results)
+        self.assertEqual(statuses, [200, 200, 429],
+                         "exactly 1 of 3 concurrent must be immediate 429 (2 queue, "
+                         "admitted after roll), got %r" % statuses)
+        stderr = stderr_text(self.proc)
+        self.assertIn("result=tpm-queue-full", stderr,
+                      "REQ line must carry result=tpm-queue-full, stderr:\n" + stderr)
+
+    def test_usage_settle_releases_budget(self) -> None:
+        """usage 回填：fake upstream 回 SSE_USAGE（total_tokens=2）→ settle 校正预算，
+        后续请求不等窗口滚过即放行；tpm_stats bucket used == 4（2+2）。"""
+        # 重建代理：上游回带 usage 帧的流（每次 POST 都含 SSE_USAGE）
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_fake_upstreams()
+        upstream_port, calls = make_scripted_upstream(
+            body_override=SSE_USAGE + SSE_A + SSE_B + SSE_DONE)
+        self.proxy_port = free_port()
+        self.proc = start_proxy(upstream_port, self.proxy_port,
+                                extra_env={"CTYUN_TPM_LIMIT": "200",
+                                           "CTYUN_TPM_WINDOW_S": "10",
+                                           "CTYUN_TPM_QUEUE_TIMEOUT_S": "5",
+                                           "CTYUN_TPM_QUEUE_MAX": "2"})
+        big_body = (b'{"model":"m","stream":true,"messages":[{"role":"user","content":"'
+                    + b"x" * 280 + b'"}]}')   # est = 191，settle → 2（释放 189）
+        small_body = b'{"model":"m","stream":true,"messages":[]}'   # est = 22
+        auth = "Bearer test-key-settle"
+        status1, _ = post_sse_auth(self.proxy_port, big_body, auth)
+        self.assertEqual(status1, 200, "first request must be admitted")
+        # settle 已把预算从 191 校正到 2 → 第二请求立即准入（无窗口等待）
+        t0 = time.time()
+        status2, _ = post_sse_auth(self.proxy_port, small_body, auth)
+        elapsed = time.time() - t0
+        self.assertEqual(status2, 200,
+                         "second request must be admitted after settle, got %d" % status2)
+        self.assertLess(elapsed, 1.0,
+                        "settle must release budget immediately (no window wait), got %.2fs"
+                        % elapsed)
+        # stderr：两次 REQ 行 tpm=2（settle 后按实际 usage 记）
+        stderr = stderr_text(self.proc)
+        self.assertGreaterEqual(stderr.count("tpm=2"), 2,
+                                "both REQ lines must carry tpm=2, stderr:\n" + stderr)
+        # tpm_stats：两次 settle 后 bucket used == 2+2 = 4（与 est 无关的稳健断言）
+        time.sleep(0.5)   # settle 在 conn.close 前已发生（卡 4 插入位），余量防客户端 EOF 竞态
+        _, body, _ = admin_get(self.proc.admin_port, "/api/tpm_stats")
+        snap = json.loads(body.decode("utf-8"))
+        self.assertEqual(len(snap["buckets"]), 1)
+        self.assertEqual(snap["buckets"][0]["used"], 4,
+                         "bucket used must be 4 (2+2) after both settles, got %r"
+                         % snap["buckets"][0])
+
+    def test_sse_passthrough_under_rate_limiting(self) -> None:
+        """SSE 透传不破坏：限流生效路径（带 Authorization 经 tpm_admit）下
+        输出仍字节等于 SSE_A+SSE_B+SSE_DONE 且以 data: [DONE] 结尾。"""
+        small_body = b'{"model":"m","stream":true,"messages":[]}'   # est = 22 ≤ 200
+        auth = "Bearer test-key-passthrough"
+        status, data = post_sse_auth(self.proxy_port, small_body, auth)
+        self.assertEqual(status, 200)
+        self.assertEqual(data, SSE_A + SSE_B + SSE_DONE,
+                         "SSE output must be byte-exact under rate limiting, got %r"
+                         % data[:200])
+        self.assertTrue(data.rstrip().endswith(b"data: [DONE]"),
+                        "stream must end with data: [DONE], got tail: %r" % data[-40:])
+
+    def test_no_auth_bypasses_tpm(self) -> None:
+        """无 Authorization 头请求直通不限流（get_plain + 无 auth POST），
+        stderr 无任何 TPM 字段。"""
+        plain_data, plain_len = get_plain(self.proxy_port)   # 无 auth，内部断言 200
+        self.assertIsNotNone(plain_data)
+        data = post_sse(self.proxy_port)   # 无 auth 默认 payload，内部断言 200
+        self.assertEqual(data, SSE_A + SSE_B + SSE_DONE)
+        stderr = stderr_text(self.proc)
+        self.assertNotIn("qwait=", stderr,
+                         "no-auth requests must not log TPM fields, stderr:\n" + stderr)
+        self.assertNotIn("tpm=", stderr)
+        self.assertNotIn("tpm-queue", stderr)
+
+    def test_tpm_stats_endpoint(self) -> None:
+        """/api/tpm_stats 返回 200 JSON：config 与 env seam 一致，bucket used 与
+        REQ 行 tpm= 计数一致，key 字段 sha256: 前缀脱敏（无原始 key 泄漏）。"""
+        small_body = b'{"model":"m","stream":true,"messages":[]}'   # 41B → est = 22
+        auth = "Bearer test-key-stats"
+        status, _ = post_sse_auth(self.proxy_port, small_body, auth)
+        self.assertEqual(status, 200)
+        expected_used = max(1, int(len(small_body) * 0.55))   # 无 usage 帧 → used 保持 est
+        status, body, ctype = admin_get(self.proc.admin_port, "/api/tpm_stats")
+        self.assertEqual(status, 200)
+        self.assertTrue(ctype and ctype.startswith("application/json"),
+                        "Content-Type must be application/json, got %r" % ctype)
+        snap = json.loads(body.decode("utf-8"))
+        self.assertEqual(snap["config"], {"limit": 200, "window_s": 2, "queue_max": 2},
+                         "config must reflect env seams, got %r" % snap["config"])
+        self.assertEqual(snap["queue_total"], 0)
+        self.assertEqual(len(snap["buckets"]), 1)
+        b = snap["buckets"][0]
+        # key 脱敏：sha256(token) 前 12 位 hex，无原始 key（依赖卡 2 的 import hashlib）
+        expected_short = "sha256:" + hashlib.sha256(b"test-key-stats").hexdigest()[:12]
+        self.assertEqual(b["key"], expected_short,
+                         "bucket key must be sha256: prefix + 12 hex, got %r" % b["key"])
+        self.assertNotIn("test-key-stats", b["key"], "bucket key must not leak raw key")
+        self.assertEqual(b["used"], expected_used,
+                         "bucket used must match REQ line tpm= value")
+        self.assertEqual(b["remaining"], 200 - expected_used)
+        self.assertEqual(b["queued"], 0)
+        self.assertEqual(b["rejected"], 0)
+        self.assertEqual(b["timeouts"], 0)
+        # 与 REQ 行交叉校验：tpm= 数值 == bucket used
+        stderr = stderr_text(self.proc)
+        self.assertIn("tpm=%d" % expected_used, stderr,
+                      "REQ line must carry tpm=%d, stderr:\n%s" % (expected_used, stderr))
+
+    def test_all_existing_tests_pass(self) -> None:
+        """既有 127 例无回归冒烟：TPM env 开启下 SSE 透传/plain 透传/统计端点正常。"""
+        data = post_sse(self.proxy_port)   # 无 auth → 既有路径，零 TPM 介入
+        self.assertEqual(data, SSE_A + SSE_B + SSE_DONE)
+        self.assertTrue(data.rstrip().endswith(b"data: [DONE]"))
+        plain_data, plain_len = get_plain(self.proxy_port)
+        self.assertIsNotNone(plain_data)
+        status, body, ctype = admin_get(self.proc.admin_port, "/api/stats")
+        self.assertEqual(status, 200)
+        snap = json.loads(body.decode("utf-8"))
+        self.assertGreaterEqual(snap["requests_total"], 2)
+        self.assertIn("filtered=0", stderr_text(self.proc))
+
+
 if __name__ == "__main__":
     import atexit
     atexit.register(kill_registered)
