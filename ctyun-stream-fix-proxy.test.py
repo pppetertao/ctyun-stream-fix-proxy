@@ -4121,6 +4121,65 @@ class ModelPricingSeamTest(unittest.TestCase):
                          "persist model_pricing must resume across restart")
 
 
+class TokenPersistTest(unittest.TestCase):
+    """P3 Token期端到端：POST 带 usage 帧 SSE → SIGTERM → 重启 → daily_by_model tokens_prompt>0。
+
+    spec P3 Acceptance：daily_by_model 当日当模型 entry 含 tokens_prompt ≥ 1（持久化闭环）。"""
+
+    def setUp(self) -> None:
+        self.upstream_port, self.calls = make_scripted_upstream(
+            body_override=SSE_USAGE + SSE_A + SSE_B + SSE_DONE)
+        self.proxy_port = free_port()
+        self.proc = start_proxy(self.upstream_port, self.proxy_port)
+
+    def tearDown(self) -> None:
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_fake_upstreams()
+
+    def test_token_persist_survives_sigterm_restart(self) -> None:
+        """POST 一次带 usage 帧 SSE → SIGTERM → 重启 → daily_by_model tokens_prompt>0。"""
+        today = time.strftime("%Y-%m-%d")
+        data = post_sse(self.proxy_port)
+        self.assertEqual(data, SSE_USAGE + SSE_A + SSE_B + SSE_DONE,
+                         "stream must relay byte-exact")
+
+        # 内存态
+        _, body, _ = admin_get(self.proc.admin_port, "/api/stats")
+        snap = json.loads(body.decode("utf-8"))
+        dm = snap["daily_by_model"][today]
+        self.assertEqual(len(dm), 1)
+        model_key = list(dm)[0]
+        self.assertEqual(dm[model_key]["tokens_prompt"], 1)
+        self.assertEqual(dm[model_key]["tokens_completion"], 1)
+
+        # SIGTERM 落盘
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        persist_file = os.path.join(self.proc.persist_dir, "settings.json")
+        with open(persist_file, encoding="utf-8") as fh:
+            saved = json.load(fh)
+        self.assertEqual(saved["stats"]["daily_by_model"][today][model_key][
+                             "tokens_prompt"], 1,
+                         "tokens_prompt must hit disk on SIGTERM")
+
+        # 重启（同 persist 内容 seed）→ daily_by_model tokens_prompt>0
+        self.proc = start_proxy(self.upstream_port, free_port(), seed_persist=saved)
+        _, body, _ = admin_get(self.proc.admin_port, "/api/stats")
+        snap2 = json.loads(body.decode("utf-8"))
+        dm2 = snap2["daily_by_model"].get(today, {})
+        self.assertIn(model_key, dm2, "model entry must survive restart")
+        self.assertGreaterEqual(dm2[model_key]["tokens_prompt"], 1,
+                                "tokens_prompt must survive SIGTERM+restart")
+        self.assertGreaterEqual(dm2[model_key]["tokens_completion"], 1,
+                                "tokens_completion must survive SIGTERM+restart")
+        self.assertGreaterEqual(dm2[model_key]["stream_requests"], 1,
+                                "stream_requests must survive SIGTERM+restart")
+
+
 class DailyV2CompatTest(unittest.TestCase):
     """P3 Token期：daily_by_model v2 向后兼容双向 degrade（R2 锁死）。
 
