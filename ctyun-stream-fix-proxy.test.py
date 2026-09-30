@@ -4317,6 +4317,59 @@ class TpmRateLimitTest(unittest.TestCase):
         self.assertIn("filtered=0", stderr_text(self.proc))
 
 
+class PerfHistTest(unittest.TestCase):
+    """P2 速度期：hist_percentile 纯函数矩阵（空/单桶/均匀/边界/末桶溢出）。"""
+
+    def test_hist_percentile_empty(self) -> None:
+        mod = load_proxy_module()
+        edges = mod.HIST_BUCKETS_MS
+        buckets = [0] * (len(edges) + 1)
+        self.assertEqual(mod.hist_percentile(buckets, edges, 0.5), 0.0,
+                         "空直方图 P50 必须为 0.0")
+        self.assertEqual(mod.hist_percentile(buckets, edges, 0.9), 0.0,
+                         "空直方图 P90 必须为 0.0")
+
+    def test_hist_percentile_single_bucket(self) -> None:
+        mod = load_proxy_module()
+        edges = mod.HIST_BUCKETS_MS
+        buckets = [0] * (len(edges) + 1)
+        buckets[0] = 1                      # 单样本落 [0, 100)
+        self.assertAlmostEqual(mod.hist_percentile(buckets, edges, 0.5), 50.0,
+                               places=6, msg="单样本首桶 P50 = 桶中点 50")
+        buckets = [0] * (len(edges) + 1)
+        buckets[1] = 1                      # 单样本落 [100, 250)
+        self.assertAlmostEqual(mod.hist_percentile(buckets, edges, 0.5), 175.0,
+                               places=6, msg="单样本第二桶 P50 = 桶中点 175")
+
+    def test_hist_percentile_uniform(self) -> None:
+        mod = load_proxy_module()
+        edges = mod.HIST_BUCKETS_MS
+        buckets = [1] * (len(edges) + 1)    # 9 桶各 1 样本
+        self.assertAlmostEqual(mod.hist_percentile(buckets, edges, 0.5), 1500.0,
+                               places=6, msg="均匀分布 P50（rank=4.5）落在 [1000,2000) 中点")
+        self.assertAlmostEqual(mod.hist_percentile(buckets, edges, 0.9), 30000.0,
+                               places=6, msg="均匀分布 P90（rank=8.1）落末桶 → 下界 30000")
+
+    def test_hist_percentile_exact_edge(self) -> None:
+        mod = load_proxy_module()
+        edges = mod.HIST_BUCKETS_MS
+        buckets = [0] * (len(edges) + 1)
+        buckets[0] = 1
+        buckets[1] = 1                      # rank=1.0 恰落在 100ms 桶界
+        self.assertAlmostEqual(mod.hist_percentile(buckets, edges, 0.5), 100.0,
+                               places=6, msg="rank 恰落桶界时返回边界值")
+
+    def test_hist_percentile_tail_overflow(self) -> None:
+        mod = load_proxy_module()
+        edges = mod.HIST_BUCKETS_MS
+        buckets = [0] * (len(edges) + 1)
+        buckets[-1] = 5                     # 全部溢出到 [30000, +inf)
+        self.assertEqual(mod.hist_percentile(buckets, edges, 0.5), float(edges[-1]),
+                         "末桶溢出 P50 返回下界 30000")
+        self.assertEqual(mod.hist_percentile(buckets, edges, 0.99), float(edges[-1]),
+                         "末桶溢出 P99 返回下界 30000")
+
+
 if __name__ == "__main__":
     import atexit
     atexit.register(kill_registered)

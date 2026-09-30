@@ -10,6 +10,7 @@ CTYUN_PERSIST_PATH / CTYUN_ADMIN_TOKEN 环境变量为测试与部署 seam。
 """
 
 import base64
+import bisect
 import hashlib
 import collections
 import datetime
@@ -109,6 +110,32 @@ _KIND_CATEGORY = {
     ERR_KIND_TPM_QUEUE_FULL: CLASS_TPM_LIMITED,
     ERR_KIND_TPM_QUEUE_TIMEOUT: CLASS_TPM_LIMITED,
 }
+
+
+def hist_percentile(buckets, edges, q):
+    """直方图线性插值分位数（stdlib 手写，无 numpy；≤20 行）。
+
+    buckets: 桶计数序列，len == len(edges) + 1（末桶为 [edges[-1], +inf)）。
+    edges:   升序右开边界（HIST_BUCKETS_MS，8 个）。
+    q:       分位数 (0, 1]。
+    返回插值毫秒值：桶内均匀分布线性插值；空直方图 → 0.0；
+    +inf 末桶命中 → 返回该桶下界 edges[-1]（保守口径，无法对 +inf 插值）。
+    """
+    total = sum(buckets)
+    if total == 0:
+        return 0.0
+    rank = q * total
+    if rank > total:
+        rank = total
+    cum = 0
+    for i, count in enumerate(buckets):
+        lo = edges[i - 1] if i > 0 else 0.0
+        if i == len(buckets) - 1:          # +inf 末桶
+            return float(lo)
+        if rank <= cum + count:
+            return lo + (rank - cum) / count * (edges[i] - lo)
+        cum += count
+    return float(edges[-1])  # 数学不可达（rank<=total 且末桶已 return）；防御性兜底
 
 
 def sse_data_line_kind(line: bytes) -> str:
