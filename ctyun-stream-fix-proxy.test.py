@@ -1077,6 +1077,32 @@ class ProxyDashboardUnitTest(unittest.TestCase):
             mod.TPM_QUEUE_TIMEOUT_S = 120
             self._tpm_cleanup(mod)
 
+    def test_tpm_waiters_identity_removal(self) -> None:
+        """队列自移除必须按同一性（值相等 race 回归）。
+
+        两个值全等的 _TpmWaiter 同在队列时（并发同 key 同 est 同 enqueued_at），
+        摘 w1 不得连带摘走 w2——旧实现用值相等的 deque.remove 会误删后者。
+        """
+        mod = self.mod
+        self._tpm_cleanup(mod)
+        w1 = mod._TpmWaiter("k", 10, 123.5)
+        w2 = mod._TpmWaiter("k", 10, 123.5)
+        self.assertEqual(w1, w2)      # namedtuple 值相等
+        self.assertIsNot(w1, w2)      # 但非同一对象
+        mod.TPM_WAITERS.append(w1)
+        mod.TPM_WAITERS.append(w2)
+        with mod.TPM_LOCK:
+            mod._tpm_remove_waiter(w1)
+        self.assertEqual(len(mod.TPM_WAITERS), 1,
+                         "identity removal must drop exactly one entry, got %d"
+                         % len(mod.TPM_WAITERS))
+        self.assertTrue(any(w is w2 for w in mod.TPM_WAITERS),
+                        "value-equal twin w2 must survive removal of w1")
+        with mod.TPM_LOCK:
+            mod._tpm_remove_waiter(w2)
+        self.assertEqual(len(mod.TPM_WAITERS), 0)
+        self._tpm_cleanup(mod)
+
     def test_tpm_snapshot_shape_and_masking(self) -> None:
         mod = self.mod
         self._tpm_cleanup(mod)

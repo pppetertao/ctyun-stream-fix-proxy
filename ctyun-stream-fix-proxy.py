@@ -326,6 +326,19 @@ def _tpm_get_bucket(key_id: str):
     return bucket
 
 
+def _tpm_remove_waiter(waiter) -> None:
+    """把 waiter 从 TPM_WAITERS 中按**同一性**摘除（不在队列时为 no-op）。
+
+    必须同一性而非值相等删除：_TpmWaiter 是 namedtuple，值全等的两个 waiter
+    同队列时，deque.remove 会摘掉别人的那份（超时 waiter 误删仍在排队的请求）。
+    仅可在持 TPM_LOCK 时调用。
+    """
+    for i, w in enumerate(TPM_WAITERS):
+        if w is waiter:
+            del TPM_WAITERS[i]
+            return
+
+
 def tpm_admit(key_id: str, est: int):
     """TPM 准入（与入队同锁，原子）。返回 (status, qwait_ms)。
 
@@ -375,12 +388,9 @@ def tpm_admit(key_id: str, est: int):
                         return ("ok", (now - started) * 1000)
                 TPM_LOCK.wait(timeout=min(1.0, remaining))
         finally:
-            if waiter in TPM_WAITERS:
-                # 超时/异常路径把自己从队列移除；已 popleft 的正常准入不会走到这
-                try:
-                    TPM_WAITERS.remove(waiter)
-                except ValueError:
-                    pass  # 已被并发 popleft：无其他路径可达，正常结束
+            # 超时/异常路径把自己从队列移除；已 popleft 的正常准入不会走到这。
+            # 同一性摘除（_tpm_remove_waiter）：值相等的其它 waiter 不受牵连
+            _tpm_remove_waiter(waiter)
 
 
 def tpm_settle(key_id: str, est: int, actual: int) -> None:
