@@ -428,6 +428,22 @@ def post_sse(port: int, payload: bytes = None) -> bytes:
     return data
 
 
+def post_sse_with_headers(port: int, payload: bytes = None):
+    """同 post_sse 但返回 (body, x_request_id)。"""
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+    if payload is None:
+        payload = b'{"model":"deepseek-v4-pro-0813-oc","stream":true,"messages":[]}'
+    conn.request("POST", "/v1/chat/completions", body=payload,
+                 headers={"Content-Type": "application/json"})
+    resp = conn.getresponse()
+    status = resp.status
+    x_request_id = resp.getheader("X-Request-Id")
+    data = resp.read()
+    conn.close()
+    assert status == 200, "expected SSE 200, got %d" % status
+    return data, x_request_id
+
+
 def get_plain(port: int):
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
     conn.request("GET", "/plain")
@@ -438,6 +454,20 @@ def get_plain(port: int):
     conn.close()
     assert status == 200, "expected /plain 200, got %d" % status
     return data, resp_len
+
+
+def get_plain_with_headers(port: int):
+    """同 get_plain 但返回 (data, content_length, x_request_id)。"""
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    conn.request("GET", "/plain")
+    resp = conn.getresponse()
+    status = resp.status
+    data = resp.read()
+    resp_len = resp.getheader("Content-Length")
+    x_request_id = resp.getheader("X-Request-Id")
+    conn.close()
+    assert status == 200, "expected /plain 200, got %d" % status
+    return data, resp_len, x_request_id
 
 
 class ProxyLifecycleTestCase(unittest.TestCase):
@@ -3572,6 +3602,47 @@ class RequestIdTest(unittest.TestCase):
         self.assertIsNotNone(m,
             "REQ 行必须带 rid/host/ttfb/stream/outcome 字段，stderr:\n" + stderr)
         self.assertEqual(m.group(1), "r-1")
+
+    def test_sse_response_carries_x_request_id_matching_req_line(self) -> None:
+        """SSE 响应头 X-Request-Id 与 REQ 行 rid 一致。"""
+        _, x_request_id = post_sse_with_headers(self.proxy_port)
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr = stderr_text(self.proc)
+        m = re.search(r"rid=(r-\d+) host=", stderr)
+        self.assertIsNotNone(m, "REQ 行必须含 rid=，stderr:\n" + stderr)
+        self.assertEqual(x_request_id, m.group(1),
+                         "X-Request-Id 响应头必须与 REQ 行 rid 一致")
+
+    def test_plain_response_carries_x_request_id(self) -> None:
+        """非流式（/plain GET → _relay_buffered）响应也带 X-Request-Id。"""
+        _, _, x_request_id = get_plain_with_headers(self.proxy_port)
+        m = re.match(r"^r-\d+$", x_request_id or "")
+        self.assertIsNotNone(m,
+            "非流式响应必须带 X-Request-Id，got %r" % x_request_id)
+
+    def test_502_response_carries_x_request_id(self) -> None:
+        """代理合成 502 响应也带 X-Request-Id。"""
+        dead_port = free_port()  # 死端口：连接即 ECONNREFUSED → 合成 502
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        self.proc = start_proxy(dead_port, free_port())
+        conn = http.client.HTTPConnection("127.0.0.1",
+                                          self.proc.proxy_port, timeout=30)
+        conn.request("POST", "/v1/chat/completions",
+                     body=b'{"model":"m","stream":true,"messages":[]}',
+                     headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        status = resp.status
+        x_request_id = resp.getheader("X-Request-Id")
+        resp.read()
+        conn.close()
+        self.assertEqual(status, 502,
+                         "死上游必须合成 502")
+        m = re.match(r"^r-\d+$", x_request_id or "")
+        self.assertIsNotNone(m,
+            "502 响应必须带 X-Request-Id，got %r" % x_request_id)
 
 
 if __name__ == "__main__":

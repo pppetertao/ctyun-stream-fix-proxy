@@ -1115,6 +1115,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             if name.lower() in ("content-length", "transfer-encoding", "connection"):
                 continue
             self.send_header(name, value)
+        self.send_header("X-Request-Id", self._req_id)
         self.send_header("Connection", "close")
         self.end_headers()
         self.close_connection = True
@@ -1214,6 +1215,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 continue
             self.send_header(name, value)
         self.send_header("Content-Length", str(len(data)))
+        self.send_header("X-Request-Id", self._req_id)
         self.end_headers()
         old_timeout = self.connection.gettimeout()
         self.connection.settimeout(SEND_TIMEOUT_S)
@@ -1228,6 +1230,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         payload = ("ctyun-stream-fix-proxy: upstream error: %s\n" % exc).encode("utf-8")
         self.send_response(502)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("X-Request-Id", self._req_id)
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         if self.command != "HEAD":
