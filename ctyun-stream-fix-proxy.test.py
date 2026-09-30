@@ -3514,6 +3514,51 @@ class P1ConstantsTest(unittest.TestCase):
                                  "outcome_failed"))
 
 
+class RequestIdTest(unittest.TestCase):
+    """P1 地基：request id / upstream host / ttfb / stream / outcome 全链路。
+
+    黑盒子进程集成：经 CTYUN_UPSTREAM_BASE seam 指向 fake upstream，
+    断言 RECENT_REQUESTS 条目携带 v2 字段且值正确。"""
+
+    def setUp(self) -> None:
+        self.upstream_port = make_fake_upstream(False)
+        self.proxy_port = free_port()
+        self.proc = start_proxy(self.upstream_port, self.proxy_port)
+
+    def tearDown(self) -> None:
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_fake_upstreams()
+
+    def test_recent_entry_carries_rid_host_ttfb_stream_outcome(self) -> None:
+        """RECENT_REQUESTS 条目含 v2 七个新字段；值正确填充。"""
+        post_sse(self.proxy_port)
+        _, body, _ = admin_get(self.proc.admin_port, "/api/stats")
+        snap = json.loads(body.decode("utf-8"))
+        self.assertTrue(snap["recent"], "RECENT_REQUESTS must not be empty")
+        entry = snap["recent"][-1]
+        for key in ("rid", "upstream_host", "ttfb_ms", "stream",
+                    "tokens", "bytes_out", "outcome"):
+            self.assertIn(key, entry,
+                          "recent entry must carry '%s' key; got keys %r"
+                          % (key, sorted(entry.keys())))
+        self.assertEqual(entry["rid"], "r-1",
+                         "first request rid must be r-1 (fresh process)")
+        self.assertEqual(entry["upstream_host"],
+                         "127.0.0.1:%d" % self.upstream_port)
+        self.assertIsInstance(entry["ttfb_ms"], float)
+        self.assertGreaterEqual(entry["ttfb_ms"], 0)
+        self.assertEqual(entry["stream"], 1,
+                         "SSE request stream must be 1")
+        self.assertEqual(entry["outcome"], "ok",
+                         "clean SSE outcome must be ok")
+        # P3 前占位字段
+        self.assertIsNone(entry["tokens"])
+        self.assertEqual(entry["bytes_out"], 0)
+
+
 if __name__ == "__main__":
     import atexit
     atexit.register(kill_registered)

@@ -704,7 +704,9 @@ def set_capture_errors(enabled: bool) -> None:
 
 
 def _record_request(method: str, path: str, status: int, dur_ms: float,
-                    filtered: int, model=None, error: bool = False) -> None:
+                    filtered: int, model=None, error: bool = False,
+                    rid=None, upstream_host=None, ttfb_ms=None, stream=None,
+                    tokens=None, bytes_out: int = 0, outcome=None) -> None:
     global _stats_dirty
     with STATS_LOCK:
         if error:
@@ -743,7 +745,11 @@ def _record_request(method: str, path: str, status: int, dur_ms: float,
                            "model": model, "status": status})
         RECENT_REQUESTS.append({"ts": time.time(), "method": method, "path": path,
                                 "status": status, "dur_ms": round(dur_ms, 1),
-                                "filtered": filtered, "model": model})
+                                "filtered": filtered, "model": model,
+                                "rid": rid, "upstream_host": upstream_host,
+                                "ttfb_ms": ttfb_ms, "stream": stream,
+                                "tokens": tokens, "bytes_out": bytes_out,
+                                "outcome": outcome})
         _stats_dirty = True
 
 
@@ -886,6 +892,12 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         with STATS_LOCK:
             STATS["requests_total"] += 1
             STATS["active"] += 1
+            rid = "r-%d" % STATS["requests_total"]
+            # 一次解析，转发路径全程复用；UPSTREAM_BASE 读侧无锁（
+            # _CFG_LOCK 只护写，Python 引用赋值原子 → 读线程看到任一完整旧值）
+            upstream_host = urllib.parse.urlparse(UPSTREAM_BASE).netloc
+        self._req_id = rid
+        self._upstream_host = upstream_host
         try:
             self._proxy_relay(started)
         except (ConnectionError, socket.timeout):
@@ -897,7 +909,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             outcome = classify_outcome(client_abort=True)
             self._log(started, 499, outcome.log_result, 0)
             _record_request(self.command, self.path, 499,
-                            (time.time() - started) * 1000, 0, model=None)
+                            (time.time() - started) * 1000, 0, model=None,
+                            rid=self._req_id, upstream_host=self._upstream_host,
+                            outcome=outcome.category)
         finally:
             with STATS_LOCK:
                 STATS["active"] -= 1
@@ -921,9 +935,11 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
         header_retried = 0
         header_retry_reason = ""
+        t_conn_start = time.monotonic()  # TTFB 起点：每次 _open_upstream 尝试前重记（重试等待不混入 TTFB）
         try:
             try:
                 conn, resp = self._open_upstream(self.command, self.path, body, fwd_headers)
+                t_headers_done = time.monotonic()
             except (socket.timeout, http.client.RemoteDisconnected, ConnectionResetError) as first_exc:
                 # socket.timeout = 响应头阶段阻塞到 HEADER_TIMEOUT_S；RemoteDisconnected
                 # = 上游在响应头阶段直接关连接（未发任何响应字节）；ConnectionResetError =
@@ -942,7 +958,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 record_error_event(ERR_KIND_HEADER_TIMEOUT, model=model, path=self.path,
                                    exc=first_exc, body=body, retry_reason=header_retry_reason)
                 _record_header_retry(model)
+                t_conn_start = time.monotonic()
                 conn, resp = self._open_upstream(self.command, self.path, body, fwd_headers)
+                t_headers_done = time.monotonic()
         except (OSError, http.client.HTTPException) as exc:
             self._reply_502(exc)
             outcome = classify_outcome(synth_502=True)
@@ -950,12 +968,15 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                       retried=header_retried, retry_reason=header_retry_reason)
             _record_request(self.command, self.path, 502,
                             (time.time() - started) * 1000, 0,
-                            model=model, error=outcome.counts_error)
+                            model=model, error=outcome.counts_error,
+                            rid=self._req_id, upstream_host=self._upstream_host,
+                            outcome=outcome.category)
             record_error_event(ERR_KIND_SYNTH_502, model=model, path=self.path,
                                exc=exc, body=body,
                                retried=header_retried, retry_reason=header_retry_reason)
             return
 
+        ttfb_ms = round((t_headers_done - t_conn_start) * 1000, 1)
         content_type = (resp.getheader("Content-Type") or "").lower()
         if "text/event-stream" in content_type:
             retried = header_retried
@@ -974,8 +995,10 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                                    response=b"".join(exc.lines),
                                    retry_reason=exc.reason)
                 conn.close()
+                t_conn_start = time.monotonic()
                 try:
                     conn, resp = self._open_upstream(self.command, self.path, body, fwd_headers)
+                    t_headers_done = time.monotonic()
                 except (OSError, http.client.HTTPException) as retry_exc:
                     self._reply_502(retry_exc)  # 客户端尚未收到字节，502 语义与既有路径一致
                     outcome = classify_outcome(synth_502=True)
@@ -983,7 +1006,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                               retry_reason=retry_reason, exc=retry_exc)
                     _record_request(self.command, self.path, 502,
                                     (time.time() - started) * 1000, 0, model=model,
-                                    error=outcome.counts_error)
+                                    error=outcome.counts_error,
+                                    rid=self._req_id, upstream_host=self._upstream_host,
+                                    outcome=outcome.category)
                     record_error_event(ERR_KIND_SYNTH_502, model=model, path=self.path,
                                        exc=retry_exc, body=body,
                                        retried=1, retry_reason=retry_reason)
@@ -991,6 +1016,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 self._body_err_line = None
                 filtered, truncated = self._relay_sse(resp, final=True)
                 body_error = self._body_err_line is not None
+                ttfb_ms = round((t_headers_done - t_conn_start) * 1000, 1)
             outcome = classify_outcome(status=resp.status, poison_filtered=filtered,
                                        body_error=body_error)
             result = outcome.log_result  # 重试后按实际 resp 重算
@@ -1020,7 +1046,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                       retry_reason=retry_reason)
             _record_request(self.command, self.path, resp.status,
                             (time.time() - started) * 1000, filtered, model=model,
-                            error=outcome.counts_error)
+                            error=outcome.counts_error,
+                            rid=self._req_id, upstream_host=self._upstream_host,
+                            ttfb_ms=ttfb_ms, stream=1, outcome=outcome.category)
         else:
             relayed_data = self._relay_buffered(resp)
             body_error = False
@@ -1035,7 +1063,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self._log(started, resp.status, outcome.log_result, 0, model=model)
             _record_request(self.command, self.path, resp.status,
                             (time.time() - started) * 1000, 0, model=model,
-                            error=outcome.counts_error)
+                            error=outcome.counts_error,
+                            rid=self._req_id, upstream_host=self._upstream_host,
+                            ttfb_ms=ttfb_ms, stream=0, outcome=outcome.category)
             if outcome.capture:
                 if body_error:
                     kind = ERR_KIND_BODY_ERROR
