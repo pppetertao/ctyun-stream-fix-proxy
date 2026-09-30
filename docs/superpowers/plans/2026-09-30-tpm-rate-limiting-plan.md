@@ -220,7 +220,9 @@ feat(proxy): add TPM constants, sse_line_usage, and KIND_CATEGORY entries
 
 #### 生产代码（完整，可直接落盘）
 
-**前置：import 区追加 `import hashlib`（`ctyun-stream-fix-proxy.py` `:12` `import base64` 之后、`:13` `import collections` 之前，按字母序）**。实测确认当前文件无 hashlib import（只有 `import hmac`），`tpm_key_id` 的 sha256 依赖它。
+**前置：import 区追加 `import hashlib`（`ctyun-stream-fix-proxy.py` `:12` `import base64` 之后、`import collections` 之前）**。实测确认当前文件无 hashlib import（只有 `import hmac`），`tpm_key_id` 的 sha256 依赖它。
+
+<!-- rev: 2026-09-30 _TpmBucket 子类修复（deque 无 __dict__） -->
 
 ```python
 import hashlib
@@ -233,8 +235,13 @@ import hashlib
 
 _TpmWaiter = collections.namedtuple("_TpmWaiter", "key_id est enqueued_at")
 
+# collections.deque 是 C 类型无 __dict__，不能挂 .used 属性；Python 空子类有
+# __dict__ 可承载 .used，而 len()/popleft/append/迭代语义与原 deque 完全一致
+class _TpmBucket(collections.deque):
+    pass
+
 TPM_LOCK = threading.Condition()
-TPM_BUCKETS: dict = {}                 # key_id -> deque([(ts, tokens), ...]) + 附加属性 .used
+TPM_BUCKETS: dict = {}                 # key_id -> _TpmBucket（deque 条目 + 附加属性 .used）
 TPM_WAITERS: collections.deque = collections.deque()  # FIFO 排队（of _TpmWaiter）
 _tpm_rejected: dict = {}               # key_id -> queue-full 拒绝计数（快照用）
 _tpm_timeouts: dict = {}               # key_id -> queue-timeout 计数（快照用）
@@ -304,7 +311,7 @@ def _tpm_get_bucket(key_id: str):
                     and not any(w.key_id == k for w in TPM_WAITERS)]
             for k in idle:
                 del TPM_BUCKETS[k]
-        bucket = collections.deque()
+        bucket = _TpmBucket()
         bucket.used = 0
         TPM_BUCKETS[key_id] = bucket
     return bucket
@@ -433,6 +440,8 @@ def empty_stream_should_retry(budget: int) -> bool:
 
 **前置：`ctyun-stream-fix-proxy.test.py` 顶部 import 区（`:12` `import collections` 之后）追加 `import hashlib`**（test_tpm_key_id/test_tpm_snapshot_shape_and_masking 用）。
 
+<!-- rev: 2026-09-30 _TpmBucket 子类修复（deque 无 __dict__） -->
+
 ```python
 import hashlib
 ```
@@ -478,7 +487,7 @@ import hashlib
 
     def test_tpm_prune(self) -> None:
         mod = self.mod
-        bucket = collections.deque()
+        bucket = mod._TpmBucket()
         bucket.used = 0
         now = 1000.0
         bucket.append((now - 30, 500))
