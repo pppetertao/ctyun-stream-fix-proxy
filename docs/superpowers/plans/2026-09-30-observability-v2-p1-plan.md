@@ -181,10 +181,10 @@ class P1ConstantsTest(unittest.TestCase):
 
 ```
 # 红（失败）—— 常量未声明
-/usr/bin/python3 -m unittest ctyun-stream-fix-proxy.test.P1ConstantsTest.test_v2_constants_declared 2>&1; echo "exit=$?"
+/usr/bin/python3 ctyun-stream-fix-proxy.test.py P1ConstantsTest.test_v2_constants_declared 2>&1; echo "exit=$?"
 
 # 绿——应用 4 个 Edit 后
-/usr/bin/python3 -m unittest ctyun-stream-fix-proxy.test.P1ConstantsTest.test_v2_constants_declared 2>&1; echo "exit=$?"
+/usr/bin/python3 ctyun-stream-fix-proxy.test.py P1ConstantsTest.test_v2_constants_declared 2>&1; echo "exit=$?"
 # 预期: OK, exit=0
 
 # 基线回归
@@ -489,10 +489,10 @@ class RequestIdTest(unittest.TestCase):
 
 ```
 # 红 — RECENT 条目缺少 rid/upstream_host 等键
-/usr/bin/python3 -m unittest ctyun-stream-fix-proxy.test.RequestIdTest.test_recent_entry_carries_rid_host_ttfb_stream_outcome 2>&1; echo "exit=$?"
+/usr/bin/python3 ctyun-stream-fix-proxy.test.py RequestIdTest.test_recent_entry_carries_rid_host_ttfb_stream_outcome 2>&1; echo "exit=$?"
 
 # 绿 — 应用全部 Edit 2-1..2-9e 后
-/usr/bin/python3 -m unittest ctyun-stream-fix-proxy.test.RequestIdTest.test_recent_entry_carries_rid_host_ttfb_stream_outcome 2>&1; echo "exit=$?"
+/usr/bin/python3 ctyun-stream-fix-proxy.test.py RequestIdTest.test_recent_entry_carries_rid_host_ttfb_stream_outcome 2>&1; echo "exit=$?"
 # 预期: OK, exit=0
 
 # 基线回归
@@ -692,10 +692,10 @@ new_string:
 
 ```
 # 红 — REQ 行不含 rid= 等新字段
-/usr/bin/python3 -m unittest ctyun-stream-fix-proxy.test.RequestIdTest.test_req_line_carries_rid_host_ttfb_stream_outcome 2>&1; echo "exit=$?"
+/usr/bin/python3 ctyun-stream-fix-proxy.test.py RequestIdTest.test_req_line_carries_rid_host_ttfb_stream_outcome 2>&1; echo "exit=$?"
 
 # 绿 — 应用全部 Edit 3-1..3-3b 后
-/usr/bin/python3 -m unittest ctyun-stream-fix-proxy.test.RequestIdTest.test_req_line_carries_rid_host_ttfb_stream_outcome 2>&1; echo "exit=$?"
+/usr/bin/python3 ctyun-stream-fix-proxy.test.py RequestIdTest.test_req_line_carries_rid_host_ttfb_stream_outcome 2>&1; echo "exit=$?"
 # 预期: OK, exit=0
 
 # 回归 — 确保既有测试全绿（含 test_req_log_line_has_ts_and_model 和 test_req_error_line_carries_exc 的修改版正则）
@@ -846,10 +846,10 @@ def get_plain_with_headers(port: int):
 
 ```
 # 红 — 响应头缺失 X-Request-Id
-/usr/bin/python3 -m unittest ctyun-stream-fix-proxy.test.RequestIdTest.test_sse_response_carries_x_request_id_matching_req_line ctyun-stream-fix-proxy.test.RequestIdTest.test_plain_response_carries_x_request_id ctyun-stream-fix-proxy.test.RequestIdTest.test_502_response_carries_x_request_id 2>&1; echo "exit=$?"
+/usr/bin/python3 ctyun-stream-fix-proxy.test.py RequestIdTest.test_sse_response_carries_x_request_id_matching_req_line ctyun-stream-fix-proxy.test.RequestIdTest.test_plain_response_carries_x_request_id ctyun-stream-fix-proxy.test.RequestIdTest.test_502_response_carries_x_request_id 2>&1; echo "exit=$?"
 
 # 绿 — 应用 3 个 Edit 后
-/usr/bin/python3 -m unittest ctyun-stream-fix-proxy.test.RequestIdTest.test_sse_response_carries_x_request_id_matching_req_line ctyun-stream-fix-proxy.test.RequestIdTest.test_plain_response_carries_x_request_id ctyun-stream-fix-proxy.test.RequestIdTest.test_502_response_carries_x_request_id 2>&1; echo "exit=$?"
+/usr/bin/python3 ctyun-stream-fix-proxy.test.py RequestIdTest.test_sse_response_carries_x_request_id_matching_req_line ctyun-stream-fix-proxy.test.RequestIdTest.test_plain_response_carries_x_request_id ctyun-stream-fix-proxy.test.RequestIdTest.test_502_response_carries_x_request_id 2>&1; echo "exit=$?"
 # 预期: OK, exit=0
 
 # 基线回归
