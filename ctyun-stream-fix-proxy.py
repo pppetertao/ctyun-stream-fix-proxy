@@ -70,6 +70,7 @@ PROBE_TIMEOUT_S = 5                # v2 P4：probe HEAD 请求超时
 PROBE_MIN_INTERVAL_S = 10          # v2 P4：probe 间隔下限（防滥用）
 PROBE_FAILURE_THRESHOLD = 3        # v2 P4：连续失败次数达此值触发 EVENTS probe_alert
 PROBE_ALERT_DEBOUNCE_S = 300       # v2 P4：同类 probe 告警最小间隔（去抖）
+STALL_THRESHOLD_S = float(os.environ.get("CTYUN_STALL_THRESHOLD_S", "5.0"))  # v2 P2：SSE 相邻 record 间隔 > 此值计一次 stall（env seam，测试降至 0.5 加速）
 
 ERROR_RING_MAX = 50
 BODY_SNAPSHOT_CAP = 4096
@@ -602,7 +603,14 @@ STATS_LOCK = threading.Lock()
 STATS = {"requests_total": 0, "filtered_total": 0, "errors_total": 0,
          "empty_retries_total": 0, "eof_without_done_total": 0,
          "finish_retries_total": 0, "header_retries_total": 0,
-         "active": 0, "daily": {}, "daily_by_model": {}}
+         "active": 0, "daily": {}, "daily_by_model": {},
+         # v2 P2 速度观测（内存态，不持久化——save/load 白名单均不含此四键，重启清零）
+         "ttfb_hist": {},    # {"<model>": [0]*9}，模型 cap 复用 BY_MODEL_CAP（R4：仅按模型，不按阶段）
+         "phase_ms": {"connect": [0] * 9, "headers": [0] * 9, "body": [0] * 9},  # 全局三阶段（R4：不按模型）
+         "rates": {"bytes_out_total": 0, "chunks_total": 0, "tokens_total": 0,
+                   "window_start": time.monotonic(), "window_bytes": 0,
+                   "window_chunks": 0, "window_tokens": 0},  # 60s 滑动窗（P2 bytes/chunks；tokens P3 填）
+         "stalls_total": 0}
 _stats_dirty = False  # STATS_LOCK 保护：计数落盘脏标记（SIGTERM/60s 脏刷消费）
 STARTED_AT = time.time()
 RECENT_REQUESTS = collections.deque(maxlen=100)  # {"ts","method","path","status","dur_ms","filtered","model","rid","upstream_host","ttfb_ms","stream","tokens","bytes_out","outcome"}
@@ -1427,6 +1435,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             conn = http.client.HTTPConnection(
                 parsed.hostname, parsed.port, timeout=HEADER_TIMEOUT_S)
         conn.request(method, upstream_path, body=body, headers=fwd_headers)
+        self._t_request_sent = time.monotonic()  # v2 P2：connect+TLS+请求发送完成时刻（phase connect/headers 分界）
         # getresponse() 成功返回后 conn.sock 会被置 None（socket 移交 HTTPResponse 的
         # fp.raw），因此必须在此之前保留自己的引用；该引用与 HTTPResponse 包装的是
         # 同一 socket 对象，settimeout 作用于体阶段读（不 poke resp.fp.raw._sock）。
@@ -1449,6 +1458,13 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
     def _relay_sse(self, resp: http.client.HTTPResponse, final: bool) -> tuple:
         old_timeout = self.connection.gettimeout()
         self.connection.settimeout(SEND_TIMEOUT_S)
+        # v2 P2 打点状态：每 record 一次 monotonic + 整数加法，零锁；stall 自增
+        # <0.1% record 命中才持 STATS_LOCK（R1 热路径纪律）。重试二次进入时此处重置，
+        # 空流尝试的残留值不会漏进交付流。
+        self._t_first_byte_mark = None  # 首个非毒 record 交付时刻（TTFB 首字节口径）
+        self._relay_bytes = 0
+        self._relay_chunks = 0
+        self._t_last_record = None      # 相邻 record 间隔基线（stall 检测）
         try:
             filtered = 0
             saw_done = False   # 全程（priming+streaming）是否见过 [DONE] record
@@ -1464,8 +1480,14 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             def _flush_primed() -> None:
                 """补发 SSE 头 + primed 缓冲并 flush，切换出 priming。"""
                 self._send_sse_headers(resp)
-                self.wfile.write(b"".join(primed))
+                primed_bytes = b"".join(primed)
+                self.wfile.write(primed_bytes)
                 self.wfile.flush()
+                now = time.monotonic()
+                if self._t_first_byte_mark is None:
+                    self._t_first_byte_mark = now  # v2 P2：TTFB 首字节口径
+                self._t_last_record = now           # v2 P2：stall 间隔基线
+                self._relay_bytes += len(primed_bytes)
 
             while True:
                 line = resp.readline()
@@ -1489,6 +1511,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                         primed.extend(pending)
                         if line:
                             primed.append(line)
+                        self._relay_chunks += 1  # v2 P2：每非毒 record 计一 chunk（毒 record 已在上面 filtered 分支）
                         if not saw_usage:
                             saw_usage = any(sse_line_has_usage(l) for l in pending)
                         if finish_hold:
@@ -1508,11 +1531,22 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                         elif "finish" in kinds:
                             finish_hold = True    # hold 至 EOF 判 usage
                     else:
+                        now = time.monotonic()
+                        if self._t_last_record is not None \
+                                and now - self._t_last_record > STALL_THRESHOLD_S:
+                            # v2 P2：stall 自增是热循环内唯一持锁点，且仅跨阈值间隙命中
+                            # （正常流相邻 record 间隔 << 阈值，<0.1% 命中；R1 纪律）
+                            with STATS_LOCK:
+                                STATS["stalls_total"] += 1
+                        self._t_last_record = now
                         for buf_line in pending:
                             self.wfile.write(buf_line)
+                            self._relay_bytes += len(buf_line)
                         if line:
                             self.wfile.write(line)
+                            self._relay_bytes += len(line)
                         self.wfile.flush()
+                        self._relay_chunks += 1
                     pending = []
                     poisoned = False
                     if line == b"":
@@ -1540,6 +1574,10 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
     def _relay_buffered(self, resp: http.client.HTTPResponse) -> bytes:
         data = resp.read()
+        t_body_done = time.monotonic()   # v2 P2：非流式无首字节事件，TTFB 口径 = t_body_done - t_conn_start（spec P2）
+        self._t_first_byte_mark = t_body_done
+        self._relay_bytes = len(data)
+        self._relay_chunks = 1           # 非流式 = 单 chunk
         self.send_response(resp.status)
         for name, value in resp.getheaders():
             if name.lower() in ("content-length", "transfer-encoding", "connection"):
