@@ -704,6 +704,14 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         self.assertEqual(
             f(b'data: {"choices":[{"delta":{"tool_calls":[{"id":"t1"}]},'
               b'"finish_reason":"stop"}]}\n'), "content")
+        # error frame -> "content" (not "noise") — spec 集成关踺：error 帧视为 content
+        # 触发 priming flush、不触发空流重试
+        self.assertEqual(
+            f(b'data: {"error":{"message":"TPM limit","type":"rate_limit_error"}}\n'),
+            "content")
+        self.assertEqual(
+            f(b'data: {"error":{"message":"model x not found"}}\r\n'),
+            "content")
 
     def test_sse_line_has_usage_matrix(self) -> None:
         f = self.mod.sse_line_has_usage
@@ -727,6 +735,57 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         self.assertFalse(f(b"data:\n"))
         # 假：usage 非 dict（如列表）
         self.assertFalse(f(b'data: {"usage":[1,2,3],"choices":[]}\n'))
+
+    def test_body_has_error_matrix(self) -> None:
+        f = self.mod.body_has_error
+        # dict with error dict -> True (OpenAI error schema)
+        self.assertTrue(f({"error": {"message": "TPM limit", "type": "rate_limit_error",
+                                    "code": "model_tpm_limit"}}))
+        self.assertTrue(f({"error": {"message": "x"}}))
+        # error key present but value not dict -> False
+        self.assertFalse(f({"error": "string error"}))
+        self.assertFalse(f({"error": None}))
+        self.assertFalse(f({"error": [1, 2, 3]}))
+        self.assertFalse(f({"error": 42}))
+        # error key missing -> False
+        self.assertFalse(f({"choices": [{"delta": {"content": "hi"}}]}))
+        self.assertFalse(f({}))
+        # not dict -> False
+        self.assertFalse(f("not a dict"))
+        self.assertFalse(f(None))
+        self.assertFalse(f([1, 2, 3]))
+        self.assertFalse(f(42))
+        # dict with both choices and error -> True (error takes priority)
+        self.assertTrue(f({"error": {"message": "x"}, "choices": [{"delta": {}}]}))
+        # error dict containing nested "choices" key -> True
+        self.assertTrue(f({"error": {"message": "x", "choices": [{}]}}))
+
+    def test_sse_line_body_error_matrix(self) -> None:
+        f = self.mod.sse_line_body_error
+        # error frame -> True
+        self.assertTrue(f(b'data: {"error":{"message":"TPM limit",'
+                         b'"type":"rate_limit_error","code":"model_tpm_limit"}}\n'))
+        self.assertTrue(f(b'data: {"error":{"message":"x","type":"t","code":"c"}}\r\n'))
+        # normal content line -> False
+        self.assertFalse(f(b'data: {"choices":[{"delta":{"content":"A"}}]}\n'))
+        # content mentioning "error" in text -> False (no string matching)
+        self.assertFalse(f(b'data: {"choices":[{"delta":{"content":"error occurred"}}]}\n'))
+        # string error value -> False (body_has_error rejects non-dict error)
+        self.assertFalse(f(b'data: {"error":"string_err"}\n'))
+        self.assertFalse(f(b'data: {"error":null}\n'))
+        # non-data prefix -> False
+        self.assertFalse(f(b': keepalive\n'))
+        self.assertFalse(f(b'event: message\n'))
+        self.assertFalse(f(b'id: 42\n'))
+        # [DONE] -> False
+        self.assertFalse(f(b'data: [DONE]\n'))
+        self.assertFalse(f(b'data:[DONE]\r\n'))
+        # non-JSON data -> False (fail-open like sse_line_has_usage)
+        self.assertFalse(f(b'data: {not-json\n'))
+        # empty data -> False
+        self.assertFalse(f(b'data: \n'))
+        # non-dict JSON -> False
+        self.assertFalse(f(b'data: [1,2,3]\n'))
 
     def test_stats_persist_roundtrip_and_defaults(self) -> None:
         mod = self.mod
@@ -1508,6 +1567,41 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             f(status=None)
 
+    def test_classify_outcome_body_error(self) -> None:
+        mod = self.mod
+        f = mod.classify_outcome
+        # body_error=True -> CLASS_BODY_ERROR / "body-err" / counts_error=True / capture=True
+        o = f(body_error=True)
+        self.assertEqual(o.category, mod.CLASS_BODY_ERROR)
+        self.assertEqual(o.log_result, "body-err")
+        self.assertTrue(o.counts_error)
+        self.assertTrue(o.capture)
+        # body_error default False: status=200 stays CLASS_OK (no regression)
+        o = f(status=200)
+        self.assertEqual(o.category, mod.CLASS_OK)
+        self.assertEqual(o.log_result, "ok")
+        self.assertFalse(o.counts_error)
+        # priority: client_abort > body_error
+        o = f(client_abort=True, body_error=True)
+        self.assertEqual(o.category, mod.CLASS_CLIENT_ABORT)
+        self.assertEqual(o.log_result, "aborted")
+        # priority: synth_502 > body_error
+        o = f(synth_502=True, body_error=True)
+        self.assertEqual(o.category, mod.CLASS_UPSTREAM_FAULT)
+        self.assertEqual(o.log_result, "error")
+        # priority: body_error > eof_without_done
+        o = f(body_error=True, eof_without_done=True)
+        self.assertEqual(o.category, mod.CLASS_BODY_ERROR)
+        self.assertEqual(o.log_result, "body-err")
+        # body_error + status=200: body_error wins over status < 400
+        o = f(status=200, body_error=True)
+        self.assertEqual(o.category, mod.CLASS_BODY_ERROR)
+        self.assertEqual(o.log_result, "body-err")
+        # body_error=False (default): no impact on status-based classification
+        self.assertEqual(f(status=200).category, mod.CLASS_OK)
+        self.assertEqual(f(status=502).category, mod.CLASS_UPSTREAM_FAULT)
+        self.assertEqual(f(status=200, poison_filtered=1).category, mod.CLASS_POISON_FIXED)
+
     def test_empty_stream_should_retry(self) -> None:
         f = self.mod.empty_stream_should_retry
         self.assertTrue(f(1))
@@ -1770,6 +1864,14 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         self.assertFalse(f(-1))
         self.assertEqual(not f(0), not 0 > 0)
         self.assertEqual(not f(1), not 1 > 0)
+
+    def test_kind_category_body_error(self) -> None:
+        mod = self.mod
+        self.assertEqual(mod._KIND_CATEGORY.get(mod.ERR_KIND_BODY_ERROR),
+                         mod.CLASS_BODY_ERROR,
+                         "body_error must map to body_error category")
+        self.assertEqual(len(mod._KIND_CATEGORY), 8,
+                         "must have exactly 8 kind-category mappings")
 
     def test_header_timeout_kind_category_and_classify_regression(self) -> None:
         mod = self.mod

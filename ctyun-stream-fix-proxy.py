@@ -73,6 +73,9 @@ ERR_KIND_UPSTREAM_5XX = "upstream_5xx"
 ERR_KIND_REQUEST_4XX = "request_4xx"
 ERR_KIND_HEADER_TIMEOUT = "header_timeout"
 
+CLASS_BODY_ERROR = "body_error"
+ERR_KIND_BODY_ERROR = "body_error"
+
 _KIND_CATEGORY = {
     ERR_KIND_POISON: CLASS_POISON_FIXED,
     ERR_KIND_EMPTY_RETRY: CLASS_OK,
@@ -81,6 +84,7 @@ _KIND_CATEGORY = {
     ERR_KIND_UPSTREAM_5XX: CLASS_UPSTREAM_FAULT,
     ERR_KIND_REQUEST_4XX: CLASS_REQUEST_FAULT,
     ERR_KIND_HEADER_TIMEOUT: CLASS_UPSTREAM_FAULT,
+    ERR_KIND_BODY_ERROR: CLASS_BODY_ERROR,
 }
 
 
@@ -88,6 +92,7 @@ def sse_data_line_kind(line: bytes) -> str:
     """SSE data 行归类："done" / "content" / "finish" / "noise"。判定序：
     非 data: 前缀（注释行/event:/id:）→ noise；[DONE] → done；
     JSON 解析失败 → content（fail-open：宁可不重试，不误判合法流）；
+    dict 且顶层 error 对象 → content（body error 帧视为 content，触发 priming flush 不重试）；
     dict + choices 非空 list 时：delta.content 非空 str / delta.tool_calls 真值 →
     content；choice.finish_reason 非 None（且无前两者）→ finish；
     其余（reasoning-only、空 delta、choices 为空的 usage 帧、data:null、非 dict JSON）→ noise。"""
@@ -102,6 +107,8 @@ def sse_data_line_kind(line: bytes) -> str:
         return "content"
     if not isinstance(data, dict):
         return "noise"
+    if body_has_error(data):
+        return "content"
     choices = data.get("choices")
     if not isinstance(choices, list) or not choices:
         return "noise"
@@ -116,6 +123,17 @@ def sse_data_line_kind(line: bytes) -> str:
     if choice.get("finish_reason") is not None:
         return "finish"
     return "noise"
+
+
+def body_has_error(parsed) -> bool:
+    """判 JSON 解析值是否含顶层 error 对象（OpenAI 错误 schema）。
+    isinstance(parsed, dict) 且 isinstance(parsed.get("error"), dict) → True；
+    其余（非 dict、error 键缺失、error 为 str/null/list）→ False。
+    不做字符串匹配：content 文本出现 "error" 字样不误判。"""
+    if not isinstance(parsed, dict):
+        return False
+    error_val = parsed.get("error")
+    return isinstance(error_val, dict)
 
 
 def sse_line_has_usage(line: bytes) -> bool:
@@ -134,20 +152,37 @@ def sse_line_has_usage(line: bytes) -> bool:
     return isinstance(usage, dict) and bool(usage)
 
 
+def sse_line_body_error(line: bytes) -> bool:
+    """判 SSE data 行是否为 body error 帧。rstrip → 非 data: 前缀或 [DONE] →
+    False；json.loads ValueError → False（fail-open 同 sse_line_has_usage）；
+    否则 return body_has_error(data)。"""
+    stripped = line.rstrip(b"\r\n")
+    if not stripped.startswith(b"data:") or DONE_RE.match(stripped):
+        return False
+    try:
+        data = json.loads(stripped[5:].strip().decode("utf-8", "replace"))
+    except ValueError:
+        return False
+    return body_has_error(data)
+
+
 _Outcome = collections.namedtuple("_Outcome", "category log_result counts_error capture")
 
 
 def classify_outcome(status=None, synth_502=False, client_abort=False,
-                     eof_without_done=False, poison_filtered=0) -> _Outcome:
+                     eof_without_done=False, poison_filtered=0,
+                     body_error=False) -> _Outcome:
     """错误分类网关：输入场景标志 → 返回 (category, log_result, counts_error, capture)。
 
-    判定优先级 client_abort > synth_502 > eof_without_done > status 阈值；
+    判定优先级 client_abort > synth_502 > body_error > eof_without_done > status 阈值；
     status=None 且无 flags → ValueError。
     """
     if client_abort:
         return _Outcome(CLASS_CLIENT_ABORT, "aborted", False, False)
     if synth_502:
         return _Outcome(CLASS_UPSTREAM_FAULT, "error", True, True)
+    if body_error:
+        return _Outcome(CLASS_BODY_ERROR, "body-err", True, True)
     if eof_without_done:
         return _Outcome(CLASS_UPSTREAM_FAULT, "eof-without-done", False, True)
     if status is None:
