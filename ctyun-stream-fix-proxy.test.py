@@ -10,6 +10,7 @@
 """
 
 import collections
+import hashlib
 import contextlib
 import http.client
 import importlib.util
@@ -899,6 +900,168 @@ class ProxyDashboardUnitTest(unittest.TestCase):
                          "env seam subprocess failed stderr:\n" + proc.stderr)
         parts = proc.stdout.strip().split()
         self.assertEqual(parts, ["50000", "30", "5", "10.0", "0.3", "8"])
+
+    def _tpm_cleanup(self, mod):
+        mod.TPM_BUCKETS.clear()
+        mod.TPM_WAITERS.clear()
+        mod._tpm_rejected.clear()
+        mod._tpm_timeouts.clear()
+
+    def test_tpm_key_id(self) -> None:
+        f = self.mod.tpm_key_id
+        self.assertIsNone(f(None))
+        self.assertIsNone(f(""))
+        self.assertIsNone(f("Basic dXNlcjpwYXNz"))
+        self.assertIsNone(f("Bearer"))
+        self.assertIsNone(f("Bearer   "))  # 空 token
+        kid1 = f("Bearer test-key-1")
+        self.assertIsInstance(kid1, str)
+        self.assertEqual(len(kid1), 64)  # sha256 hex 全位
+        self.assertEqual(f("Bearer test-key-1"), kid1)  # 确定性
+        self.assertEqual(f("bearer test-key-1"), kid1)  # scheme 大小写不敏感
+        self.assertNotEqual(f("Bearer test-key-2"), kid1)
+
+    def test_estimate_request_tokens(self) -> None:
+        f = self.mod.estimate_request_tokens
+        ratio = self.mod.TPM_TOKEN_RATIO
+        self.assertEqual(f(b""), 1)
+        self.assertEqual(f(None), 1)
+        body = b'{"model":"x","stream":true,"messages":[]}'
+        self.assertEqual(f(body), max(1, int(len(body) * ratio)))
+        body2 = b'{"model":"x","max_tokens":4096,"messages":[]}'
+        self.assertEqual(f(body2), max(1, int(len(body2) * ratio)) + 4096)
+        # max_tokens 非 int（str/null/bool）不累加
+        for non_int in (b'{"max_tokens":"4096"}', b'{"max_tokens":null}',
+                        b'{"max_tokens":true}'):
+            self.assertEqual(f(non_int), max(1, int(len(non_int) * ratio)))
+        # 非 JSON → 裸长度估（fail-open）
+        self.assertEqual(f(b"plain text"), max(1, int(10 * ratio)))
+
+    def test_tpm_prune(self) -> None:
+        mod = self.mod
+        bucket = mod._TpmBucket()
+        bucket.used = 0
+        now = 1000.0
+        bucket.append((now - 90, 100))   # 窗口外（window=60），先入队保持时间序
+        bucket.append((now - 30, 500))
+        bucket.used = 600
+        mod._tpm_prune(bucket, now)
+        self.assertEqual(len(bucket), 1)  # 窗口内保留
+        mod._tpm_prune(bucket, now)
+        self.assertEqual(len(bucket), 1)
+        self.assertEqual(bucket.used, 500)
+        bucket.used = -10                 # 钳制 ≥0
+        mod._tpm_prune(bucket, now)
+        self.assertEqual(bucket.used, 0)
+
+    def test_tpm_admit_ok_immediate(self) -> None:
+        mod = self.mod
+        self._tpm_cleanup(mod)
+        status, qwait = mod.tpm_admit("key:imm", 100)
+        self.assertEqual(status, "ok")
+        self.assertEqual(qwait, 0)
+        self.assertEqual(mod.TPM_BUCKETS["key:imm"].used, 100)
+        self.assertEqual(len(mod.TPM_WAITERS), 0)
+
+    def test_tpm_admit_full_oversized(self) -> None:
+        mod = self.mod
+        self._tpm_cleanup(mod)
+        status, qwait = mod.tpm_admit("key:big", mod.TPM_LIMIT + 1)
+        self.assertEqual(status, "full")
+        self.assertEqual(qwait, 0)
+        self.assertNotIn("key:big", mod.TPM_BUCKETS)  # 不入桶
+        self.assertEqual(len(mod.TPM_WAITERS), 0)     # 不入队
+
+    def test_tpm_admit_queue_full(self) -> None:
+        mod = self.mod
+        self._tpm_cleanup(mod)
+        mod.TPM_QUEUE_MAX = 2
+        try:
+            mod.tpm_admit("key:qfull", mod.TPM_LIMIT)  # 占满预算
+            # 两个 waiter 已在队（绕过 wait 循环用私有结构直接入队，验证队满拒绝分支）
+            with mod.TPM_LOCK:
+                mod.TPM_WAITERS.append(mod._TpmWaiter("key:qfull", 1, 0))
+                mod.TPM_WAITERS.append(mod._TpmWaiter("key:qfull", 1, 0))
+            status3, qwait3 = mod.tpm_admit("key:qfull", 1)
+            self.assertEqual(status3, "full")
+            self.assertEqual(qwait3, 0)
+            self.assertEqual(mod._tpm_rejected.get("key:qfull"), 1)
+            self.assertEqual(len(mod.TPM_WAITERS), 2)  # 第三个未入队
+        finally:
+            mod.TPM_QUEUE_MAX = 20
+            self._tpm_cleanup(mod)
+
+    def test_tpm_settle_corrects_usage(self) -> None:
+        mod = self.mod
+        self._tpm_cleanup(mod)
+        mod.tpm_admit("key:settle", 500)
+        # 实际 200 → 退款 300
+        mod.tpm_settle("key:settle", 500, 200)
+        self.assertEqual(mod.TPM_BUCKETS["key:settle"].used, 200)
+        # 实际 800 → 追加 300
+        mod.tpm_settle("key:settle", 500, 800)
+        self.assertEqual(mod.TPM_BUCKETS["key:settle"].used, 500)
+        # 0 → 全额退款
+        mod.tpm_settle("key:settle", 500, 0)
+        self.assertEqual(mod.TPM_BUCKETS["key:settle"].used, 0)
+
+    def test_tpm_settle_notifies_waiters(self) -> None:
+        mod = self.mod
+        self._tpm_cleanup(mod)
+        mod.TPM_QUEUE_TIMEOUT_S = 5.0
+        results = {}
+        # 占满预算
+        mod.tpm_admit("key:wake", mod.TPM_LIMIT)
+        def waiter():
+            results["w"] = mod.tpm_admit("key:wake", 10)
+        t = threading.Thread(target=waiter)
+        t.start()
+        time.sleep(0.2)  # 给 waiter 入队时间（确定性：settle 后立即 notify）
+        self.assertEqual(len(mod.TPM_WAITERS), 1)
+        mod.tpm_settle("key:wake", mod.TPM_LIMIT, 0)  # 全额退款唤醒
+        t.join(timeout=5)
+        self.assertFalse(t.is_alive())
+        self.assertIn("w", results)
+        self.assertEqual(results["w"][0], "ok")
+        self.assertGreaterEqual(results["w"][1], 0)
+        mod.TPM_QUEUE_TIMEOUT_S = 120
+
+    def test_tpm_admit_queue_timeout(self) -> None:
+        mod = self.mod
+        self._tpm_cleanup(mod)
+        mod.TPM_QUEUE_TIMEOUT_S = 0.3
+        try:
+            mod.tpm_admit("key:to", mod.TPM_LIMIT)  # 占满
+            started = time.time()
+            status, qwait = mod.tpm_admit("key:to", 10)
+            self.assertEqual(status, "timeout")
+            self.assertLess(time.time() - started, 3.0)
+            self.assertEqual(mod._tpm_timeouts.get("key:to"), 1)
+            self.assertEqual(len(mod.TPM_WAITERS), 0)  # 已自队列移除
+        finally:
+            mod.TPM_QUEUE_TIMEOUT_S = 120
+            self._tpm_cleanup(mod)
+
+    def test_tpm_snapshot_shape_and_masking(self) -> None:
+        mod = self.mod
+        self._tpm_cleanup(mod)
+        mod.tpm_admit(mod.tpm_key_id("Bearer key:snap"), 100)
+        snap = mod.tpm_snapshot()
+        self.assertEqual(snap["config"]["limit"], mod.TPM_LIMIT)
+        self.assertEqual(snap["config"]["window_s"], mod.TPM_WINDOW_S)
+        self.assertEqual(snap["config"]["queue_max"], mod.TPM_QUEUE_MAX)
+        self.assertEqual(snap["queue_total"], 0)
+        self.assertEqual(len(snap["buckets"]), 1)
+        b = snap["buckets"][0]
+        # key 脱敏：sha256: 前缀 + sha256(key) 前 12 位 hex
+        expected_short = "sha256:" + hashlib.sha256(b"key:snap").hexdigest()[:12]
+        self.assertEqual(b["key"], expected_short)
+        self.assertNotIn("key:snap", b["key"])  # 无原始 key 泄漏
+        self.assertEqual(b["used"], 100)
+        self.assertEqual(b["remaining"], mod.TPM_LIMIT - 100)
+        self.assertEqual(b["queued"], 0)
+        self.assertEqual(b["rejected"], 0)
+        self.assertEqual(b["timeouts"], 0)
 
     def test_stats_persist_roundtrip_and_defaults(self) -> None:
         mod = self.mod

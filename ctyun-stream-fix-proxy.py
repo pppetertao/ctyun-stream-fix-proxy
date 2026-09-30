@@ -10,6 +10,7 @@ CTYUN_PERSIST_PATH / CTYUN_ADMIN_TOKEN 环境变量为测试与部署 seam。
 """
 
 import base64
+import hashlib
 import collections
 import datetime
 import hmac
@@ -237,6 +238,202 @@ def classify_outcome(status=None, synth_502=False, client_abort=False,
         return _Outcome(CLASS_REQUEST_FAULT, "upstream-err", False, True)
     # status >= 500
     return _Outcome(CLASS_UPSTREAM_FAULT, "upstream-err", False, True)
+
+
+# --- TPM rate limiting（module-level state，全部由 TPM_LOCK 保护）---
+
+_TpmWaiter = collections.namedtuple("_TpmWaiter", "key_id est enqueued_at")
+
+# collections.deque 是 C 类型无 __dict__，不能挂 .used 属性；Python 空子类有
+# __dict__ 可承载 .used，而 len()/popleft/append/迭代语义与原 deque 完全一致
+class _TpmBucket(collections.deque):
+    pass
+
+TPM_LOCK = threading.Condition()
+TPM_BUCKETS: dict = {}                 # key_id -> _TpmBucket（deque 条目 + 附加属性 .used）
+TPM_WAITERS: collections.deque = collections.deque()  # FIFO 排队（of _TpmWaiter）
+_tpm_rejected: dict = {}               # key_id -> queue-full 拒绝计数（快照用）
+_tpm_timeouts: dict = {}               # key_id -> queue-timeout 计数（快照用）
+
+
+def tpm_key_id(auth_header):
+    """从 Authorization 头提取 per-key 标识。
+
+    无头 / 非 "Bearer " 前缀 / 空 token → None（= 不限流直通）；
+    否则返回 token 的 sha256 hex 全位（内部桶键用全位防碰撞，
+    快照对外只显前 12 位脱敏）。
+    """
+    if not auth_header:
+        return None
+    parts = auth_header.split(None, 1)
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        return None
+    token = parts[1].strip()
+    if not token:
+        return None
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def estimate_request_tokens(body):
+    """准入估算：max(1, int(len(body) * TPM_TOKEN_RATIO))；
+    body 可解析为 JSON 且含 int max_tokens 时累加该值（输出预留）。
+    非 JSON body 按裸长度估（fail-open），永不抛出。
+    """
+    if not body:
+        return 1
+    base = max(1, int(len(body) * TPM_TOKEN_RATIO))
+    try:
+        data = json.loads(body.decode("utf-8", "replace"))
+    except ValueError:
+        # 吞掉的是非 JSON 请求体（GET/表单/二进制属常态）：按裸长度估即可。
+        return base
+    if isinstance(data, dict):
+        mt = data.get("max_tokens")
+        if isinstance(mt, int) and not isinstance(mt, bool) and mt > 0:
+            base += mt
+    return base
+
+
+def _tpm_prune(bucket, now: float) -> None:
+    """裁剪 bucket 中 now - TPM_WINDOW_S 之前的条目并同步 .used。
+
+    bucket 为 collections.deque（条目 (ts, tokens)，delta 可为负），
+    .used 为其增量维护的窗口内 token 合计；popleft 时同步扣减。
+    仅可在持 TPM_LOCK 时调用。
+    """
+    cutoff = now - TPM_WINDOW_S
+    while bucket and bucket[0][0] < cutoff:
+        _, tokens = bucket.popleft()
+        bucket.used -= tokens
+    if bucket.used < 0:  # 浮点边界/重入保护：钳制 ≥0
+        bucket.used = 0
+
+
+def _tpm_get_bucket(key_id: str):
+    """取 key 的桶；不存在则惰性创建（cap 满时先驱逐空桶）。仅在 TPM_LOCK 内调用。"""
+    bucket = TPM_BUCKETS.get(key_id)
+    if bucket is None:
+        if len(TPM_BUCKETS) >= TPM_KEY_CAP:
+            # 惰性驱逐：窗口空且无排队的桶（窗口自动过期，最旧优先）
+            idle = [k for k, b in TPM_BUCKETS.items()
+                    if b.used <= 0
+                    and not any(w.key_id == k for w in TPM_WAITERS)]
+            for k in idle:
+                del TPM_BUCKETS[k]
+        bucket = _TpmBucket()
+        bucket.used = 0
+        TPM_BUCKETS[key_id] = bucket
+    return bucket
+
+
+def tpm_admit(key_id: str, est: int):
+    """TPM 准入（与入队同锁，原子）。返回 (status, qwait_ms)。
+
+    status: "ok"（准入）/ "full"（队列满或 est 超预算，立即 429）/
+            "timeout"（排队超时，429）。
+    规则：
+    - est > TPM_LIMIT → 直接 ("full", 0)（永远等不到，不入队）。
+    - 窗口内充足 → 入桶 ("ok", 0)。
+    - 否则入队 FIFO；仅队首 waiter 可被准入（严格 FIFO 防惊群）；
+      wait 循环 TPM_LOCK.wait(timeout=min(1.0, remaining)) + deadline 检查
+      （窗口过期靠 1s 粒度轮询，settle 时 notify_all 提前唤醒）。
+    - 队满（len(TPM_WAITERS) >= TPM_QUEUE_MAX）→ ("full", 0) 不入队。
+    - deadline 到仍未准入 → ("timeout", 0) 并自队列移除。
+    排队期间不持有任何上游连接（hook 点在 _open_upstream 之前）。
+    """
+    if est > TPM_LIMIT:
+        return ("full", 0)
+    started = time.time()
+    with TPM_LOCK:
+        bucket = _tpm_get_bucket(key_id)
+        _tpm_prune(bucket, started)
+        if bucket.used + est <= TPM_LIMIT:
+            bucket.append((started, est))
+            bucket.used += est
+            return ("ok", 0)
+        if len(TPM_WAITERS) >= TPM_QUEUE_MAX:
+            _tpm_rejected[key_id] = _tpm_rejected.get(key_id, 0) + 1
+            return ("full", 0)
+        waiter = _TpmWaiter(key_id=key_id, est=est, enqueued_at=started)
+        TPM_WAITERS.append(waiter)
+        deadline = started + TPM_QUEUE_TIMEOUT_S
+        try:
+            while True:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    _tpm_timeouts[key_id] = _tpm_timeouts.get(key_id, 0) + 1
+                    return ("timeout", 0)
+                head = TPM_WAITERS[0] if TPM_WAITERS else None
+                if head is waiter:
+                    now = time.time()
+                    bucket = _tpm_get_bucket(key_id)
+                    _tpm_prune(bucket, now)
+                    if bucket.used + est <= TPM_LIMIT:
+                        TPM_WAITERS.popleft()
+                        bucket.append((now, est))
+                        bucket.used += est
+                        return ("ok", (now - started) * 1000)
+                TPM_LOCK.wait(timeout=min(1.0, remaining))
+        finally:
+            if waiter in TPM_WAITERS:
+                # 超时/异常路径把自己从队列移除；已 popleft 的正常准入不会走到这
+                try:
+                    TPM_WAITERS.remove(waiter)
+                except ValueError:
+                    pass  # 已被并发 popleft：无其他路径可达，正常结束
+
+
+def tpm_settle(key_id: str, est: int, actual: int) -> None:
+    """结算：以实际 usage 校正窗口占用。
+
+    prune 后追加校正条目 (now, delta)，delta = actual - est（可为负 = 退款），
+    used 钳制 ≥0。settle 后 notify_all 唤醒排队 waiter 重试准入。
+    """
+    now = time.time()
+    with TPM_LOCK:
+        bucket = TPM_BUCKETS.get(key_id)
+        if bucket is None:
+            return  # 该 key 从未准入（不可能路径，防御处理）
+        _tpm_prune(bucket, now)
+        delta = actual - est
+        if delta != 0:
+            bucket.append((now, delta))
+        bucket.used = max(0, bucket.used + delta)
+        TPM_LOCK.notify_all()
+
+
+def tpm_snapshot() -> dict:
+    """TPM 状态快照（/api/tpm_stats 端点用）。
+
+    返回 {"config": {"limit", "window_s", "queue_max"},
+          "queue_total", "buckets": [...]}；
+    bucket 条目 {"key"（sha256: 前缀 + 前 12 位 hex）, "used", "remaining",
+                 "queued", "rejected", "timeouts"}——key 脱敏，无原始 key 泄漏。
+    """
+    now = time.time()
+    with TPM_LOCK:
+        buckets = []
+        for key_id, bucket in TPM_BUCKETS.items():
+            _tpm_prune(bucket, now)
+            if bucket.used <= 0 and not any(w.key_id == key_id for w in TPM_WAITERS):
+                continue  # 空桶不展示（噪声）
+            buckets.append({
+                "key": "sha256:" + key_id[:12],
+                "used": bucket.used,
+                "remaining": max(0, TPM_LIMIT - bucket.used),
+                "queued": sum(1 for w in TPM_WAITERS if w.key_id == key_id),
+                "rejected": _tpm_rejected.get(key_id, 0),
+                "timeouts": _tpm_timeouts.get(key_id, 0),
+            })
+        return {
+            "config": {
+                "limit": TPM_LIMIT,
+                "window_s": TPM_WINDOW_S,
+                "queue_max": TPM_QUEUE_MAX,
+            },
+            "queue_total": len(TPM_WAITERS),
+            "buckets": buckets,
+        }
 
 
 def empty_stream_should_retry(budget: int) -> bool:
