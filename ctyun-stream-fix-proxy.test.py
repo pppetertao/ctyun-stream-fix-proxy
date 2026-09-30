@@ -1095,15 +1095,18 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         self.assertIsNot(w1, w2)      # 但非同一对象
         mod.TPM_WAITERS.append(w1)
         mod.TPM_WAITERS.append(w2)
+        # 值相等实现（deque.remove(waiter)）在摘 w2 时会误删队首 w1 —— 本用例必红。
         with mod.TPM_LOCK:
-            mod._tpm_remove_waiter(w1)
+            mod._tpm_remove_waiter(w2)
         self.assertEqual(len(mod.TPM_WAITERS), 1,
                          "identity removal must drop exactly one entry, got %d"
                          % len(mod.TPM_WAITERS))
-        self.assertTrue(any(w is w2 for w in mod.TPM_WAITERS),
-                        "value-equal twin w2 must survive removal of w1")
+        self.assertTrue(any(w is w1 for w in mod.TPM_WAITERS),
+                        "head twin w1 must survive removal of w2")
+        self.assertFalse(any(w is w2 for w in mod.TPM_WAITERS),
+                         "removed waiter w2 must be gone from the queue")
         with mod.TPM_LOCK:
-            mod._tpm_remove_waiter(w2)
+            mod._tpm_remove_waiter(w1)
         self.assertEqual(len(mod.TPM_WAITERS), 0)
         self._tpm_cleanup(mod)
 
