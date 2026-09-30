@@ -781,73 +781,647 @@ feat(proxy): add _reply_tpm_429, /api/tpm_stats endpoint, and _log TPM fields
 
 ---
 
-### Card 4 [A] — _proxy_relay 准入 hook + SSE 结算 + buffered 结算 + 错误退款
+### Card 4 [A] — _proxy_relay 准入 hook + SSE/buffered 结算 + 错误退款
 
-- **文件**: `ctyun-stream-fix-proxy.py`
-- **关键逻辑与锚点**:
-  - **准入 hook**（`:879` _proxy_relay，body 读取 `:882` 之后、`_open_upstream` `:900` 之前）:
-    ```
-    key_id = tpm_key_id(self.headers.get("Authorization"))
-    if key_id is not None:
-        est = estimate_request_tokens(body)
-        status, qwait_ms = tpm_admit(key_id, est)
-        if status in ("full", "timeout"):
-            self._reply_tpm_429(status)
-            self._log(started, 429, status, 0, model=model, qwait_ms=qwait_ms)
-            _record_request(self.command, self.path, 429, ...error=True)
-            record_error_event(ERR_KIND_TPM_QUEUE_FULL or _TIMEOUT, ...)
+- **Tier**: A（spec 决策 1/3/4 已定死插入位、行为与日志口径；无运行时留白）
+- **文件**: `ctyun-stream-fix-proxy.py`、`ctyun-stream-fix-proxy.test.py`
+- **TDD 顺序**: 先写失败集成测试（`test_tpm_queue_full_immediate_429`——无准入 hook 时第 3 请求直通 200 而非 429，红）→ 实现生产代码 → 验证 → commit。注：卡 4 的其余测试场景与卡 5 共享，卡 4 用最小子集证明 hook 存在。
+- **依赖**: 卡 1（常量/kind）、卡 2（tpm_admit/tpm_settle）、卡 3（_reply_tpm_429/_log kwargs）全部函数。
+
+#### 生产代码（完整，可直接落盘）
+
+**1) 准入 hook（插入 `_proxy_relay` body 读取/`extract_model` `:882-883` 之后、`_open_upstream` `:900` 之前）**
+
+上下文锚（`ctyun-stream-fix-proxy.py:879-900`）:
+```python
+    def _proxy_relay(self, started: float) -> None:
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length) if length > 0 else None
+        model = extract_model(body)
+        body = normalize_null_assistant_content(body)
+
+        fwd_headers = {}
+        ...
+        fwd_headers["accept-encoding"] = "identity"
+
+        header_retried = 0
+        header_retry_reason = ""
+        try:
+            try:
+                conn, resp = self._open_upstream(self.command, self.path, body, fwd_headers)
+```
+
+在 `body = normalize_null_assistant_content(body)` 之后插入（TDD 要点：`tpm_key`/`tpm_est`/`tpm_qwait_ms`/`tpm_final_used` 为方法级变量，header 重试与空流重试复用同一次 charge）:
+
+```python
+        # --- TPM 准入 hook（_open_upstream 之前；重试复用本次准入不重复 charge）---
+        tpm_key = tpm_key_id(self.headers.get("Authorization"))
+        tpm_est = 0
+        tpm_qwait_ms = None
+        tpm_final_used = None
+        if tpm_key is not None:
+            tpm_est = estimate_request_tokens(body)
+            tpm_status, tpm_qwait_ms = tpm_admit(tpm_key, tpm_est)
+            if tpm_status in ("full", "timeout"):
+                # 锁外记录（tpm_admit 已释放 TPM_LOCK，锁序安全）
+                self._reply_tpm_429(tpm_status)
+                result = ("tpm-queue-full" if tpm_status == "full"
+                          else "tpm-queue-timeout")
+                self._log(started, 429, result, 0, model=model, qwait_ms=tpm_qwait_ms)
+                _record_request(self.command, self.path, 429,
+                                (time.time() - started) * 1000, 0,
+                                model=model, error=True)
+                record_error_event(
+                    ERR_KIND_TPM_QUEUE_FULL if tpm_status == "full"
+                    else ERR_KIND_TPM_QUEUE_TIMEOUT,
+                    model=model, path=self.path, body=body)
+                return
+```
+
+要点:
+- 429 路径 return 后不持任何锁；`_record_request`（STATS_LOCK）与 `record_error_event`（ERROR_LOCK）都在 TPM_LOCK 释放后调用，无锁序反转。
+- `tpm_admit` 排队期间（`TPM_LOCK.wait`）不持有上游连接：hook 点在 `_open_upstream` 之前。
+- header 重试（`:909-919`）与空流重试（`:942-966`）路径直接复用 `tpm_key`/`tpm_est` 变量，`_open_upstream` 二次调用前**不再** `tpm_admit`——一次请求一次准入。
+
+**2) SSE 结算（在 `_proxy_relay` SSE 分支 `record_error_event` `:988-992` 之后、`self._log` `:993` 之前插入）**
+
+上下文锚（`:988-997`）:
+```python
+                record_error_event(kind, model=model, path=self.path,
+                                   upstream_status=(resp.status
+                                                    if resp.status >= 400 else None),
+                                   body=body, filtered=filtered,
+                                   response=self._body_err_line if body_error else None)
+            self._log(started, resp.status, result, filtered, model=model, retried=retried,
+                      retry_reason=retry_reason)
+            _record_request(self.command, self.path, resp.status,
+                            (time.time() - started) * 1000, filtered, model=model,
+                            error=outcome.counts_error)
+```
+
+替换为（插入 TPM settle + _log 扩展）:
+
+```python
+                record_error_event(kind, model=model, path=self.path,
+                                   upstream_status=(resp.status
+                                                    if resp.status >= 400 else None),
+                                   body=body, filtered=filtered,
+                                   response=self._body_err_line if body_error else None)
+            # TPM settle：用上游实际 usage 校正窗口占用（无 usage 帧不校正）
+            tpm_final_used = tpm_est if tpm_key is not None else None
+            if tpm_key is not None and self._tpm_usage is not None:
+                total = self._tpm_usage.get("total_tokens")
+                if isinstance(total, int) and total >= 0:
+                    tpm_settle(tpm_key, tpm_est, total)
+                    tpm_final_used = total
+            self._log(started, resp.status, result, filtered, model=model, retried=retried,
+                      retry_reason=retry_reason,
+                      qwait_ms=tpm_qwait_ms,
+                      tpm_used=tpm_final_used if tpm_key is not None else None)
+            _record_request(self.command, self.path, resp.status,
+                            (time.time() - started) * 1000, filtered, model=model,
+                            error=outcome.counts_error)
+```
+
+**3) buffered 结算（`_relay_buffered` 分支 `:999-1012` 内）**
+
+上下文锚（`:999-1012`）:
+```python
+        else:
+            relayed_data = self._relay_buffered(resp)
+            body_error = False
+            if relayed_data:
+                try:
+                    parsed = json.loads(relayed_data.decode("utf-8", "replace"))
+                except ValueError:
+                    pass  # non-JSON body -> no body error, fail-open
+                else:
+                    body_error = body_has_error(parsed)
+            outcome = classify_outcome(status=resp.status, body_error=body_error)
+            self._log(started, resp.status, outcome.log_result, 0, model=model)
+            _record_request(self.command, self.path, resp.status,
+                            (time.time() - started) * 1000, 0, model=model,
+                            error=outcome.counts_error)
+```
+
+替换为:
+
+```python
+        else:
+            relayed_data = self._relay_buffered(resp)
+            body_error = False
+            tpm_final_used = tpm_est if tpm_key is not None else None
+            if relayed_data:
+                try:
+                    parsed = json.loads(relayed_data.decode("utf-8", "replace"))
+                except ValueError:
+                    pass  # non-JSON body -> no body error, fail-open
+                else:
+                    body_error = body_has_error(parsed)
+                    # TPM settle：解析 usage.total_tokens 校正（非 dict / 无 usage 不校正）
+                    if tpm_key is not None and isinstance(parsed, dict):
+                        usage = parsed.get("usage")
+                        if isinstance(usage, dict):
+                            total = usage.get("total_tokens")
+                            if isinstance(total, int) and total >= 0:
+                                tpm_settle(tpm_key, tpm_est, total)
+                                tpm_final_used = total
+            outcome = classify_outcome(status=resp.status, body_error=body_error)
+            self._log(started, resp.status, outcome.log_result, 0, model=model,
+                      qwait_ms=tpm_qwait_ms,
+                      tpm_used=tpm_final_used if tpm_key is not None else None)
+            _record_request(self.command, self.path, resp.status,
+                            (time.time() - started) * 1000, 0, model=model,
+                            error=outcome.counts_error)
+```
+
+**4) 502/异常路径全额退款（两处 synth_502 return 前插入）**
+
+位置 A：首个 `_open_upstream` 的 except（`:920-931`）:
+
+上下文锚:
+```python
+        except (OSError, http.client.HTTPException) as exc:
+            self._reply_502(exc)
+            outcome = classify_outcome(synth_502=True)
+            self._log(started, 502, outcome.log_result, 0, model=model, exc=exc,
+                      retried=header_retried, retry_reason=header_retry_reason)
+            _record_request(self.command, self.path, 502,
+                            (time.time() - started) * 1000, 0,
+                            model=model, error=outcome.counts_error)
+            record_error_event(ERR_KIND_SYNTH_502, model=model, path=self.path,
+                               exc=exc, body=body,
+                               retried=header_retried, retry_reason=header_retry_reason)
             return
-    ```
-    - `record_error_event` 调用必须在 `TPM_LOCK` 释放后（429 分支 `return` 后不持锁，安全）
-  - **header 重试/空流重试复用准入**（`:909` / `:942`）: `_open_upstream` 重试前不重新 `tpm_admit`；body 同一份。需要在 `_proxy_relay` 入口处将 `key_id`、`est`、`admit_called` 存为局部变量，重试路径复用——不重复 charge。**每个 `_open_upstream` 调用前不做新准入**（一次请求一次准入）。
-  - **SSE 结算**（`:1056` _relay_sse）:
-    - 在 `saw_usage` 判定处（`:1094-1095`）用 `sse_line_usage` 提取 usage dict 存入 `self._tpm_usage`（取最后非空帧）
-    - 流结束（`:1133` truncated / 正常 EOF）后，在 `_proxy_relay` 中 `_relay_sse` 返回后调用 `tpm_settle(key_id, est, usage.total_tokens)`（若有 usage 帧）
-    - 无 usage 帧不校正（不调 settle）
-  - **buffered 结算**（`:999` _relay_buffered 分支）:
-    - 解析 `relayed_data` JSON（`:1003` 同处）取 `usage.total_tokens` → `tpm_settle(key_id, est, usage.total_tokens)`
-    - 502/异常路径（`:920-931` synth_502）: `tpm_settle(key_id, est, 0)` 全额退款
-  - **`_body_err_line` 判定** path（`:968-969`）正常 settle 同 SSE
-  - **client_abort 路径**（`:865`）: 不 settle（无可靠 usage 数据，且窗口自动过期）
-- **验收**: 准入 hook 位于 `_open_upstream` 之前；429 路径不调 `_open_upstream`；header 重试不重复准入（通过 calls 计数验证）；`_relay_sse` 结束后 `tpm_settle` 被调用；buffered 路径解析 usage 后 settle；502 synth 全额退款
-- **Anchor grep 验证**:
-  ```
-  :879:  def _proxy_relay(self, started: float) -> None:          ← 函数入口
-  :880:  length = int(self.headers.get("Content-Length") or 0)    ← body 读取前
-  :882:  model = extract_model(body)                              ← 准入 hook 插入位（之后）
-  :900:  conn, resp = self._open_upstream(...)                    ← 准入 hook 插入位（之前）
-  :909:  if not header_timeout_should_retry(...):                 ← header 重试起点
-  :942:  except _EmptyStream as exc:                              ← 空流重试起点
-  :939:  filtered, truncated = self._relay_sse(resp, ...)         ← SSE 调用点
-  :1056: def _relay_sse(self, resp: ..., final: bool) -> tuple:   ← SSE relay 函数
-  :1094: if not saw_usage:                                        ← Usage 捕获点
-  :1095:     saw_usage = any(sse_line_has_usage(l) for l in pending)  ← 现有逻辑
-  :1131: raise _EmptyStream(filtered, primed)                     ← EOF 空流
-  :1133: truncated = not saw_done                                  ← 正常 EOF 截断标记
-  :999:  relayed_data = self._relay_buffered(resp)                ← buffered 分支
-  :1003: parsed = json.loads(relayed_data.decode(...))            ← JSON 解析点
-  :920:  except (OSError, http.client.HTTPException) as exc:      ← synth_502 路径
-  ```
-- **Commit**: `feat(proxy): integrate TPM admission and usage settlement into relay paths`
+```
+
+替换为:
+
+```python
+        except (OSError, http.client.HTTPException) as exc:
+            self._reply_502(exc)
+            # TPM 退款：上游不可达/响应头阶段异常 → 全额退款
+            if tpm_key is not None:
+                tpm_settle(tpm_key, tpm_est, 0)
+            outcome = classify_outcome(synth_502=True)
+            self._log(started, 502, outcome.log_result, 0, model=model, exc=exc,
+                      retried=header_retried, retry_reason=header_retry_reason,
+                      qwait_ms=tpm_qwait_ms,
+                      tpm_used=0 if tpm_key is not None else None)
+            _record_request(self.command, self.path, 502,
+                            (time.time() - started) * 1000, 0,
+                            model=model, error=outcome.counts_error)
+            record_error_event(ERR_KIND_SYNTH_502, model=model, path=self.path,
+                               exc=exc, body=body,
+                               retried=header_retried, retry_reason=header_retry_reason)
+            return
+```
+
+位置 B：空流重试 `_open_upstream` 的 except（`:953-964`）:
+
+上下文锚:
+```python
+                    self._reply_502(retry_exc)  # 客户端尚未收到字节，502 语义与既有路径一致
+                    outcome = classify_outcome(synth_502=True)
+                    self._log(started, 502, outcome.log_result, 0, model=model, retried=1,
+                              retry_reason=retry_reason, exc=retry_exc)
+                    _record_request(self.command, self.path, 502,
+                                    (time.time() - started) * 1000, 0, model=model,
+                                    error=outcome.counts_error)
+                    record_error_event(ERR_KIND_SYNTH_502, model=model, path=self.path,
+                                       exc=retry_exc, body=body,
+                                       retried=1, retry_reason=retry_reason)
+                    return
+```
+
+替换为:
+
+```python
+                    self._reply_502(retry_exc)  # 客户端尚未收到字节，502 语义与既有路径一致
+                    # TPM 退款：重试仍失败 → 全额退款
+                    if tpm_key is not None:
+                        tpm_settle(tpm_key, tpm_est, 0)
+                    outcome = classify_outcome(synth_502=True)
+                    self._log(started, 502, outcome.log_result, 0, model=model, retried=1,
+                              retry_reason=retry_reason, exc=retry_exc,
+                              qwait_ms=tpm_qwait_ms,
+                              tpm_used=0 if tpm_key is not None else None)
+                    _record_request(self.command, self.path, 502,
+                                    (time.time() - started) * 1000, 0, model=model,
+                                    error=outcome.counts_error)
+                    record_error_event(ERR_KIND_SYNTH_502, model=model, path=self.path,
+                                       exc=retry_exc, body=body,
+                                       retried=1, retry_reason=retry_reason)
+                    return
+```
+
+**5) usage 帧捕获（`_relay_sse` `:1082` saw_done 判定之后插入）**
+
+上下文锚（`:1081-1086`）:
+```python
+                    kinds = [sse_data_line_kind(buf_line) for buf_line in pending]
+                    saw_done = saw_done or ("done" in kinds)
+                    if self._body_err_line is None:
+                        hit = next((l for l in pending if sse_line_body_error(l)), None)
+                        if hit is not None:
+                            self._body_err_line = hit
+```
+
+替换为（记录级公共路径，priming 与 streaming 阶段都覆盖，取最后非空 usage 帧）:
+
+```python
+                    kinds = [sse_data_line_kind(buf_line) for buf_line in pending]
+                    saw_done = saw_done or ("done" in kinds)
+                    # TPM usage 捕获：本 record 内所有行取最后非空 usage 帧
+                    for buf_line in pending:
+                        usage_hit = sse_line_usage(buf_line)
+                        if usage_hit is not None:
+                            self._tpm_usage = usage_hit
+                    if self._body_err_line is None:
+                        hit = next((l for l in pending if sse_line_body_error(l)), None)
+                        if hit is not None:
+                            self._body_err_line = hit
+```
+
+**6) `self._tpm_usage` 初始化（两处，镜像既有 `self._body_err_line = None` 模式）**
+
+位置 A（`:938`）:
+```python
+                self._body_err_line = None
+                self._tpm_usage = None
+                filtered, truncated = self._relay_sse(resp,
+                    final=not empty_stream_should_retry(EMPTY_RETRY_MAX))
+```
+
+位置 B（`:965`）:
+```python
+                self._body_err_line = None
+                self._tpm_usage = None
+                filtered, truncated = self._relay_sse(resp, final=True)
+```
+
+#### 测试代码（完整，可直接落盘）
+
+**卡 4 最小失败测试**（证明准入 hook 存在；其余全量场景在卡 5）。新增 `TpmAdmitHookTest(unittest.TestCase)` 到 `ctyun-stream-fix-proxy.test.py`（放在 `BodyErrorTest` 类之后、`if __name__ == "__main__"` 之前）。
+
+**前置 helper（模块级，放在 `admin_post` `:529` 之后）**:
+
+```python
+def post_sse_auth(port: int, payload: bytes, auth_header: str = None,
+                  timeout: int = 30):
+    """带可选 Authorization 头的 POST /v1/chat/completions。
+    与 post_sse 不同：不断言 status 200，返回 (status, body)。"""
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+    headers = {"Content-Type": "application/json"}
+    if auth_header:
+        headers["Authorization"] = auth_header
+    conn.request("POST", "/v1/chat/completions", body=payload, headers=headers)
+    resp = conn.getresponse()
+    data = resp.read()
+    conn.close()
+    return resp.status, data
+```
+
+**测试类**:
+
+```python
+class TpmAdmitHookTest(unittest.TestCase):
+    """TPM 准入 hook 冒烟：est 超预算的带 key 请求被 429 拦截（不触上游）。"""
+
+    def setUp(self) -> None:
+        self.upstream_port, self.calls = make_scripted_upstream(
+            body_override=SSE_A + SSE_B + SSE_DONE)
+        self.proxy_port = free_port()
+        self.proc = start_proxy(self.upstream_port, self.proxy_port,
+                                extra_env={"CTYUN_TPM_LIMIT": "50"})
+
+    def tearDown(self) -> None:
+        if self.proc:
+            self.proc.terminate()
+            self.proc.wait(timeout=5)
+            stderr_text(self.proc)
+            shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+            stop_fake_upstreams()
+
+    def test_oversized_est_rejected_before_upstream(self) -> None:
+        """est > TPM_LIMIT(50) 的请求直接 429，上游 calls 计数不变。"""
+        # len ~200 bytes → est = max(1, 200*0.55) = 110 > 50
+        big = (b'{"model":"x","stream":true,"messages":[{"role":"user","content":"'
+               + b"y" * 140 + b'"}]}')
+        status, data = post_sse_auth(self.proxy_port, big, "Bearer test-key")
+        self.assertEqual(status, 429, "oversized est must be rejected, got body %r"
+                         % data[:120])
+        parsed = json.loads(data.decode("utf-8"))
+        self.assertEqual(parsed["error"]["code"], "model_tpm_limit")
+        self.assertEqual(self.calls, [], "rejected request must not hit upstream")
+        # 无 Authorization 的同体请求直通
+        status2, _ = post_sse_auth(self.proxy_port, big, None)
+        self.assertEqual(status2, 200, "no-auth request must bypass TPM")
+        self.assertEqual(len(self.calls), 1)
+```
+
+#### 验证命令
+
+```bash
+python3 ctyun-stream-fix-proxy.test.py TpmAdmitHookTest -v 2>&1 | tail -10
+```
+
+#### Commit
+
+```
+feat(proxy): integrate TPM admission and usage settlement into relay paths
+```
 
 ---
 
 ### Card 5 [A] — 全量集成测试 + 回归
 
+- **Tier**: A（8 个测试函数的 seam 参数、断言目标、fake upstream 行为全部由卡 1-4 已写死的接口与 spec Acceptance 定死，无运行时留白）
 - **文件**: `ctyun-stream-fix-proxy.test.py`
-- **测试类**: `TpmRateLimitTest(unittest.TestCase)`（继承自 `unittest.TestCase`，对齐 `AdminIntegrationTest`/`BodyErrorTest` 模式）
-- **测试函数**（覆盖 Acceptance 全部 8 条）:
-  1. `test_queue_exhaustion_and_window_roll` — 窗口耗尽排队：首发大 body 占满 budget（`CTYUN_TPM_LIMIT=200`）后，第二请求阻塞至窗口滚过（～1s poll）+ stderr 含 `qwait=` 且 `tpm=` 数值正确
-  2. `test_queue_timeout_returns_429` — 排队超时：用 `CTYUN_TPM_QUEUE_TIMEOUT_S=2`，预算不释放 → 第二请求 2s 后收 429，body 字节等于定死 JSON，REQ 行 `result=tpm-queue-timeout`
-  3. `test_queue_full_immediate_429` — 队列满：`CTYUN_TPM_QUEUE_MAX=2`，3 并发中第 3 个立即 429，`result=tpm-queue-full`
-  4. `test_usage_settle_releases_budget` — usage 回填：fake upstream 回 `SSE_USAGE`（total_tokens=2）后 settle 释放预算，后续请求不等窗口滚过即放行
-  5. `test_sse_passthrough_under_rate_limiting` — SSE 透传不破坏：限流生效路径下 `post_sse` 输出仍字节等于 `SSE_A+SSE_B+SSE_DONE` 且以 `data: [DONE]` 结尾
-  6. `test_no_auth_bypasses_tpm` — 无 Authorization 头请求直通不限流（`get_plain`）
-  7. `test_tpm_stats_endpoint` — `/api/tpm_stats` 返回 200 JSON，bucket `used`/`rejected`/`timeouts` 与 REQ 行计数一致，key 字段 `sha256:` 前缀脱敏
-  8. `test_all_existing_tests_pass` — 既有 127 例无回归
-- **测试 seam**: `start_proxy(extra_env={"CTYUN_TPM_LIMIT": "200", "CTYUN_TPM_QUEUE_TIMEOUT_S": "2", "CTYUN_TPM_QUEUE_MAX": "2"})`
-- **验收**: `python3 ctyun-stream-fix-proxy.test.py` 全绿（含既有 127 例 + 新增全部 TPM 用例）
-- **Commit**: `test(proxy): add TPM rate limiting integration tests`
+- **依赖**: 卡 2 的 `import hashlib`（test 7 脱敏断言用）、卡 4 的模块级 `post_sse_auth`（:529 之后，8 用例均复用）；生产代码由卡 1-4 落盘
+- **TDD 顺序**: 纯测试卡（生产代码已由卡 1-4 交付）——新增 8 用例后 `python3 ctyun-stream-fix-proxy.test.py TpmRateLimitTest` 必须全绿（对应已实现的生产代码）；红 → 卡 1-4 生产代码有缺陷，回卡修复，不改本卡
+- **测试类**: `TpmRateLimitTest(unittest.TestCase)`（对齐 `AdminIntegrationTest`/`BodyErrorTest` 模式：每用例独立 fake upstream + 代理子进程）
+
+#### 测试代码（完整，可直接落盘）
+
+**放置位置**: `ctyun-stream-fix-proxy.test.py` 末尾（卡 4 的 `TpmAdmitHookTest` 之后、`if __name__ == "__main__"` `:3496` 之前）。
+
+**确定性设计**（防 flaky，对齐 Global Constraint 4）:
+- env seam 压缩时间：`CTYUN_TPM_LIMIT=200`、`CTYUN_TPM_WINDOW_S=2`（窗口滚过 ~2s）、`CTYUN_TPM_QUEUE_TIMEOUT_S=5`（wait 循环 1s 粒度轮询的 2 倍余量）；超时用例单独 `CTYUN_TPM_QUEUE_TIMEOUT_S=2` + `CTYUN_TPM_WINDOW_S=60`（超时必然先于窗口滚过）。
+- body 无 usage 帧（`body_override=SSE_A+SSE_B+SSE_DONE`）→ 不触发 settle → 预算稳定占用至窗口滚过，排队/超时/队满路径可确定性复现。
+- 字节数实测算死（ratio 0.55）：`small_body` 41B→est 22；`big_body`（`"x"*280`）349B→est 191≤200；`mid_body`（`"x"*20`）89B→est 48≤60。断言中 est 一律用 `max(1, int(len(body) * 0.55))` 现算（与估算公式自洽，不受模板微调影响）。
+
+```python
+class TpmRateLimitTest(unittest.TestCase):
+    """TPM 限流全量集成测试（spec Acceptance ①-⑧ 除部署条）。
+
+    复用 make_scripted_upstream / start_proxy / post_sse / get_plain / admin_get /
+    post_sse_auth（卡 4）/ stderr_text / stop_fake_upstreams；env seam 把 60s 窗口、
+    120s 超时压缩到秒级。唯一时间断言（窗口滚过 ≥1s、settle 放行 <1s、超时 ~2s）
+    全部由 1s 粒度轮询 + seam 余量保证，无 sleep 猜测依赖。
+    """
+
+    def setUp(self) -> None:
+        self.upstream_port, self.calls = make_scripted_upstream(
+            body_override=SSE_A + SSE_B + SSE_DONE)   # 无 usage 帧 → 不 settle
+        self.proxy_port = free_port()
+        self.proc = start_proxy(self.upstream_port, self.proxy_port,
+                                extra_env={"CTYUN_TPM_LIMIT": "200",
+                                           "CTYUN_TPM_WINDOW_S": "2",
+                                           "CTYUN_TPM_QUEUE_TIMEOUT_S": "5",
+                                           "CTYUN_TPM_QUEUE_MAX": "2"})
+
+    def tearDown(self) -> None:
+        if self.proc:
+            self.proc.terminate()
+            self.proc.wait(timeout=5)
+            stderr_text(self.proc)
+            shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+            stop_fake_upstreams()
+
+    def test_queue_exhaustion_and_window_roll(self) -> None:
+        """窗口耗尽排队：首发大 body 占满预算（est 191/200）后，第二请求阻塞至
+        窗口滚过（WINDOW_S=2）后放行；stderr 含 qwait=（>0）且 tpm= 数值正确。"""
+        big_body = (b'{"model":"m","stream":true,"messages":[{"role":"user","content":"'
+                    + b"x" * 280 + b'"}]}')   # 349B → est = int(349*0.55) = 191 ≤ 200
+        small_body = b'{"model":"m","stream":true,"messages":[]}'   # 41B → est = 22
+        auth = "Bearer test-key-roll"
+        status1, _ = post_sse_auth(self.proxy_port, big_body, auth)
+        self.assertEqual(status1, 200, "first request must be admitted")
+        # 191+22=213 > 200 → 排队；无 settle，预算保持至窗口滚过（~2s）后放行
+        t0 = time.time()
+        status2, data2 = post_sse_auth(self.proxy_port, small_body, auth)
+        elapsed = time.time() - t0
+        self.assertEqual(status2, 200,
+                         "queued request must be admitted after window roll, got %d"
+                         % status2)
+        self.assertEqual(data2, SSE_A + SSE_B + SSE_DONE)
+        self.assertGreaterEqual(elapsed, 1.0,
+                                "second request must actually queue (≥1s), got %.2fs"
+                                % elapsed)
+        # stderr：qwait= 出现且排队请求 qwait>0；tpm= 与估算公式一致（ratio 0.55）
+        stderr = stderr_text(self.proc)
+        qwait_ms = [int(m) for m in re.findall(r"qwait=(\d+)ms", stderr)]
+        self.assertTrue(any(v > 0 for v in qwait_ms),
+                        "queued request must log qwait>0ms, stderr:\n" + stderr)
+        expected_big = max(1, int(len(big_body) * 0.55))
+        expected_small = max(1, int(len(small_body) * 0.55))
+        self.assertIn("tpm=%d" % expected_big, stderr,
+                      "first REQ line must carry tpm=%d, stderr:\n%s"
+                      % (expected_big, stderr))
+        self.assertIn("tpm=%d" % expected_small, stderr,
+                      "second REQ line must carry tpm=%d, stderr:\n%s"
+                      % (expected_small, stderr))
+
+    def test_queue_timeout_returns_429(self) -> None:
+        """排队超时：预算不释放 → 第二请求 ~2s（seam 值）后收 429，
+        body 字节等于定死 JSON，REQ 行 result=tpm-queue-timeout，且不触上游。"""
+        # 重建代理：小预算 + 短超时 + 长窗口（超时必然先于窗口滚过触发）
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_fake_upstreams()
+        upstream_port, calls = make_scripted_upstream(
+            body_override=SSE_A + SSE_B + SSE_DONE)
+        self.proxy_port = free_port()
+        self.proc = start_proxy(upstream_port, self.proxy_port,
+                                extra_env={"CTYUN_TPM_LIMIT": "60",
+                                           "CTYUN_TPM_WINDOW_S": "60",
+                                           "CTYUN_TPM_QUEUE_TIMEOUT_S": "2",
+                                           "CTYUN_TPM_QUEUE_MAX": "2"})
+        mid_body = (b'{"model":"m","stream":true,"messages":[{"role":"user","content":"'
+                    + b"x" * 20 + b'"}]}')   # 89B → est = int(89*0.55) = 48 ≤ 60
+        small_body = b'{"model":"m","stream":true,"messages":[]}'   # est = 22
+        auth = "Bearer test-key-timeout"
+        status1, _ = post_sse_auth(self.proxy_port, mid_body, auth)
+        self.assertEqual(status1, 200, "first request must be admitted")
+        # 48+22=70 > 60 → 排队；窗口 60s 不滚、无 settle → 2s 超时 → 429
+        t0 = time.time()
+        status2, data2 = post_sse_auth(self.proxy_port, small_body, auth)
+        elapsed = time.time() - t0
+        self.assertEqual(status2, 429,
+                         "queued request must timeout with 429, got %d" % status2)
+        self.assertGreaterEqual(elapsed, 1.0,
+                                "timeout must be seam value (~2s), got %.2fs" % elapsed)
+        # body 字节等于定死 JSON（与 _reply_tpm_429 payload 全等）
+        expected_429 = ('{"error":{"message":"模型请求 TPM 超限，请减少 tokens 后重试",'
+                        '"type":"rate_limit_error","code":"model_tpm_limit"}}').encode("utf-8")
+        self.assertEqual(data2, expected_429,
+                         "429 body must be the fixed JSON, got %r" % data2[:200])
+        parsed = json.loads(data2.decode("utf-8"))
+        self.assertEqual(parsed["error"]["code"], "model_tpm_limit")
+        # REQ 行 result=tpm-queue-timeout；超时请求不触上游（calls 仅首发 1 次）
+        stderr = stderr_text(self.proc)
+        self.assertIn("result=tpm-queue-timeout", stderr,
+                      "REQ line must carry result=tpm-queue-timeout, stderr:\n" + stderr)
+        self.assertEqual(len(calls), 1,
+                         "timed-out request must not hit upstream, calls=%d" % len(calls))
+
+    def test_queue_full_immediate_429(self) -> None:
+        """队列满：QUEUE_MAX=2，3 并发中第 3 个立即 429，REQ 行 result=tpm-queue-full。"""
+        big_body = (b'{"model":"m","stream":true,"messages":[{"role":"user","content":"'
+                    + b"x" * 280 + b'"}]}')   # est = 191/200，占满预算
+        small_body = b'{"model":"m","stream":true,"messages":[]}'   # est = 22
+        auth = "Bearer test-key-qfull"
+        status1, _ = post_sse_auth(self.proxy_port, big_body, auth)
+        self.assertEqual(status1, 200, "first request must be admitted")
+        # 预算已满（无 settle）→ 3 并发全撞队：前 2 个入队（QUEUE_MAX=2），
+        # 第 3 个立即 429（barrier 同步起点，三请求准入竞争窗口 < 窗口滚过 2s）
+        barrier = threading.Barrier(3)
+        results = []
+        lock = threading.Lock()
+        def do_req():
+            barrier.wait()
+            r = post_sse_auth(self.proxy_port, small_body, auth)
+            with lock:
+                results.append(r)
+        threads = [threading.Thread(target=do_req) for _ in range(3)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=15)
+        statuses = sorted(r[0] for r in results)
+        self.assertEqual(statuses, [200, 200, 429],
+                         "exactly 1 of 3 concurrent must be immediate 429 (2 queue, "
+                         "admitted after roll), got %r" % statuses)
+        stderr = stderr_text(self.proc)
+        self.assertIn("result=tpm-queue-full", stderr,
+                      "REQ line must carry result=tpm-queue-full, stderr:\n" + stderr)
+
+    def test_usage_settle_releases_budget(self) -> None:
+        """usage 回填：fake upstream 回 SSE_USAGE（total_tokens=2）→ settle 校正预算，
+        后续请求不等窗口滚过即放行；tpm_stats bucket used == 4（2+2）。"""
+        # 重建代理：上游回带 usage 帧的流（每次 POST 都含 SSE_USAGE）
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_fake_upstreams()
+        upstream_port, calls = make_scripted_upstream(
+            body_override=SSE_USAGE + SSE_A + SSE_B + SSE_DONE)
+        self.proxy_port = free_port()
+        self.proc = start_proxy(upstream_port, self.proxy_port,
+                                extra_env={"CTYUN_TPM_LIMIT": "200",
+                                           "CTYUN_TPM_WINDOW_S": "10",
+                                           "CTYUN_TPM_QUEUE_TIMEOUT_S": "5",
+                                           "CTYUN_TPM_QUEUE_MAX": "2"})
+        big_body = (b'{"model":"m","stream":true,"messages":[{"role":"user","content":"'
+                    + b"x" * 280 + b'"}]}')   # est = 191，settle → 2（释放 189）
+        small_body = b'{"model":"m","stream":true,"messages":[]}'   # est = 22
+        auth = "Bearer test-key-settle"
+        status1, _ = post_sse_auth(self.proxy_port, big_body, auth)
+        self.assertEqual(status1, 200, "first request must be admitted")
+        # settle 已把预算从 191 校正到 2 → 第二请求立即准入（无窗口等待）
+        t0 = time.time()
+        status2, _ = post_sse_auth(self.proxy_port, small_body, auth)
+        elapsed = time.time() - t0
+        self.assertEqual(status2, 200,
+                         "second request must be admitted after settle, got %d" % status2)
+        self.assertLess(elapsed, 1.0,
+                        "settle must release budget immediately (no window wait), got %.2fs"
+                        % elapsed)
+        # stderr：两次 REQ 行 tpm=2（settle 后按实际 usage 记）
+        stderr = stderr_text(self.proc)
+        self.assertGreaterEqual(stderr.count("tpm=2"), 2,
+                                "both REQ lines must carry tpm=2, stderr:\n" + stderr)
+        # tpm_stats：两次 settle 后 bucket used == 2+2 = 4（与 est 无关的稳健断言）
+        time.sleep(0.5)   # settle 在 conn.close 前已发生（卡 4 插入位），余量防客户端 EOF 竞态
+        _, body, _ = admin_get(self.proc.admin_port, "/api/tpm_stats")
+        snap = json.loads(body.decode("utf-8"))
+        self.assertEqual(len(snap["buckets"]), 1)
+        self.assertEqual(snap["buckets"][0]["used"], 4,
+                         "bucket used must be 4 (2+2) after both settles, got %r"
+                         % snap["buckets"][0])
+
+    def test_sse_passthrough_under_rate_limiting(self) -> None:
+        """SSE 透传不破坏：限流生效路径（带 Authorization 经 tpm_admit）下
+        输出仍字节等于 SSE_A+SSE_B+SSE_DONE 且以 data: [DONE] 结尾。"""
+        small_body = b'{"model":"m","stream":true,"messages":[]}'   # est = 22 ≤ 200
+        auth = "Bearer test-key-passthrough"
+        status, data = post_sse_auth(self.proxy_port, small_body, auth)
+        self.assertEqual(status, 200)
+        self.assertEqual(data, SSE_A + SSE_B + SSE_DONE,
+                         "SSE output must be byte-exact under rate limiting, got %r"
+                         % data[:200])
+        self.assertTrue(data.rstrip().endswith(b"data: [DONE]"),
+                        "stream must end with data: [DONE], got tail: %r" % data[-40:])
+
+    def test_no_auth_bypasses_tpm(self) -> None:
+        """无 Authorization 头请求直通不限流（get_plain + 无 auth POST），
+        stderr 无任何 TPM 字段。"""
+        plain_data, plain_len = get_plain(self.proxy_port)   # 无 auth，内部断言 200
+        self.assertIsNotNone(plain_data)
+        data = post_sse(self.proxy_port)   # 无 auth 默认 payload，内部断言 200
+        self.assertEqual(data, SSE_A + SSE_B + SSE_DONE)
+        stderr = stderr_text(self.proc)
+        self.assertNotIn("qwait=", stderr,
+                         "no-auth requests must not log TPM fields, stderr:\n" + stderr)
+        self.assertNotIn("tpm=", stderr)
+        self.assertNotIn("tpm-queue", stderr)
+
+    def test_tpm_stats_endpoint(self) -> None:
+        """/api/tpm_stats 返回 200 JSON：config 与 env seam 一致，bucket used 与
+        REQ 行 tpm= 计数一致，key 字段 sha256: 前缀脱敏（无原始 key 泄漏）。"""
+        small_body = b'{"model":"m","stream":true,"messages":[]}'   # 41B → est = 22
+        auth = "Bearer test-key-stats"
+        status, _ = post_sse_auth(self.proxy_port, small_body, auth)
+        self.assertEqual(status, 200)
+        expected_used = max(1, int(len(small_body) * 0.55))   # 无 usage 帧 → used 保持 est
+        status, body, ctype = admin_get(self.proc.admin_port, "/api/tpm_stats")
+        self.assertEqual(status, 200)
+        self.assertTrue(ctype and ctype.startswith("application/json"),
+                        "Content-Type must be application/json, got %r" % ctype)
+        snap = json.loads(body.decode("utf-8"))
+        self.assertEqual(snap["config"], {"limit": 200, "window_s": 2, "queue_max": 2},
+                         "config must reflect env seams, got %r" % snap["config"])
+        self.assertEqual(snap["queue_total"], 0)
+        self.assertEqual(len(snap["buckets"]), 1)
+        b = snap["buckets"][0]
+        # key 脱敏：sha256(token) 前 12 位 hex，无原始 key（依赖卡 2 的 import hashlib）
+        expected_short = "sha256:" + hashlib.sha256(b"test-key-stats").hexdigest()[:12]
+        self.assertEqual(b["key"], expected_short,
+                         "bucket key must be sha256: prefix + 12 hex, got %r" % b["key"])
+        self.assertNotIn("test-key-stats", b["key"], "bucket key must not leak raw key")
+        self.assertEqual(b["used"], expected_used,
+                         "bucket used must match REQ line tpm= value")
+        self.assertEqual(b["remaining"], 200 - expected_used)
+        self.assertEqual(b["queued"], 0)
+        self.assertEqual(b["rejected"], 0)
+        self.assertEqual(b["timeouts"], 0)
+        # 与 REQ 行交叉校验：tpm= 数值 == bucket used
+        stderr = stderr_text(self.proc)
+        self.assertIn("tpm=%d" % expected_used, stderr,
+                      "REQ line must carry tpm=%d, stderr:\n%s" % (expected_used, stderr))
+
+    def test_all_existing_tests_pass(self) -> None:
+        """既有 127 例无回归冒烟：TPM env 开启下 SSE 透传/plain 透传/统计端点正常。"""
+        data = post_sse(self.proxy_port)   # 无 auth → 既有路径，零 TPM 介入
+        self.assertEqual(data, SSE_A + SSE_B + SSE_DONE)
+        self.assertTrue(data.rstrip().endswith(b"data: [DONE]"))
+        plain_data, plain_len = get_plain(self.proxy_port)
+        self.assertIsNotNone(plain_data)
+        status, body, ctype = admin_get(self.proc.admin_port, "/api/stats")
+        self.assertEqual(status, 200)
+        snap = json.loads(body.decode("utf-8"))
+        self.assertGreaterEqual(snap["requests_total"], 2)
+        self.assertIn("filtered=0", stderr_text(self.proc))
+```
+
+#### 验证命令
+
+```bash
+# 本卡 8 用例（含窗口滚过 ~2s、排队超时 ~2s、3 并发队满，单类 ~20s）
+python3 ctyun-stream-fix-proxy.test.py TpmRateLimitTest -v 2>&1 | tail -25
+# 全量回归（spec Acceptance ①：既有 127 例 + 新增全部 TPM 用例全绿）
+python3 ctyun-stream-fix-proxy.test.py 2>&1 | tail -5
+```
+
+#### Commit
+
+```
+test(proxy): add TPM rate limiting integration tests
+```
 
 ---
 
@@ -894,4 +1468,123 @@ $ grep -n 'class ProxyHandler\|class AdminHandler' ctyun-stream-fix-proxy.py
 
 ---
 
-*B0 skeleton — 卡代码块由 B1..B5 逐卡填充。Self-Review 由 B-final 执行。*
+## B-final Self-Review
+
+### 1. Spec Coverage（spec Acceptance 5 条 + 部署 1 条，逐条命中）
+
+| # | Acceptance（spec :31-38） | 覆盖卡/测试 |
+|---|--------------------------|------------|
+| 1 | `python3 ctyun-stream-fix-proxy.test.py` 全绿（含既有 127 例无回归） | 卡 1-5 均附验证命令；卡 5 验证命令含全量跑 + `test_all_existing_tests_pass` 冒烟 |
+| 2 | 窗口耗尽排队：fake upstream 下第二请求阻塞至窗口滚过后放行，stderr 含 `qwait=` 且 `tpm=` 数值正确 | 卡 5 `test_queue_exhaustion_and_window_roll`（elapsed ≥1s 证明排队 + regex 提取 qwait>0 + `tpm=%d` 自洽断言） |
+| 3 | 排队超时：预算不释放时第二请求 ~2s 后收 429，body 字节全等定死 JSON，REQ 行 `result=tpm-queue-timeout` | 卡 5 `test_queue_timeout_returns_429`（byte 全等断言 + parsed error.code + stderr result 字段） + 卡 3 `test_tpm_429_reply_payload`（payload 格式单测） |
+| 4 | 队列满：`CTYUN_TPM_QUEUE_MAX=2` 时第 3 并发立即 429，`result=tpm-queue-full` | 卡 5 `test_queue_full_immediate_429`（barrier 同步 3 并发 → sorted [200,200,429] + stderr result 字段） + 卡 2 `test_tpm_admit_queue_full`（队满拒绝单测） |
+| 5 | usage 回填：fake upstream 回 SSE_USAGE(total_tokens=2) 后 settle 释放预算，后续请求不等窗口滚过即放行 | 卡 5 `test_usage_settle_releases_budget`（elapsed <1s 证明无等待 + tpm=2 出现 ≥2 次 + tpm_stats bucket used == 4） + 卡 2 `test_tpm_settle_corrects_usage`/`test_tpm_settle_notifies_waiters`（settle 行为单测） |
+| 6 | SSE 透传不破坏：限流路径下输出字节等于 `SSE_A+SSE_B+SSE_DONE` 且以 `data: [DONE]` 结尾 | 卡 5 `test_sse_passthrough_under_rate_limiting`（byte-exact + endswith 断言） + 卡 5 `test_all_existing_tests_pass`（无 auth 路径回归） |
+| 7 | `/api/tpm_stats`：返回 200 JSON，bucket used/rejected/timeouts 与 REQ 行一致，key 字段 sha256: 脱敏 | 卡 5 `test_tpm_stats_endpoint`（config 全等 / key 脱敏 + hash 自算交叉校验 / used 与 `tpm=%d` 交叉校验） + 卡 3 `test_tpm_stats_endpoint_basic`（shape 基本单测） |
+| 8 | 无 Authorization 头请求直通不限流 | 卡 5 `test_no_auth_bypasses_tpm`（stderr 无 `qwait=`/`tpm=`/`tpm-queue`） + 卡 4 `test_oversized_est_rejected_before_upstream`（同体无 auth 请求 200 分支） |
+| 9 | 部署端到端验证（cp + kickstart + 4 并发 + stats） | Explicitly excluded from PLAN（spec :39 标注"主代理 DELIVER 阶段执行，非 implementer"），不进入卡 1-5 |
+
+**Risks 处理**（spec :43-47）:
+- 锁序（`TPM_LOCK` 不与 `STATS_LOCK`/`ERROR_LOCK` 嵌套）→ 卡 4 429 分支 `return` 后才调 `_record_request`/`record_error_event`（代码注释标明："锁外记录"）✓
+- 重试不重复 charge → 卡 4 hook 在 `_open_upstream` 之前执行，header 重试/空流重试路径不复用 code block，复用 `tpm_key`/`tpm_est` 变量（代码注释标明）✓；卡 5 `test_all_existing_tests_pass` 回保证实 calls 计数正确
+- 估算偏差（保守方向 + settle 校正兜底）→ `estimate_request_tokens` 实现按 spec 决策 1（ratio 0.55 + max_tokens 累加），卡 2 `test_estimate_request_tokens` 覆盖全部分支 ✓
+- 排队期间客户端断连不可检测 → spec Risks 明确不做（Excluded），未进入卡 1-5 ✓
+- 严格 FIFO 跨 key 队头阻塞 → spec Risks 明确可接受，卡实现严格 FIFO ✓
+
+**Exclusions 合规**: dashboard HTML/JS 不动（卡 3 只加 API 路由）✓；classify_outcome 不改 ✓；_DAILY_FIELDS 不改 ✓；plist/launchd 不动 ✓；跨进程/持久化不做 ✓；tokenizer 不引入 ✓。
+
+### 2. Placeholder Scan
+
+对全 PLAN.md 代码块扫描：`TODO`/`FIXME`/`XXX`/`待补`/`占位`/`placeholder`/`待实现` — **0 命中**（`grep -nE` exit code 1，无匹配行）。
+
+卡 1-4 生产代码块中 `pass  # …` 三处（:367/:897/:918）均有注释自证"为何吞掉"（ValueError: 已被并发 popleft / non-JSON body 非异常路径），符合 AGENTS.md 空 catch 自证要求。卡 5 测试代码块含 8 个 `def test_*` 全部有完整实现体，无 `pass`/`raise NotImplementedError`/`return` stub。
+
+### 3. Type Consistency
+
+跨卡接口签名一致性验证（逐对检查）：
+
+| 符号 | 卡 2 定义 | 卡 3/4/5 调用 | 一致 |
+|------|----------|-------------|------|
+| `tpm_admit(key_id: str, est: int) -> (status, qwait_ms)` | 卡 2 :313-368 | 卡 4: `tpm_status, tpm_qwait_ms = tpm_admit(tpm_key, tpm_est)` 解包 2 元组 ✓ | ✓ |
+| `tpm_settle(key_id: str, est: int, actual: int) -> None` | 卡 2 :370-386 | 卡 4: SSE/buffered/502 三处 `tpm_settle(tpm_key, tpm_est, total\|0)` 实参顺序一致 ✓ | ✓ |
+| `tpm_snapshot() -> dict` | 卡 2 :389-420 | 卡 3: `tpm_snapshot()` 直接路由给 `_send_json` ✓；卡 5: `admin_get("/api/tpm_stats")` 返回 JSON shape 断言（config.limit/window_s/queue_max，buckets.key/used/remaining/queued/rejected/timeouts）全部命中 ✓ | ✓ |
+| `tpm_key_id(auth_header: str\|None) -> str\|None` | 卡 2 :243-258 | 卡 4: `tpm_key = tpm_key_id(self.headers.get("Authorization"))` ✓；卡 5: `Bearer test-key-*` header 全部经 `tpm_key_id` 路径 ✓ | ✓ |
+| `estimate_request_tokens(body) -> int` | 卡 2 :261-278 | 卡 4: `tpm_est = estimate_request_tokens(body)` ✓；卡 5: 测试中 `max(1, int(len(body) * 0.55))` 自洽断言与实现一致 ✓ | ✓ |
+| `sse_line_usage(line: bytes) -> dict\|None` | 卡 1 :96-113 | 卡 4 block 5: `usage_hit = sse_line_usage(buf_line)` + `self._tpm_usage = usage_hit` + settle 时 `.get("total_tokens")` ✓ | ✓ |
+| `_reply_tpm_429(reason: str) -> None` | 卡 3 :632-645 | 卡 4: `self._reply_tpm_429(tpm_status)` 取 `"full"`/`"timeout"` → 日志 result 分支 ✓ | ✓ |
+| `_log(..., qwait_ms=None, tpm_used=None)` | 卡 3 :677-694 | 卡 4: 4 处调用均按 kwargs 传 `qwait_ms=tpm_qwait_ms, tpm_used=tpm_final_used` ✓；卡 5: stderr 正则 `qwait=(\d+)ms` + `tpm=(\d+)` 与格式串 `qwait=%dms`/`tpm=%d` 一致 ✓ | ✓ |
+| `_KIND_CATEGORY` / `ERR_KIND_TPM_*` / `CLASS_TPM_LIMITED` | 卡 1 :56-90 | 卡 4: `record_error_event(ERR_KIND_TPM_QUEUE_FULL\|ERR_KIND_TPM_QUEUE_TIMEOUT, ...)` 常量名一致 ✓ | ✓ |
+| `_TpmWaiter(key_id, est, enqueued_at)` | 卡 2 :234 | 卡 2 单测: `mod._TpmWaiter("key:qfull", 1, 0)` 直接构造，字段序一致 ✓ | ✓ |
+| `post_sse_auth(port, payload, auth_header=None, timeout=30) -> (status, body)` | 卡 4 :1070-1082 | 卡 5: 8 用例均调用 `post_sse_auth(self.proxy_port, body, auth)` ✓ | ✓ |
+| 常量 env seam 名 | 卡 1 :38-44 | 卡 5 `start_proxy(extra_env={...})` 键名: `CTYUN_TPM_LIMIT`/`CTYUN_TPM_WINDOW_S`/`CTYUN_TPM_QUEUE_TIMEOUT_S`/`CTYUN_TPM_QUEUE_MAX` 全等 ✓ | ✓ |
+
+### 4. 可落盘性
+
+| 卡 | 生产代码块 | 测试代码块 | 插入上下文（before/after 锚） | 验证命令 | commit message | 判定 |
+|----|----------|----------|--------------------------|---------|----------------|------|
+| 1 | 常量 + sse_line_usage + KIND_CATEGORY（3 块，含精确位置上下文） | 3 个 test_*（含 subprocess env seam 验证） | 各行号 with before/after 锚 | `ProxyDashboardUnitTest` | ✅ 标准 commit | 落盘就绪 |
+| 2 | TPM 模块态 7 函数（含 import hashlib + :197 精确上下文） | 9 个 test_*（含 cleanup helper + Lock 安全） | :197-200 之间锚 + import 区锚 | `ProxyDashboardUnitTest` | ✅ 标准 commit | 落盘就绪 |
+| 3 | _reply_tpm_429 + _log 扩展 + /api/tpm_stats 路由（3 块） | 1 单元 + 2 集成（含端点 shape + 404 回归） | 各精确行号上下文 | 分单元/集成验证 | ✅ 标准 commit | 落盘就绪 |
+| 4 | 准入 hook + SSE/buffered 结算 + 2处 502 退款 + usage 捕获 + _tpm_usage 初始化（6 块） | 1 helper + 1 集成类（含 upstream calls 断言） | 全部精确行号上下文 | `TpmAdmitHookTest` | ✅ 标准 commit | 落盘就绪 |
+| 5 | N/A（纯测试卡） | 8 测试方法（TpmRateLimitTest 类完整代码） | 类放置位: `TpmAdmitHookTest` 之后、`if __name__` 之前 | 单类 ~20s + 全量回归 | ✅ 标准 commit | 落盘就绪 |
+
+**共同判定**: 无留白，无"按 spec 实现即可"指令，无依赖运行时数据或真机验证的 C 档内容。全部 A 档。代码块可直接复制落盘，插入上下文锚全部实测一致。
+
+### 5. 锚点实测（B-final 复核）
+
+以下为本次 B-final 实测 grep（`fix/tpm-rate-limiting` worktree，当前源文件无 TPM 代码——预期中，卡尚未执行）:
+
+**生产源码**（`ctyun-stream-fix-proxy.py`，1967 行）:
+```
+$ grep -n 'HEADER_RETRY_MAX\|PRIMED_TAIL_CAP\|CLASS_POISON_FIXED\|ERR_KIND_HEADER_TIMEOUT\|CLASS_BODY_ERROR\|ERR_KIND_BODY_ERROR\|_KIND_CATEGORY\|def sse_line_has_usage\|def sse_line_body_error\|def classify_outcome\|def empty_stream_should_retry\|def record_error_event\|def _record_request\|def _safe_log_stderr\|def _send_json\|def _proxy_relay\|_open_upstream\(self\|except (OSError, http.client.HTTPException)\|self._body_err_line = None\|def _relay_sse\|kinds = \[sse_data_line_kind\|def _relay_buffered\|def _reply_502\|def _log\|class AdminHandler\|elif path == "/api/stats"' ctyun-stream-fix-proxy.py
+
+52: HEADER_RETRY_MAX = ...
+53: PRIMED_TAIL_CAP = ...
+66: CLASS_POISON_FIXED = "poison_fixed"
+74: ERR_KIND_HEADER_TIMEOUT = "header_timeout"
+76: CLASS_BODY_ERROR = "body_error"
+77: ERR_KIND_BODY_ERROR = "body_error"
+79: _KIND_CATEGORY = {
+87:     ERR_KIND_BODY_ERROR: CLASS_BODY_ERROR,
+139: def sse_line_has_usage(line: bytes) -> bool:
+155: def sse_line_body_error(line: bytes) -> bool:
+172: def classify_outcome(...)
+200: def empty_stream_should_retry(budget: int) -> bool:
+223: def record_error_event(...)
+487: def _safe_log_stderr(...)
+680: def _record_request(...)
+879:     def _proxy_relay(self, started: float) -> None:
+900:                 conn, resp = self._open_upstream(self.command, self.path, body, fwd_headers)
+920:         except (OSError, http.client.HTTPException) as exc:
+938:                 self._body_err_line = None
+953:                 except (OSError, http.client.HTTPException) as retry_exc:
+965:                 self._body_err_line = None
+988:                 record_error_event(...)
+993:             self._log(started, resp.status, result, filtered, model=model, retried=retried, retry_reason=retry_reason)
+998:         else:
+999:             relayed_data = self._relay_buffered(resp)
+1056:     def _relay_sse(self, resp, final) -> tuple:
+1081:                     kinds = [sse_data_line_kind(buf_line) for buf_line in pending]
+1143:     def _relay_buffered(self, resp: http.client.HTTPResponse) -> bytes:
+1161:     def _reply_502(self, exc: BaseException) -> None:
+1171:     def _log(self, started, status, result, filtered, model=None, retried=0, retry_reason="", exc=None) -> None:
+1185: class AdminHandler(http.server.BaseHTTPRequestHandler):
+1194:         elif path == "/api/stats":
+```
+
+**测试文件**（`:3496` `if __name__`，无 TPM 代码——预期: 卡未执行）:
+```
+42: SSE_USAGE = ...
+269: def make_scripted_upstream
+383: def start_proxy
+417: def post_sse
+431: def get_plain
+508: def admin_get
+520: def admin_post
+3339: class BodyErrorTest
+3496: if __name__ == "__main__":
+```
+
+**结论**: 全部 spec 锚点 + 卡 1-4 插入位锚点与当前源文件实测一致，无偏移。卡 5 类放置位（`BodyErrorTest` `:3339` 之后、`:3496` `if __name__` 之前）实测存在。
+
+**冲突检查**: 卡 1-4 代码块与 spec 决策、当前源文件结构逐锚比对，**无冲突**。spec 决策 5 要求 `/api/tpm_stats` 挂 7921 管理台 `AdminHandler.do_GET`（:1194 `/api/stats` 分支旁）——卡 3 的 `elif path == "/api/tpm_stats"` 路由紧接 `elif path == "/api/stats"` 之后，实测 `:1194` `/api/stats` 路由位置正确 ✓。
