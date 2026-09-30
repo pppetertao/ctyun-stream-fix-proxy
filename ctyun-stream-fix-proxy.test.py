@@ -4044,6 +4044,8 @@ class TokenRelayTest(unittest.TestCase):
                           "internal capture attr must not leak into snapshot")
         self.assertIsNotNone(entry_recent.get("tokens"),
                              "RECENT tokens key must be filled by P3")
+        self.assertGreater(snap["perf"]["tokens_per_s"], 0,
+                           "rates window_tokens must accumulate from usage frame total")
 
 
 class ModelPricingSeamTest(unittest.TestCase):
