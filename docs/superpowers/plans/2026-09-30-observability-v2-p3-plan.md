@@ -62,6 +62,8 @@ def usage_dict_tokens(usage) -> tuple:
 
     def _int_field(key):
         value = usage.get(key)
+        if isinstance(value, bool):  # bool 是 int 子类：JSON true/false 不是合法计数，归 0
+            return 0
         return value if isinstance(value, int) and value >= 0 else 0
 
     return (_int_field("prompt_tokens"), _int_field("completion_tokens"),
@@ -91,7 +93,8 @@ class UsageExtractTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        cls.extract = load_proxy_module().sse_line_extract_usage
+        # staticmethod 包装：裸函数赋类属性会成为 method descriptor（self.extract 多传一参）
+        cls.extract = staticmethod(load_proxy_module().sse_line_extract_usage)
 
     def test_standard_usage_frame(self) -> None:
         line = (b'data: {"id":"u","choices":[],"usage":'
