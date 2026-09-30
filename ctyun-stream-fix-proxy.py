@@ -1001,9 +1001,10 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             if relayed_data:
                 try:
                     parsed = json.loads(relayed_data.decode("utf-8", "replace"))
-                    body_error = body_has_error(parsed)
                 except ValueError:
                     pass  # non-JSON body -> no body error, fail-open
+                else:
+                    body_error = body_has_error(parsed)
             outcome = classify_outcome(status=resp.status, body_error=body_error)
             self._log(started, resp.status, outcome.log_result, 0, model=model)
             _record_request(self.command, self.path, resp.status,
