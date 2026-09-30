@@ -57,7 +57,7 @@ TPM_LIMIT = int(os.environ.get("CTYUN_TPM_LIMIT", "110000"))
 TPM_WINDOW_S = int(os.environ.get("CTYUN_TPM_WINDOW_S", "60"))
 TPM_QUEUE_MAX = int(os.environ.get("CTYUN_TPM_QUEUE_MAX", "20"))
 TPM_QUEUE_TIMEOUT_S = float(os.environ.get("CTYUN_TPM_QUEUE_TIMEOUT_S", "120"))
-TPM_TOKEN_RATIO = float(os.environ.get("CTYUN_TPM_TOKEN_RATIO", "0.3"))
+TPM_TOKEN_RATIO = float(os.environ.get("CTYUN_TPM_TOKEN_RATIO", "0.25"))
 TPM_KEY_CAP = int(os.environ.get("CTYUN_TPM_KEY_CAP", "64"))
 
 PRIMED_TAIL_CAP = 262144  # finish hold 尾段缓冲上限（超限 fail-open 防内存膨胀）

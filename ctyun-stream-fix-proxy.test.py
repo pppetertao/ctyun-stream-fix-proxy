@@ -883,7 +883,7 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         self.assertEqual(mod.TPM_WINDOW_S, 60)
         self.assertEqual(mod.TPM_QUEUE_MAX, 20)
         self.assertEqual(mod.TPM_QUEUE_TIMEOUT_S, 120)
-        self.assertEqual(mod.TPM_TOKEN_RATIO, 0.3)
+        self.assertEqual(mod.TPM_TOKEN_RATIO, 0.25)
         self.assertEqual(mod.TPM_KEY_CAP, 64)
         self.assertEqual(mod.CLASS_TPM_LIMITED, "tpm_limited")
         self.assertEqual(mod.ERR_KIND_TPM_QUEUE_FULL, "tpm_queue_full")
@@ -4001,7 +4001,7 @@ class TpmAdmitHookTest(unittest.TestCase):
 
     def test_oversized_est_rejected_before_upstream(self) -> None:
         """est > TPM_LIMIT(50) 的请求直接 429，上游 calls 计数不变。"""
-        # len ~209 bytes → est = max(1, 209*0.3) = 62 > 50
+        # len ~209 bytes → est = max(1, 209*0.25) = 52 > 50
         big = (b'{"model":"x","stream":true,"messages":[{"role":"user","content":"'
                + b"y" * 140 + b'"}]}')
         status, data = post_sse_auth(self.proxy_port, big, "Bearer test-key")
@@ -4047,12 +4047,12 @@ class TpmRateLimitTest(unittest.TestCase):
         """窗口耗尽排队：首发大 body 占满预算（est 104/110）后，第二请求阻塞至
         窗口滚过（WINDOW_S=2）后放行；stderr 含 qwait=（>0）且 tpm= 数值正确。"""
         big_body = (b'{"model":"m","stream":true,"messages":[{"role":"user","content":"'
-                    + b"x" * 280 + b'"}]}')   # 349B → est = int(349*ratio) = 104 ≤ 110
-        small_body = b'{"model":"m","stream":true,"messages":[]}'   # 41B → est = 12
+                    + b"x" * 347 + b'"}]}')   # 416B → est = int(416*ratio) = 104 ≤ 110
+        small_body = b'{"model":"m","stream":true,"messages":[]}'   # 41B → est = 10
         auth = "Bearer test-key-roll"
         status1, _ = post_sse_auth(self.proxy_port, big_body, auth)
         self.assertEqual(status1, 200, "first request must be admitted")
-        # 104+12=116 > 110 → 排队；无 settle，预算保持至窗口滚过（~2s）后放行
+        # 104+10=114 > 110 → 排队；无 settle，预算保持至窗口滚过（~2s）后放行
         t0 = time.time()
         status2, data2 = post_sse_auth(self.proxy_port, small_body, auth)
         elapsed = time.time() - t0
@@ -4095,12 +4095,12 @@ class TpmRateLimitTest(unittest.TestCase):
                                            "CTYUN_TPM_QUEUE_TIMEOUT_S": "2",
                                            "CTYUN_TPM_QUEUE_MAX": "2"})
         mid_body = (b'{"model":"m","stream":true,"messages":[{"role":"user","content":"'
-                    + b"x" * 20 + b'"}]}')   # 89B → est = int(89*ratio) = 26 ≤ 30
-        small_body = b'{"model":"m","stream":true,"messages":[]}'   # est = 12
+                    + b"x" * 20 + b'"}]}')   # 89B → est = int(89*ratio) = 22 ≤ 30
+        small_body = b'{"model":"m","stream":true,"messages":[]}'   # est = 10
         auth = "Bearer test-key-timeout"
         status1, _ = post_sse_auth(self.proxy_port, mid_body, auth)
         self.assertEqual(status1, 200, "first request must be admitted")
-        # 26+12=38 > 30 → 排队；窗口 60s 不滚、无 settle → 2s 超时 → 429
+        # 22+10=32 > 30 → 排队；窗口 60s 不滚、无 settle → 2s 超时 → 429
         t0 = time.time()
         status2, data2 = post_sse_auth(self.proxy_port, small_body, auth)
         elapsed = time.time() - t0
@@ -4125,8 +4125,8 @@ class TpmRateLimitTest(unittest.TestCase):
     def test_queue_full_immediate_429(self) -> None:
         """队列满：QUEUE_MAX=2，3 并发中第 3 个立即 429，REQ 行 result=tpm-queue-full。"""
         big_body = (b'{"model":"m","stream":true,"messages":[{"role":"user","content":"'
-                    + b"x" * 280 + b'"}]}')   # est = 104/110，占满预算
-        small_body = b'{"model":"m","stream":true,"messages":[]}'   # est = 12
+                    + b"x" * 347 + b'"}]}')   # est = 104/110，占满预算
+        small_body = b'{"model":"m","stream":true,"messages":[]}'   # est = 10
         auth = "Bearer test-key-qfull"
         status1, _ = post_sse_auth(self.proxy_port, big_body, auth)
         self.assertEqual(status1, 200, "first request must be admitted")
@@ -4171,12 +4171,12 @@ class TpmRateLimitTest(unittest.TestCase):
                                            "CTYUN_TPM_QUEUE_TIMEOUT_S": "5",
                                            "CTYUN_TPM_QUEUE_MAX": "2"})
         big_body = (b'{"model":"m","stream":true,"messages":[{"role":"user","content":"'
-                    + b"x" * 280 + b'"}]}')   # est = 104，settle → 2（释放 102）
-        small_body = b'{"model":"m","stream":true,"messages":[]}'   # est = 12
+                    + b"x" * 280 + b'"}]}')   # est = 87，settle → 2（释放 85）
+        small_body = b'{"model":"m","stream":true,"messages":[]}'   # est = 10
         auth = "Bearer test-key-settle"
         status1, _ = post_sse_auth(self.proxy_port, big_body, auth)
         self.assertEqual(status1, 200, "first request must be admitted")
-        # settle 已把预算从 104 校正到 2 → 第二请求立即准入（无窗口等待）
+        # settle 已把预算从 87 校正到 2 → 第二请求立即准入（无窗口等待）
         t0 = time.time()
         status2, _ = post_sse_auth(self.proxy_port, small_body, auth)
         elapsed = time.time() - t0
@@ -4201,7 +4201,7 @@ class TpmRateLimitTest(unittest.TestCase):
     def test_sse_passthrough_under_rate_limiting(self) -> None:
         """SSE 透传不破坏：限流生效路径（带 Authorization 经 tpm_admit）下
         输出仍字节等于 SSE_A+SSE_B+SSE_DONE 且以 data: [DONE] 结尾。"""
-        small_body = b'{"model":"m","stream":true,"messages":[]}'   # est = 12 ≤ 110
+        small_body = b'{"model":"m","stream":true,"messages":[]}'   # est = 10 ≤ 110
         auth = "Bearer test-key-passthrough"
         status, data = post_sse_auth(self.proxy_port, small_body, auth)
         self.assertEqual(status, 200)
@@ -4227,7 +4227,7 @@ class TpmRateLimitTest(unittest.TestCase):
     def test_tpm_stats_endpoint(self) -> None:
         """/api/tpm_stats 返回 200 JSON：config 与 env seam 一致，bucket used 与
         REQ 行 tpm= 计数一致，key 字段 sha256: 前缀脱敏（无原始 key 泄漏）。"""
-        small_body = b'{"model":"m","stream":true,"messages":[]}'   # 41B → est = 12
+        small_body = b'{"model":"m","stream":true,"messages":[]}'   # 41B → est = 10
         auth = "Bearer test-key-stats"
         status, _ = post_sse_auth(self.proxy_port, small_body, auth)
         self.assertEqual(status, 200)
@@ -4278,7 +4278,7 @@ class TpmRateLimitTest(unittest.TestCase):
                                            "CTYUN_TPM_QUEUE_TIMEOUT_S": "5",
                                            "CTYUN_TPM_QUEUE_MAX": "2",
                                            "CTYUN_HEADER_TIMEOUT": "1"})
-        small_body = b'{"model":"m","stream":true,"messages":[]}'   # 41B → est = 12
+        small_body = b'{"model":"m","stream":true,"messages":[]}'   # 41B → est = 10
         auth = "Bearer test-key-retry"
         status, data = post_sse_auth(self.proxy_port, small_body, auth)
         self.assertEqual(status, 200, "retried request must succeed, got %d" % status)
