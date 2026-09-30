@@ -65,6 +65,8 @@ class FakeUpstreamHandler(BaseHTTPRequestHandler):
     sleep_stall_calls = ()     # 1-based 呼叫序号元组：命中则 sleep 持连不写响应（同 sleep_stall_all 形态）
     sleep_stall_seconds = 3.0  # 须 > 用例 HEADER_TIMEOUT（白盒 0.5s/黑盒 1s），余量 ≥2s 防 flaky
     tail_delay_after_done_s = 0.0  # >0 → 正常流写完后 flush+sleep 再关连接（模拟"发完 [DONE] 滞留"的 EOF 尾间隙）
+    latency_s = 0.0            # >0 → 正常路径写响应前 sleep（TTFB 测试模拟上游慢）
+    stall_mid_stream_s = 0.0   # >0 → 写 SSE_A 后 sleep 再写 SSE_B+DONE（stall 检测测试）
     rst_all = False         # True → 每呼读 body 后 SO_LINGER(1,0) close 强制发 RST（代理 getresponse 抛 ConnectionResetError）
     rst_calls = ()          # 1-based 呼叫序号元组：命中则 SO_LINGER(1,0) close 强制发 RST（同 rst_all 形态）
     calls = None          # 共享 list：非 None 时按调用序 append 计数；无 body_override 时首次回空流
@@ -169,6 +171,24 @@ class FakeUpstreamHandler(BaseHTTPRequestHandler):
                     pass
             self.close_connection = True
             return
+        if self.stall_mid_stream_s:
+            # SSE_A 后 sleep 再续 SSE_B+DONE：相邻 record 间隔 = sleep 时长（stall 检测用）
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            try:
+                self.wfile.write(SSE_A)
+                self.wfile.flush()
+                time.sleep(self.stall_mid_stream_s)
+                self.wfile.write(SSE_B + SSE_DONE)
+                self.wfile.flush()
+            except ConnectionError:
+                # 吞掉的是代理侧已放弃读取后的写出端 Broken pipe（预期路径，同下方正常路径注释）
+                pass
+            self.close_connection = True
+            return
+        if self.latency_s:
+            time.sleep(self.latency_s)
         if self.big:
             self._respond_big_sse()
             return
@@ -234,6 +254,8 @@ def make_fake_upstream(poison: bool, tag: str = "/plain", big: bool = False,
                        sleep_stall_seconds: float = 3.0,
                        rst_all: bool = False, rst_calls: tuple = (),
                        fail_200_error: bool = False,
+                       latency_s: float = 0.0,
+                       stall_mid_stream_s: float = 0.0,
                        tail_delay_after_done_s: float = 0.0) -> int:
     attrs = {"poison": poison, "tag": tag, "big": big, "fail_500": fail_500,
              "empty_stream": empty_stream, "empty_stream_calls": empty_stream_calls,
@@ -249,6 +271,8 @@ def make_fake_upstream(poison: bool, tag: str = "/plain", big: bool = False,
              "rst_all": rst_all,
              "rst_calls": rst_calls,
              "fail_200_error": fail_200_error,
+             "latency_s": latency_s,
+             "stall_mid_stream_s": stall_mid_stream_s,
              "tail_delay_after_done_s": tail_delay_after_done_s,
              "bodies": [] if record_bodies else None}
     if scripted:
@@ -3928,9 +3952,9 @@ class RequestIdTest(unittest.TestCase):
                          "SSE request stream must be 1")
         self.assertEqual(entry["outcome"], "ok",
                          "clean SSE outcome must be ok")
-        # P3 前占位字段
+        # tokens 为 P3 前占位；bytes_out 自 P2 起为真实下发字节数（fake 流 >0）
         self.assertIsNone(entry["tokens"])
-        self.assertEqual(entry["bytes_out"], 0)
+        self.assertGreater(entry["bytes_out"], 0)
 
     def test_req_line_carries_rid_host_ttfb_stream_outcome(self) -> None:
         """REQ 行含 rid=r-N / host= / ttfb=<num>ms / stream=1 / outcome=ok。"""
@@ -4374,6 +4398,106 @@ class PerfHistTest(unittest.TestCase):
                          "末桶溢出 P50 返回下界 30000")
         self.assertEqual(mod.hist_percentile(buckets, edges, 0.99), float(edges[-1]),
                          "末桶溢出 P99 返回下界 30000")
+
+
+class TtfbStreamTest(unittest.TestCase):
+    """P2 速度期：TTFB 首字节口径 + histogram + 吞吐 + stall 检测。
+
+    黑盒子进程集成：fake upstream sleep 100ms 后吐流 → ttfb_ms ∈ [80, 500] 且
+    perf 节按模型 P50/P90 与三阶段 P50 均被填充、bytes/chunks 速率 > 0；
+    stall 检测用 env seam CTYUN_STALL_THRESHOLD_S=0.5 加速（上游中途 sleep 1s）。"""
+
+    MODEL = "deepseek-v4-pro-0813-oc"
+
+    def setUp(self) -> None:
+        self.upstream_port = make_fake_upstream(False, latency_s=0.1)
+        self.proxy_port = free_port()
+        self.proc = start_proxy(self.upstream_port, self.proxy_port)
+
+    def tearDown(self) -> None:
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_fake_upstreams()
+
+    def test_ttfb_ms_in_range_and_perf_populated(self) -> None:
+        """fake upstream sleep 100ms → ttfb_ms ∈ [80, 500]；perf 节非空且速率 > 0。"""
+        post_sse(self.proxy_port)
+        _, body, _ = admin_get(self.proc.admin_port, "/api/stats")
+        snap = json.loads(body.decode("utf-8"))
+        self.assertIn("perf", snap, "/api/stats 必须含 perf 节")
+        perf = snap["perf"]
+        entry = snap["recent"][-1]
+        self.assertGreaterEqual(entry["ttfb_ms"], 80,
+                                "ttfb 必须 ≥ 80ms（上游 sleep 100ms），got %r" % entry["ttfb_ms"])
+        self.assertLessEqual(entry["ttfb_ms"], 500,
+                             "ttfb 必须 ≤ 500ms（本地回环 100ms sleep），got %r" % entry["ttfb_ms"])
+        self.assertGreater(entry["bytes_out"], 0,
+                           "流式 bytes_out 必须 > 0")
+        self.assertEqual(entry["chunks"], 3,
+                         "chunks 必须精确等于 3（SSE_A+SSE_B+SSE_DONE 三条 record；"
+                         "无 EOF 幽灵 chunk——fix-loop-1 回归锁）")
+        self.assertIn(self.MODEL, perf["ttfb_p50_ms_by_model"],
+                      "ttfb P50 必须按模型出现；got %r"
+                      % sorted(perf["ttfb_p50_ms_by_model"].keys()))
+        self.assertGreater(perf["ttfb_p50_ms_by_model"][self.MODEL], 0)
+        self.assertGreater(perf["ttfb_p90_ms_by_model"][self.MODEL], 0)
+        for name in ("connect", "headers", "body"):
+            self.assertIn(name, perf["phase_p50_ms"],
+                          "phase_p50_ms 必须含 '%s'；got %r"
+                          % (name, sorted(perf["phase_p50_ms"].keys())))
+            self.assertGreater(perf["phase_p50_ms"][name], 0,
+                               "phase '%s' P50 必须 > 0" % name)
+        self.assertGreater(perf["bytes_per_s"], 0,
+                           "60s 窗口 bytes/s 必须 > 0")
+        self.assertGreater(perf["chunks_per_s"], 0,
+                           "60s 窗口 chunks/s 必须 > 0")
+        self.assertEqual(perf["stalls_total"], 0,
+                         "无 stall 的流 stalls_total 必须为 0")
+        self.assertEqual(perf["stream_share"], 1.0,
+                         "单条流式请求 stream_share 必须为 1.0")
+
+    def test_stall_detected_via_env_seam(self) -> None:
+        """上游中途 sleep 1s（> 0.5s 阈值）→ stalls_total ≥ 1。"""
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        stop_fake_upstreams()
+        self.upstream_port = make_fake_upstream(False, stall_mid_stream_s=1.0)
+        self.proxy_port = free_port()
+        self.proc = start_proxy(self.upstream_port, self.proxy_port,
+                                extra_env={"CTYUN_STALL_THRESHOLD_S": "0.5"})
+        post_sse(self.proxy_port)
+        _, body, _ = admin_get(self.proc.admin_port, "/api/stats")
+        snap = json.loads(body.decode("utf-8"))
+        perf = snap["perf"]
+        self.assertGreaterEqual(perf["stalls_total"], 1,
+                                "中途 1s 间隙（阈值 0.5s）必须计 ≥1 次 stall；perf=%r" % perf)
+
+
+class StallTailGapTest(unittest.TestCase):
+    """P2 fix-loop-1：上游发完 [DONE] 后滞留 >阈值 再关连接（EOF 尾间隙）不得计 stall；
+    纯 EOF 迭代不得计 chunk（chunks==3 断言在 TtfbStreamTest，经 RECENT 锁定）。"""
+
+    def test_tail_eof_gap_not_counted_as_stall(self) -> None:
+        upstream_port = make_fake_upstream(False, tail_delay_after_done_s=1.0)
+        proxy_port = free_port()
+        proc = start_proxy(upstream_port, proxy_port,
+                           extra_env={"CTYUN_STALL_THRESHOLD_S": "0.5"})
+        try:
+            post_sse(proxy_port)
+            _, body, _ = admin_get(proc.admin_port, "/api/stats")
+            snap = json.loads(body.decode("utf-8"))
+            perf = snap["perf"]
+            self.assertEqual(perf["stalls_total"], 0,
+                             "EOF 尾间隙不是相邻 record 间隔，不得计 stall；perf=%r" % perf)
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+            stderr_text(proc)
+            shutil.rmtree(proc.persist_dir, ignore_errors=True)
+            stop_fake_upstreams()
 
 
 if __name__ == "__main__":

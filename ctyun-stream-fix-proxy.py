@@ -613,7 +613,7 @@ STATS = {"requests_total": 0, "filtered_total": 0, "errors_total": 0,
          "stalls_total": 0}
 _stats_dirty = False  # STATS_LOCK 保护：计数落盘脏标记（SIGTERM/60s 脏刷消费）
 STARTED_AT = time.time()
-RECENT_REQUESTS = collections.deque(maxlen=100)  # {"ts","method","path","status","dur_ms","filtered","model","rid","upstream_host","ttfb_ms","stream","tokens","bytes_out","outcome"}
+RECENT_REQUESTS = collections.deque(maxlen=100)  # {"ts","method","path","status","dur_ms","filtered","model","rid","upstream_host","ttfb_ms","stream","tokens","bytes_out","chunks","outcome"}
 POISON_PREVIEWS = collections.deque(maxlen=20)   # {"ts","preview"} 最近剥除的 record 预览
 EVENTS = collections.deque(maxlen=100)  # {"ts","kind":"proxy"|"upstream"|"retry","model","status"}
 # 单一全局事件流（kind 区分）而非按 (day,model,kind) 分环：per-key 环形几十个 deque
@@ -985,7 +985,8 @@ def set_capture_errors(enabled: bool) -> None:
 def _record_request(method: str, path: str, status: int, dur_ms: float,
                     filtered: int, model=None, error: bool = False,
                     rid=None, upstream_host=None, ttfb_ms=None, stream=None,
-                    tokens=None, bytes_out: int = 0, outcome=None) -> None:
+                    tokens=None, bytes_out: int = 0, outcome=None,
+                    chunks: int = 0, phase_ms: dict = None) -> None:
     global _stats_dirty
     with STATS_LOCK:
         if error:
@@ -1028,7 +1029,33 @@ def _record_request(method: str, path: str, status: int, dur_ms: float,
                                 "rid": rid, "upstream_host": upstream_host,
                                 "ttfb_ms": ttfb_ms, "stream": stream,
                                 "tokens": tokens, "bytes_out": bytes_out,
-                                "outcome": outcome})
+                                "chunks": chunks, "outcome": outcome})
+        # v2 P2：histogram 桶更新与 60s rates 窗口滚动（每请求一次，均在本锁内；R1/R4）
+        if ttfb_ms is not None and model:
+            ttfb_hist = STATS["ttfb_hist"]
+            if model not in ttfb_hist and len(ttfb_hist) < BY_MODEL_CAP:
+                ttfb_hist[model] = [0] * 9
+            if model in ttfb_hist:
+                ttfb_hist[model][bisect.bisect_right(HIST_BUCKETS_MS, ttfb_ms)] += 1
+        if phase_ms:
+            for name in ("connect", "headers", "body"):
+                STATS["phase_ms"][name][
+                    bisect.bisect_right(HIST_BUCKETS_MS, phase_ms[name])] += 1
+        now_mono = time.monotonic()
+        rates = STATS["rates"]
+        if now_mono - rates["window_start"] >= 60.0:
+            # 60s 滑动窗滚动：仅新请求进入且窗口过期时重置一次（spec P2）
+            rates["window_start"] = now_mono
+            rates["window_bytes"] = 0
+            rates["window_chunks"] = 0
+            rates["window_tokens"] = 0
+        rates["bytes_out_total"] += bytes_out
+        rates["chunks_total"] += chunks
+        rates["window_bytes"] += bytes_out
+        rates["window_chunks"] += chunks
+        if tokens:  # P3 填 tokens；P2 阶段恒 None → 不累计
+            rates["tokens_total"] += tokens
+            rates["window_tokens"] += tokens
         _stats_dirty = True
 
 
@@ -1133,12 +1160,40 @@ def stats_snapshot() -> dict:
         snap["recent"] = list(RECENT_REQUESTS)
         snap["poison_previews"] = list(POISON_PREVIEWS)
         snap["events"] = [dict(e) for e in EVENTS]  # 逐条浅拷贝（对齐 daily 模式），oldest→newest
+        ttfb_hist = {m: list(h) for m, h in STATS["ttfb_hist"].items()}
+        phase_hist = {k: list(v) for k, v in STATS["phase_ms"].items()}
+        rates = dict(STATS["rates"])
+        stalls_total = STATS["stalls_total"]
+        recent_len = len(RECENT_REQUESTS)
+        recent_stream = sum(1 for r in RECENT_REQUESTS if r.get("stream"))
     snap["uptime_s"] = int(time.time() - STARTED_AT)
     snap["upstream_base"] = UPSTREAM_BASE
     snap["upstream_source"] = _upstream_source
     plan = range_stats(snap["daily"])  # 锁外基于副本计算（4×≤31 桶求和 <1ms），不拉长持锁
     snap["range_stats"] = plan["stats"]
     snap["range_bounds"] = plan["bounds"]
+    # v2 P2：perf 节（锁外基于浅拷贝计算；≤32 模型 × 9 桶 + 3 阶段 × 9 桶 <1ms）
+    perf = {"ttfb_p50_ms_by_model": {}, "ttfb_p90_ms_by_model": {},
+            "phase_p50_ms": {}, "bytes_per_s": 0.0, "chunks_per_s": 0.0,
+            "tokens_per_s": 0.0, "stalls_total": stalls_total,
+            "stream_share": 0.0}
+    for model, hist in ttfb_hist.items():
+        perf["ttfb_p50_ms_by_model"][model] = round(
+            hist_percentile(hist, HIST_BUCKETS_MS, 0.5), 1)
+        perf["ttfb_p90_ms_by_model"][model] = round(
+            hist_percentile(hist, HIST_BUCKETS_MS, 0.9), 1)
+    for name in ("connect", "headers", "body"):
+        perf["phase_p50_ms"][name] = round(
+            hist_percentile(phase_hist[name], HIST_BUCKETS_MS, 0.5), 1)
+    elapsed = time.monotonic() - rates["window_start"]
+    if elapsed < 60.0 and elapsed > 0:
+        # 窗口过期（≥60s 无请求）时速率报 0：无近期流量（Anchor Reconciliation）
+        perf["bytes_per_s"] = round(rates["window_bytes"] / elapsed, 1)
+        perf["chunks_per_s"] = round(rates["window_chunks"] / elapsed, 1)
+        perf["tokens_per_s"] = round(rates["window_tokens"] / elapsed, 1)
+    if recent_len:
+        perf["stream_share"] = round(recent_stream / recent_len, 4)
+    snap["perf"] = perf
     return snap
 
 
@@ -1337,6 +1392,14 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 filtered, truncated = self._relay_sse(resp, final=True)
                 body_error = self._body_err_line is not None
                 ttfb_ms = round((t_headers_done - t_conn_start) * 1000, 1)
+            # v2 P2：首字节口径覆盖 headers 口径（流式 = 首个非毒 record 交付时刻；
+            # 空流重试路径 _relay_sse 入口已重置 mark，此处读到的始终是交付流的值）
+            if self._t_first_byte_mark is not None:
+                ttfb_ms = round((self._t_first_byte_mark - t_conn_start) * 1000, 1)
+            t_relay_done = time.monotonic()
+            connect_ms = round((self._t_request_sent - t_conn_start) * 1000, 1)
+            headers_ms = round((t_headers_done - self._t_request_sent) * 1000, 1)
+            body_ms = round((t_relay_done - t_headers_done) * 1000, 1)
             outcome = classify_outcome(status=resp.status, poison_filtered=filtered,
                                        body_error=body_error)
             result = outcome.log_result  # 重试后按实际 resp 重算
@@ -1379,9 +1442,17 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                             (time.time() - started) * 1000, filtered, model=model,
                             error=outcome.counts_error,
                             rid=self._req_id, upstream_host=self._upstream_host,
-                            ttfb_ms=ttfb_ms, stream=1, outcome=outcome.category)
+                            ttfb_ms=ttfb_ms, stream=1, outcome=outcome.category,
+                            bytes_out=self._relay_bytes, chunks=self._relay_chunks,
+                            phase_ms={"connect": connect_ms, "headers": headers_ms,
+                                      "body": body_ms})
         else:
             relayed_data = self._relay_buffered(resp)
+            # v2 P2：非流式 TTFB = t_body_done - t_conn_start（_relay_buffered 已置 mark）
+            ttfb_ms = round((self._t_first_byte_mark - t_conn_start) * 1000, 1)
+            connect_ms = round((self._t_request_sent - t_conn_start) * 1000, 1)
+            headers_ms = round((t_headers_done - self._t_request_sent) * 1000, 1)
+            body_ms = round((self._t_first_byte_mark - t_headers_done) * 1000, 1)
             body_error = False
             tpm_final_used = tpm_est if tpm_key is not None else None
             if relayed_data:
@@ -1409,7 +1480,10 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                             (time.time() - started) * 1000, 0, model=model,
                             error=outcome.counts_error,
                             rid=self._req_id, upstream_host=self._upstream_host,
-                            ttfb_ms=ttfb_ms, stream=0, outcome=outcome.category)
+                            ttfb_ms=ttfb_ms, stream=0, outcome=outcome.category,
+                            bytes_out=self._relay_bytes, chunks=self._relay_chunks,
+                            phase_ms={"connect": connect_ms, "headers": headers_ms,
+                                      "body": body_ms})
             if outcome.capture:
                 if body_error:
                     kind = ERR_KIND_BODY_ERROR
