@@ -52,6 +52,14 @@ EMPTY_RETRY_MAX = int(os.environ.get("CTYUN_EMPTY_RETRY", "1"))  # env seam，�
 HEADER_RETRY_MAX = max(0, int(os.environ.get("CTYUN_HEADER_RETRY", "1")))
 PRIMED_TAIL_CAP = 262144  # finish hold 尾段缓冲上限（超限 fail-open 防内存膨胀）
 
+# observability v2 常量（P1 先声明；HIST_BUCKETS_MS P2 起用、PROBE_* P4 起用）
+HIST_BUCKETS_MS = (100, 250, 500, 1000, 2000, 5000, 10000, 30000)  # 8 桶右开边界，+inf 隐式第 9 桶（对数等比 ≈ ×2.5，覆盖 100ms~30s+）
+PROBE_INTERVAL_S_DEFAULT = 30      # v2 P4：probe 线程默认间隔（CTYUN_PROBE_INTERVAL_S env seam 可调）
+PROBE_TIMEOUT_S = 5                # v2 P4：probe HEAD 请求超时
+PROBE_MIN_INTERVAL_S = 10          # v2 P4：probe 间隔下限（防滥用）
+PROBE_FAILURE_THRESHOLD = 3        # v2 P4：连续失败次数达此值触发 EVENTS probe_alert
+PROBE_ALERT_DEBOUNCE_S = 300       # v2 P4：同类 probe 告警最小间隔（去抖）
+
 ERROR_RING_MAX = 50
 BODY_SNAPSHOT_CAP = 4096
 RESPONSE_SNIPPET_CAP = 2048
@@ -309,6 +317,15 @@ HOP_HEADERS = {"connection", "keep-alive", "proxy-connection",
                "te", "trailer", "transfer-encoding", "upgrade"}
 STRIP_HEADERS = HOP_HEADERS | {"host", "content-length", "accept-encoding"}
 
+# 锁纪律（现状审计，2026-09-30 文档化）：
+#   STATS_LOCK — 保护 STATS（含 daily/daily_by_model 桶）/ RECENT_REQUESTS / EVENTS /
+#                POISON_PREVIEWS / _stats_dirty
+#   _CFG_LOCK  — 保护 UPSTREAM_BASE / _upstream_source / CAPTURE_ERRORS（只护写；
+#                UPSTREAM_BASE 读侧无锁：Python 引用赋值原子，读线程看到任一完整旧值）
+#   ERROR_LOCK — 保护 ERROR_EVENTS / _ERROR_EVENT_SEQ
+#   LOG_LOCK   — 保护 LOG_RING / _LOG_SEQ
+#   PROBE_LOCK — P4 新增，保护 _PROBE_STATE；独立于 STATS_LOCK：探测线程与请求线程
+#                共享 STATS 时只经 STATS_LOCK 短持锁更新计数器，绝不持锁做网络 IO。
 _CFG_LOCK = threading.Lock()
 STATS_LOCK = threading.Lock()
 STATS = {"requests_total": 0, "filtered_total": 0, "errors_total": 0,
@@ -317,7 +334,7 @@ STATS = {"requests_total": 0, "filtered_total": 0, "errors_total": 0,
          "active": 0, "daily": {}, "daily_by_model": {}}
 _stats_dirty = False  # STATS_LOCK 保护：计数落盘脏标记（SIGTERM/60s 脏刷消费）
 STARTED_AT = time.time()
-RECENT_REQUESTS = collections.deque(maxlen=100)  # {"ts","method","path","status","dur_ms","filtered","model"}
+RECENT_REQUESTS = collections.deque(maxlen=100)  # {"ts","method","path","status","dur_ms","filtered","model","rid","upstream_host","ttfb_ms","stream","tokens","bytes_out","outcome"}
 POISON_PREVIEWS = collections.deque(maxlen=20)   # {"ts","preview"} 最近剥除的 record 预览
 EVENTS = collections.deque(maxlen=100)  # {"ts","kind":"proxy"|"upstream"|"retry","model","status"}
 # 单一全局事件流（kind 区分）而非按 (day,model,kind) 分环：per-key 环形几十个 deque
@@ -557,6 +574,15 @@ def load_capture_errors(path: str) -> bool:
 
 _DAILY_FIELDS = ("requests", "filtered", "errors_proxy", "errors_upstream",
                  "retries", "eof_without_done", "header_retries")
+
+# v2 P3 起用（P1 先声明）：daily/daily_by_model 16 字段 schema。
+# P3 切换前零引用；load/save 循环各按迭代时的 _DAILY_FIELDS 白名单，
+# 切换后旧格式自动补 0，新格式被旧版加载时自动丢新字段。
+DAILY_V2_FIELDS = _DAILY_FIELDS + ("tokens_prompt", "tokens_completion",
+                                   "bytes_out", "stream_requests",
+                                   "ttfb_sum_ms", "ttfb_count",
+                                   "outcome_ok", "outcome_degraded",
+                                   "outcome_failed")
 
 
 def load_daily_buckets(path: str) -> dict:

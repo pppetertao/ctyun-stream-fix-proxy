@@ -3493,6 +3493,27 @@ class BodyErrorTest(unittest.TestCase):
                          "content with 'error' text must NOT be flagged as body-err")
 
 
+class P1ConstantsTest(unittest.TestCase):
+    """P1 地基：v2 常量声明（值精确断言，锚住 P2-P4 桶/间隔契约）。"""
+
+    def test_v2_constants_declared(self) -> None:
+        mod = load_proxy_module()
+        self.assertEqual(mod.HIST_BUCKETS_MS,
+                         (100, 250, 500, 1000, 2000, 5000, 10000, 30000))
+        self.assertEqual(mod.PROBE_INTERVAL_S_DEFAULT, 30)
+        self.assertEqual(mod.PROBE_TIMEOUT_S, 5)
+        self.assertEqual(mod.PROBE_MIN_INTERVAL_S, 10)
+        self.assertEqual(mod.PROBE_FAILURE_THRESHOLD, 3)
+        self.assertEqual(mod.PROBE_ALERT_DEBOUNCE_S, 300)
+        self.assertEqual(
+            mod.DAILY_V2_FIELDS,
+            mod._DAILY_FIELDS + ("tokens_prompt", "tokens_completion",
+                                 "bytes_out", "stream_requests",
+                                 "ttfb_sum_ms", "ttfb_count",
+                                 "outcome_ok", "outcome_degraded",
+                                 "outcome_failed"))
+
+
 if __name__ == "__main__":
     import atexit
     atexit.register(kill_registered)
