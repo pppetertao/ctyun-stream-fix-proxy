@@ -950,9 +950,6 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         mod._tpm_prune(bucket, now)
         self.assertEqual(len(bucket), 1)
         self.assertEqual(bucket.used, 500)
-        bucket.used = -10                 # 钳制 ≥0
-        mod._tpm_prune(bucket, now)
-        self.assertEqual(bucket.used, 0)
 
     def test_tpm_admit_ok_immediate(self) -> None:
         mod = self.mod
@@ -1004,6 +1001,29 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         # 0 → 全额退款
         mod.tpm_settle("key:settle", 500, 0)
         self.assertEqual(mod.TPM_BUCKETS["key:settle"].used, 0)
+
+    def test_tpm_settle_prune_invariant_no_ghost_tokens(self) -> None:
+        """存储不变量：used 恒等于 deque 条目之和（rev spec 0f2e88e 决策 2）。
+
+        settle 退款条目晚于准入计费条目过期时，存储层不钳位 → used 暂为负
+        （窗口欠账），负条目过期后 used 自愈归 0，不留幽灵 token 永久限流。
+        """
+        mod = self.mod
+        self._tpm_cleanup(mod)
+        bucket = mod._TpmBucket()
+        bucket.used = 0
+        bucket.append((0.0, 500))   # t=0 准入计费 est=500
+        bucket.used = 500
+        bucket.append((30.0, -300))  # t=30 settle actual=200 → 退款 300
+        bucket.used = 200
+        mod._tpm_prune(bucket, 61.0)  # 计费已过期、退款仍在窗口内
+        self.assertEqual(len(bucket), 1)
+        self.assertEqual(bucket.used, sum(tokens for _, tokens in bucket))
+        self.assertEqual(bucket.used, -300)  # 允许为负（窗口欠账）
+        mod._tpm_prune(bucket, 91.0)  # 退款也过期 → 自愈归 0，无幽灵 token
+        self.assertEqual(len(bucket), 0)
+        self.assertEqual(bucket.used, 0)
+        self._tpm_cleanup(mod)
 
     def test_tpm_settle_notifies_waiters(self) -> None:
         mod = self.mod

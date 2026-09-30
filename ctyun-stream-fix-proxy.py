@@ -299,14 +299,14 @@ def _tpm_prune(bucket, now: float) -> None:
 
     bucket 为 collections.deque（条目 (ts, tokens)，delta 可为负），
     .used 为其增量维护的窗口内 token 合计；popleft 时同步扣减。
-    仅可在持 TPM_LOCK 时调用。
+    存储不变量：used 恒等于 deque 条目之和，不做下界修正——used 可为负
+    （负值 = 窗口欠账，随负 settle 条目过期 prune 自愈）；下界钳位只发生
+    在 tpm_snapshot 展示层。仅可在持 TPM_LOCK 时调用。
     """
     cutoff = now - TPM_WINDOW_S
     while bucket and bucket[0][0] < cutoff:
         _, tokens = bucket.popleft()
         bucket.used -= tokens
-    if bucket.used < 0:  # 浮点边界/重入保护：钳制 ≥0
-        bucket.used = 0
 
 
 def _tpm_get_bucket(key_id: str):
@@ -386,8 +386,9 @@ def tpm_admit(key_id: str, est: int):
 def tpm_settle(key_id: str, est: int, actual: int) -> None:
     """结算：以实际 usage 校正窗口占用。
 
-    prune 后追加校正条目 (now, delta)，delta = actual - est（可为负 = 退款），
-    used 钳制 ≥0。settle 后 notify_all 唤醒排队 waiter 重试准入。
+    prune 后追加校正条目 (now, delta)，delta = actual - est（可为负 = 退款）；
+    used 存原始值 used + delta，与追加条目自此保持一致（可为负 = 窗口欠账，
+    随条目过期 prune 自愈）。settle 后 notify_all 唤醒排队 waiter 重试准入。
     """
     now = time.time()
     with TPM_LOCK:
@@ -398,7 +399,7 @@ def tpm_settle(key_id: str, est: int, actual: int) -> None:
         delta = actual - est
         if delta != 0:
             bucket.append((now, delta))
-        bucket.used = max(0, bucket.used + delta)
+        bucket.used = bucket.used + delta
         TPM_LOCK.notify_all()
 
 
@@ -409,6 +410,8 @@ def tpm_snapshot() -> dict:
           "queue_total", "buckets": [...]}；
     bucket 条目 {"key"（sha256: 前缀 + 前 12 位 hex）, "used", "remaining",
                  "queued", "rejected", "timeouts"}——key 脱敏，无原始 key 泄漏。
+    展示层钳位：存储 used 可为负（窗口欠账，见 _tpm_prune 不变量），
+    对外 used 取 max(0, used)，避免暴露/展示负值。
     """
     now = time.time()
     with TPM_LOCK:
@@ -419,7 +422,7 @@ def tpm_snapshot() -> dict:
                 continue  # 空桶不展示（噪声）
             buckets.append({
                 "key": "sha256:" + key_id[:12],
-                "used": bucket.used,
+                "used": max(0, bucket.used),
                 "remaining": max(0, TPM_LIMIT - bucket.used),
                 "queued": sum(1 for w in TPM_WAITERS if w.key_id == key_id),
                 "rejected": _tpm_rejected.get(key_id, 0),
