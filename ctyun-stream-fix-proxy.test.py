@@ -3432,6 +3432,66 @@ class BodyErrorTest(unittest.TestCase):
         self.assertIn("result=body-err", stderr,
                       "non-SSE error must log result=body-err, stderr:\n" + stderr)
 
+    def test_sse_body_error_recorded(self) -> None:
+        """capture_errors on + SSE error 帧 -> /api/errors kind=body_error，detail 含 response。"""
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_fake_upstreams()
+        body = SSE_A + SSE_ERROR_FRAME + SSE_DONE
+        upstream_port, calls = make_scripted_upstream(body_override=body)
+        self.proc = start_proxy(upstream_port, free_port())
+        admin_post(
+            self.proc.admin_port, "/api/config",
+            json.dumps({"upstream_base": "http://127.0.0.1:%d" % upstream_port,
+                        "capture_errors": True}).encode("utf-8"))
+        post_sse(self.proc.proxy_port)
+        status, body_bytes, _ = admin_get(self.proc.admin_port, "/api/errors")
+        data = json.loads(body_bytes.decode("utf-8"))
+        self.assertTrue(data["capture_errors"])
+        self.assertGreaterEqual(data["count"], 1)
+        kinds = [e["kind"] for e in data["events"]]
+        self.assertIn("body_error", kinds,
+                      "/api/errors must contain kind=body_error, got %r" % kinds)
+        eid = data["events"][0]["id"]
+        status, body_bytes, _ = admin_get(self.proc.admin_port, "/api/errors?id=%d" % eid)
+        self.assertEqual(status, 200)
+        ev = json.loads(body_bytes.decode("utf-8"))
+        self.assertEqual(ev["kind"], "body_error")
+        self.assertEqual(ev["category"], "body_error")
+        self.assertIn("response", ev)
+        self.assertIsNotNone(ev["response"])
+        self.assertIn("error", ev["response"].lower(),
+                      "detail response must contain the error frame text")
+
+    def test_sse_content_mentioning_error_not_flagged(self) -> None:
+        """content 文本含 'error' 字样 -> result=ok，零误判。"""
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_fake_upstreams()
+        body = (SSE_A +
+                b'data: {"choices":[{"delta":{"content":"error occurred"}}]}\n\n' +
+                SSE_B + SSE_DONE)
+        upstream_port, calls = make_scripted_upstream(body_override=body)
+        self.proc = start_proxy(upstream_port, free_port())
+        data = post_sse(self.proc.proxy_port)
+        self.assertEqual(data, body,
+                         "normal content mentioning 'error' must relay as-is, got %r" % data[:200])
+        _, body_bytes, _ = admin_get(self.proc.admin_port, "/api/stats")
+        snap = json.loads(body_bytes.decode("utf-8"))
+        self.assertEqual(snap["errors_total"], 0,
+                         "false positive must not increment errors_total")
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr = stderr_text(self.proc)
+        self.assertIn("result=ok", stderr,
+                      "content with 'error' text must stay result=ok, stderr:\n" + stderr)
+        self.assertNotIn("body-err", stderr,
+                         "content with 'error' text must NOT be flagged as body-err")
+
 
 if __name__ == "__main__":
     import atexit
