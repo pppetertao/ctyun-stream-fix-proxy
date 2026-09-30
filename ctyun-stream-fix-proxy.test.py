@@ -4002,6 +4002,125 @@ class UsageExtractTest(unittest.TestCase):
                              "has_usage/extract must agree on %r" % line)
 
 
+class TokenRelayTest(unittest.TestCase):
+    """P3 Token期：usage 数值穿透 relay 路径落 daily_by_model + stream_requests 计数。"""
+
+    def setUp(self) -> None:
+        upstream_port, self.calls = make_scripted_upstream(
+            body_override=SSE_USAGE + SSE_A + SSE_B + SSE_DONE)
+        self.proxy_port = free_port()
+        self.proc = start_proxy(upstream_port, self.proxy_port)
+
+    def tearDown(self) -> None:
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_fake_upstreams()
+
+    def test_sse_usage_frame_lands_in_daily_by_model(self) -> None:
+        """POST 带 SSE_USAGE(prompt=1,completion=1,total=2) 的流 → daily_by_model 当日
+        tokens_prompt=1/tokens_completion=1，daily 总桶 stream_requests=1。"""
+        data = post_sse(self.proxy_port)
+        self.assertEqual(data, SSE_USAGE + SSE_A + SSE_B + SSE_DONE,
+                         "stream must relay byte-exact")
+        today = time.strftime("%Y-%m-%d")
+        _, body, _ = admin_get(self.proc.admin_port, "/api/stats")
+        snap = json.loads(body.decode("utf-8"))
+        dm = snap["daily_by_model"].get(today, {})
+        self.assertEqual(len(dm), 1, "exactly one model expected, got %r" % sorted(dm))
+        entry = list(dm.values())[0]
+        self.assertEqual(entry["tokens_prompt"], 1)
+        self.assertEqual(entry["tokens_completion"], 1)
+        self.assertEqual(entry["stream_requests"], 1)
+        self.assertEqual(entry["requests"], 1)
+        daily_today = snap["daily"][today]
+        self.assertEqual(daily_today["tokens_prompt"], 1,
+                         "daily total bucket must mirror dm tokens_prompt")
+        self.assertEqual(daily_today["stream_requests"], 1)
+        # RECENT 条目 tokens 键携带数值三元组
+        entry_recent = snap["recent"][-1]
+        self.assertIsNone(entry_recent.get("_p3_usage_tokens"),
+                          "internal capture attr must not leak into snapshot")
+        self.assertIsNotNone(entry_recent.get("tokens"),
+                             "RECENT tokens key must be filled by P3")
+
+
+class ModelPricingSeamTest(unittest.TestCase):
+    """P3 Token期：CTYUN_MODEL_PRICING env seam + persist model_pricing schema（默认 off）。"""
+
+    def setUp(self) -> None:
+        self.upstream_port = make_fake_upstream(False)
+        self.proxy_port = free_port()
+        self.proc = start_proxy(self.upstream_port, self.proxy_port)
+
+    def tearDown(self) -> None:
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_fake_upstreams()
+
+    def test_default_off_persists_empty_schema(self) -> None:
+        """无 env → /api/config model_pricing == {}；SIGTERM 后 persist 文件含该键。"""
+        _, body, _ = admin_get(self.proc.admin_port, "/api/config")
+        cfg = json.loads(body.decode("utf-8"))
+        self.assertEqual(cfg["model_pricing"], {},
+                         "model_pricing must default to {} (cost UI off)")
+        post_sse(self.proxy_port)   # 触发一次 dirty 落盘
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        with open(os.path.join(self.proc.persist_dir, "settings.json"),
+                  encoding="utf-8") as fh:
+            saved = json.load(fh)
+        self.assertEqual(saved["model_pricing"], {},
+                         "persist top-level model_pricing schema must be present")
+
+    def test_env_seam_overrides_persist(self) -> None:
+        """CTYUN_MODEL_PRICING env JSON → /api/config 回显该 dict（默认 off 被覆盖）。"""
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        pricing = {"deepseek-v4": {"prompt": 0.1, "completion": 0.2}}
+        self.proc = start_proxy(
+            self.upstream_port, free_port(),
+            extra_env={"CTYUN_MODEL_PRICING": json.dumps(pricing)})
+        _, body, _ = admin_get(self.proc.admin_port, "/api/config")
+        cfg = json.loads(body.decode("utf-8"))
+        self.assertEqual(cfg["model_pricing"], pricing,
+                         "env seam must override default with full dict")
+
+    def test_bad_env_json_falls_back_empty(self) -> None:
+        """非法 JSON env → {} 不崩。"""
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        self.proc = start_proxy(self.upstream_port, free_port(),
+                                extra_env={"CTYUN_MODEL_PRICING": "{not-json"})
+        _, body, _ = admin_get(self.proc.admin_port, "/api/config")
+        cfg = json.loads(body.decode("utf-8"))
+        self.assertEqual(cfg["model_pricing"], {})
+
+    def test_persist_resume_roundtrip(self) -> None:
+        """persist 文件已有 model_pricing（无 env）→ 重启后 /api/config 回读同值。"""
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        pricing = {"m-x": {"prompt": 1.5, "completion": 2.5}}
+        self.proc = start_proxy(
+            self.upstream_port, free_port(),
+            seed_persist={"upstream_base": "http://127.0.0.1:%d" % self.upstream_port,
+                          "model_pricing": pricing})
+        _, body, _ = admin_get(self.proc.admin_port, "/api/config")
+        cfg = json.loads(body.decode("utf-8"))
+        self.assertEqual(cfg["model_pricing"], pricing,
+                         "persist model_pricing must resume across restart")
+
+
 class DailyV2CompatTest(unittest.TestCase):
     """P3 Token期：daily_by_model v2 向后兼容双向 degrade（R2 锁死）。
 

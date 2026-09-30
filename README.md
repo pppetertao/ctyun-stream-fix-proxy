@@ -56,6 +56,7 @@ launchctl kickstart -k gui/$UID/com.ctyun-stream-fix-proxy
 | `CTYUN_SEND_TIMEOUT` | `60` | relay 期间客户端 socket 发送超时（秒） |
 | `CTYUN_HEADER_TIMEOUT` | `45` | 头阶段（连接+响应头）超时（秒），最小值 1 |
 | `CTYUN_HEADER_RETRY` | `1` | 头阶段故障（超时/断连/RST）自动重试开关（>0 开启单次重试，0 禁用） |
+| `CTYUN_MODEL_PRICING` | 空 | 模型价目表 JSON 字符串（可选 cost 估算数据源）；仅落 persist 顶层 `model_pricing` schema，不实现任何计费 UI |
 
 配置优先级：env > 持久化文件 > 内置默认。
 

@@ -665,6 +665,7 @@ EVENTS = collections.deque(maxlen=100)  # {"ts","kind":"proxy"|"upstream"|"retry
 # 持久化/清洗成本高，单流 maxlen=100 硬上界等价满足"每 key 有界"，tooltip 按需过滤。
 
 CAPTURE_ERRORS = False  # _CFG_LOCK 守护
+MODEL_PRICING: dict = {}  # v2 P3：model 价目表（可选 cost 估算），main() 启动时置值，之后只读
 ERROR_EVENTS = collections.deque(maxlen=ERROR_RING_MAX)
 ERROR_LOCK = threading.Lock()
 _ERROR_EVENT_SEQ = 0  # ERROR_LOCK 内递增
@@ -861,6 +862,7 @@ def save_stats_counters(path: str) -> None:
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump({"upstream_base": base,
                    "capture_errors": capture_enabled,
+                   "model_pricing": MODEL_PRICING,
                    "stats": dict(counters, daily=daily, daily_by_model=daily_by_model,
                                  events=events)},
                   fh, ensure_ascii=False)
@@ -894,6 +896,14 @@ def load_capture_errors(path: str) -> bool:
     data = _load_persist_file(path)
     val = data.get("capture_errors") if isinstance(data, dict) else None
     return val if isinstance(val, bool) else False
+
+
+def load_model_pricing(path: str) -> dict:
+    """从持久化文件顶层读 model_pricing；缺/损坏/非 dict → {}。
+    env seam CTYUN_MODEL_PRICING（JSON 字符串）优先级更高，由 main() 覆盖。"""
+    data = _load_persist_file(path)
+    val = data.get("model_pricing") if isinstance(data, dict) else None
+    return val if isinstance(val, dict) else {}
 
 
 _DAILY_FIELDS = ("requests", "filtered", "errors_proxy", "errors_upstream",
@@ -1412,6 +1422,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             try:
                 self._body_err_line = None
                 self._tpm_usage = None
+                self._p3_usage_tokens = None
                 filtered, truncated = self._relay_sse(resp,
                     final=not empty_stream_should_retry(EMPTY_RETRY_MAX))
                 body_error = self._body_err_line is not None
@@ -1451,6 +1462,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     return
                 self._body_err_line = None
                 self._tpm_usage = None
+                self._p3_usage_tokens = None
                 filtered, truncated = self._relay_sse(resp, final=True)
                 body_error = self._body_err_line is not None
                 ttfb_ms = round((t_headers_done - t_conn_start) * 1000, 1)
@@ -1500,12 +1512,16 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                       ttfb_ms=ttfb_ms, stream=1, outcome=outcome.category,
                       qwait_ms=tpm_qwait_ms,
                       tpm_used=tpm_final_used if tpm_key is not None else None)
+            p3_tokens = self._p3_usage_tokens
             _record_request(self.command, self.path, resp.status,
                             (time.time() - started) * 1000, filtered, model=model,
                             error=outcome.counts_error,
                             rid=self._req_id, upstream_host=self._upstream_host,
                             ttfb_ms=ttfb_ms, stream=1, outcome=outcome.category,
+                            tokens=p3_tokens[2] if p3_tokens else None,
                             bytes_out=self._relay_bytes, chunks=self._relay_chunks,
+                            tokens_prompt=p3_tokens[0] if p3_tokens else 0,
+                            tokens_completion=p3_tokens[1] if p3_tokens else 0,
                             phase_ms={"connect": connect_ms, "headers": headers_ms,
                                       "body": body_ms})
         else:
@@ -1517,6 +1533,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             body_ms = round((self._t_first_byte_mark - t_headers_done) * 1000, 1)
             body_error = False
             tpm_final_used = tpm_est if tpm_key is not None else None
+            p3_buf_tokens = None
             if relayed_data:
                 try:
                     parsed = json.loads(relayed_data.decode("utf-8", "replace"))
@@ -1524,14 +1541,17 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     pass  # non-JSON body -> no body error, fail-open
                 else:
                     body_error = body_has_error(parsed)
-                    # TPM settle：解析 usage.total_tokens 校正（非 dict / 无 usage 不校正）
-                    if tpm_key is not None and isinstance(parsed, dict):
+                    # TPM settle：解析 usage.total_tokens 校正（非 dict / 无 usage 不校正）；
+                    # v2 P3：同一 parsed dict 顺手抽 usage 数值——零额外 json.loads（R1）
+                    if isinstance(parsed, dict):
                         usage = parsed.get("usage")
                         if isinstance(usage, dict):
-                            total = usage.get("total_tokens")
-                            if isinstance(total, int) and total >= 0:
-                                tpm_settle(tpm_key, tpm_est, total)
-                                tpm_final_used = total
+                            p3_buf_tokens = usage_dict_tokens(usage)
+                            if tpm_key is not None:
+                                total = usage.get("total_tokens")
+                                if isinstance(total, int) and total >= 0:
+                                    tpm_settle(tpm_key, tpm_est, total)
+                                    tpm_final_used = total
             outcome = classify_outcome(status=resp.status, body_error=body_error)
             self._log(started, resp.status, outcome.log_result, 0, model=model,
                       rid=self._req_id, upstream_host=self._upstream_host,
@@ -1543,7 +1563,10 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                             error=outcome.counts_error,
                             rid=self._req_id, upstream_host=self._upstream_host,
                             ttfb_ms=ttfb_ms, stream=0, outcome=outcome.category,
+                            tokens=p3_buf_tokens[2] if p3_buf_tokens else None,
                             bytes_out=self._relay_bytes, chunks=self._relay_chunks,
+                            tokens_prompt=p3_buf_tokens[0] if p3_buf_tokens else 0,
+                            tokens_completion=p3_buf_tokens[1] if p3_buf_tokens else 0,
                             phase_ms={"connect": connect_ms, "headers": headers_ms,
                                       "body": body_ms})
             if outcome.capture:
@@ -1631,11 +1654,13 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     # b"\n"/b"\r\n" = record 终结；b"" = EOF（残留 record 同规则收尾）
                     kinds = [sse_data_line_kind(buf_line) for buf_line in pending]
                     saw_done = saw_done or ("done" in kinds)
-                    # TPM usage 捕获：本 record 内所有行取最后非空 usage 帧
+                    # TPM usage 捕获：本 record 内所有行取最后非空 usage 帧；
+                    # v2 P3 同循环顺手消费已解析 dict——零额外 json.loads（R1）
                     for buf_line in pending:
                         usage_hit = sse_line_usage(buf_line)
                         if usage_hit is not None:
                             self._tpm_usage = usage_hit
+                            self._p3_usage_tokens = usage_dict_tokens(usage_hit)
                     if self._body_err_line is None:
                         hit = next((l for l in pending if sse_line_body_error(l)), None)
                         if hit is not None:
@@ -1803,7 +1828,8 @@ class AdminHandler(http.server.BaseHTTPRequestHandler):
         elif path == "/api/config":
             with _CFG_LOCK:
                 payload = {"upstream_base": UPSTREAM_BASE, "source": _upstream_source,
-                           "capture_errors": CAPTURE_ERRORS}
+                           "capture_errors": CAPTURE_ERRORS,
+                           "model_pricing": MODEL_PRICING}
             self._send_json(200, payload)
         elif path == "/api/errors":
             id_str = urllib.parse.parse_qs(
@@ -2505,7 +2531,7 @@ FAVICON_ICO = base64.b64decode(_FAVICON_B64)
 
 
 def main() -> None:
-    global UPSTREAM_BASE, _upstream_source, _stats_dirty, CAPTURE_ERRORS
+    global UPSTREAM_BASE, _upstream_source, _stats_dirty, CAPTURE_ERRORS, MODEL_PRICING
     UPSTREAM_BASE, _upstream_source = resolve_upstream_base(
         os.environ.get("CTYUN_UPSTREAM_BASE"), PERSIST_PATH)
     counters = load_stats_counters(PERSIST_PATH)  # 累计计数跨重启续算
@@ -2513,6 +2539,18 @@ def main() -> None:
     daily_by_model = load_daily_by_model_buckets(PERSIST_PATH)  # 按天×模型矩阵跨重启续算
     events = load_stats_events(PERSIST_PATH)      # 错误/重试事件流跨重启续算
     CAPTURE_ERRORS = load_capture_errors(PERSIST_PATH)  # 启动时回填开关
+    # v2 P3：model_pricing 装载（env seam 优先，否则持久化文件；解析失败回落 {}）
+    pricing_env = os.environ.get("CTYUN_MODEL_PRICING", "")
+    if pricing_env:
+        try:
+            MODEL_PRICING = json.loads(pricing_env)
+        except ValueError:
+            # 吞掉的是 env 里非法 JSON 字符串：价目表 best-effort，回落 {} 即可，无其他路径可达。
+            MODEL_PRICING = {}
+        if not isinstance(MODEL_PRICING, dict):
+            MODEL_PRICING = {}
+    else:
+        MODEL_PRICING = load_model_pricing(PERSIST_PATH)
     with STATS_LOCK:
         STATS["requests_total"] = counters["requests_total"]
         STATS["filtered_total"] = counters["filtered_total"]
