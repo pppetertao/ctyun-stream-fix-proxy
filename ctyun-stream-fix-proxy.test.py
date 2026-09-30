@@ -4251,6 +4251,51 @@ class TpmRateLimitTest(unittest.TestCase):
         self.assertIn("tpm=%d" % expected_used, stderr,
                       "REQ line must carry tpm=%d, stderr:\n%s" % (expected_used, stderr))
 
+    def test_retry_does_not_double_charge(self) -> None:
+        """header-stall 重试复用同一次准入：上游被请求 2 次，窗口只 charge 1 次 est。
+
+        stall_calls=(1,) → 首呼 stall 触发 header-timeout 重试 → 次呼正常 SSE。
+        SSE 无 usage 帧 → 不 settle，bucket used 应恰为单次 est（非 2×est）。
+        """
+        # 重建代理：指向 stall 上游（窗口 60s 防 2s seam 下 est 条目滚出窗口）
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_fake_upstreams()
+        upstream_port, calls = make_stall_upstream(stall_calls=(1,))
+        self.proxy_port = free_port()
+        self.proc = start_proxy(upstream_port, self.proxy_port,
+                                extra_env={"CTYUN_TPM_LIMIT": "200",
+                                           "CTYUN_TPM_WINDOW_S": "60",
+                                           "CTYUN_TPM_QUEUE_TIMEOUT_S": "5",
+                                           "CTYUN_TPM_QUEUE_MAX": "2",
+                                           "CTYUN_HEADER_TIMEOUT": "1"})
+        small_body = b'{"model":"m","stream":true,"messages":[]}'   # 41B → est = 22
+        auth = "Bearer test-key-retry"
+        status, data = post_sse_auth(self.proxy_port, small_body, auth)
+        self.assertEqual(status, 200, "retried request must succeed, got %d" % status)
+        self.assertEqual(data, SSE_A + SSE_B + SSE_DONE)
+        self.assertEqual(len(calls), 2,
+                         "header stall must trigger exactly one retry, calls=%d" % len(calls))
+        est = max(1, int(len(small_body) * 0.55))
+        _, body, _ = admin_get(self.proc.admin_port, "/api/tpm_stats")
+        snap = json.loads(body.decode("utf-8"))
+        self.assertEqual(len(snap["buckets"]), 1,
+                         "one key must own exactly one bucket, got %r" % snap["buckets"])
+        b = snap["buckets"][0]
+        self.assertEqual(b["key"], "sha256:" + hashlib.sha256(b"test-key-retry").hexdigest()[:12],
+                         "bucket key must be the auth token's masked sha256, got %r" % b["key"])
+        self.assertEqual(b["used"], est,
+                         "retry must not double-charge: used=%r want single est=%d"
+                         % (b["used"], est))
+        stderr = stderr_text(self.proc)
+        self.assertIn("retried=1", stderr,
+                      "REQ line must carry retried=1, stderr:\n" + stderr)
+        self.assertIn("tpm=%d" % est, stderr,
+                      "REQ line must carry tpm=%d (single charge), stderr:\n%s"
+                      % (est, stderr))
+
     def test_all_existing_tests_pass(self) -> None:
         """既有 127 例无回归冒烟：TPM env 开启下 SSE 透传/plain 透传/统计端点正常。"""
         data = post_sse(self.proxy_port)   # 无 auth → 既有路径，零 TPM 介入
