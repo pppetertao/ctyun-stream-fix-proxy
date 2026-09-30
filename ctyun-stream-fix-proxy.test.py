@@ -64,6 +64,7 @@ class FakeUpstreamHandler(BaseHTTPRequestHandler):
     sleep_stall_all = False    # True → 每呼读 body 后 sleep 持连不写响应（代理 getresponse 抛 socket.timeout）
     sleep_stall_calls = ()     # 1-based 呼叫序号元组：命中则 sleep 持连不写响应（同 sleep_stall_all 形态）
     sleep_stall_seconds = 3.0  # 须 > 用例 HEADER_TIMEOUT（白盒 0.5s/黑盒 1s），余量 ≥2s 防 flaky
+    tail_delay_after_done_s = 0.0  # >0 → 正常流写完后 flush+sleep 再关连接（模拟"发完 [DONE] 滞留"的 EOF 尾间隙）
     rst_all = False         # True → 每呼读 body 后 SO_LINGER(1,0) close 强制发 RST（代理 getresponse 抛 ConnectionResetError）
     rst_calls = ()          # 1-based 呼叫序号元组：命中则 SO_LINGER(1,0) close 强制发 RST（同 rst_all 形态）
     calls = None          # 共享 list：非 None 时按调用序 append 计数；无 body_override 时首次回空流
@@ -183,6 +184,9 @@ class FakeUpstreamHandler(BaseHTTPRequestHandler):
         self.end_headers()
         try:
             self.wfile.write(body)
+            if self.tail_delay_after_done_s:
+                self.wfile.flush()
+                time.sleep(self.tail_delay_after_done_s)
         except ConnectionError:
             # 吞掉的是 client-abort 测试里代理线程 EPIPE 死掉后不再读上游、本假上游
             # 写出端随之 Broken pipe 的预期路径：测试假上游无需留痕，无其他路径可达。
@@ -229,7 +233,8 @@ def make_fake_upstream(poison: bool, tag: str = "/plain", big: bool = False,
                        sleep_stall_all: bool = False, sleep_stall_calls: tuple = (),
                        sleep_stall_seconds: float = 3.0,
                        rst_all: bool = False, rst_calls: tuple = (),
-                       fail_200_error: bool = False) -> int:
+                       fail_200_error: bool = False,
+                       tail_delay_after_done_s: float = 0.0) -> int:
     attrs = {"poison": poison, "tag": tag, "big": big, "fail_500": fail_500,
              "empty_stream": empty_stream, "empty_stream_calls": empty_stream_calls,
              "blank_stream": blank_stream,
@@ -244,6 +249,7 @@ def make_fake_upstream(poison: bool, tag: str = "/plain", big: bool = False,
              "rst_all": rst_all,
              "rst_calls": rst_calls,
              "fail_200_error": fail_200_error,
+             "tail_delay_after_done_s": tail_delay_after_done_s,
              "bodies": [] if record_bodies else None}
     if scripted:
         attrs["calls"] = []

@@ -1511,7 +1511,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                         primed.extend(pending)
                         if line:
                             primed.append(line)
-                        self._relay_chunks += 1  # v2 P2：每非毒 record 计一 chunk（毒 record 已在上面 filtered 分支）
+                        if pending or line:
+                            self._relay_chunks += 1  # v2 P2：每非毒 record 计一 chunk（毒 record 已在 filtered 分支；纯 EOF 迭代不计——fix-loop-1）
                         if not saw_usage:
                             saw_usage = any(sse_line_has_usage(l) for l in pending)
                         if finish_hold:
@@ -1531,22 +1532,24 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                         elif "finish" in kinds:
                             finish_hold = True    # hold 至 EOF 判 usage
                     else:
-                        now = time.monotonic()
-                        if self._t_last_record is not None \
-                                and now - self._t_last_record > STALL_THRESHOLD_S:
-                            # v2 P2：stall 自增是热循环内唯一持锁点，且仅跨阈值间隙命中
-                            # （正常流相邻 record 间隔 << 阈值，<0.1% 命中；R1 纪律）
-                            with STATS_LOCK:
-                                STATS["stalls_total"] += 1
-                        self._t_last_record = now
-                        for buf_line in pending:
-                            self.wfile.write(buf_line)
-                            self._relay_bytes += len(buf_line)
-                        if line:
-                            self.wfile.write(line)
-                            self._relay_bytes += len(line)
-                        self.wfile.flush()
-                        self._relay_chunks += 1
+                        if pending or line:  # 纯 EOF 迭代（pending 空 + line 空）不计 chunk、不做 stall 检测：
+                            # 否则"最后 record→EOF 尾间隙"会被当相邻 record 间隔误报 stall（fix-loop-1）
+                            now = time.monotonic()
+                            if self._t_last_record is not None \
+                                    and now - self._t_last_record > STALL_THRESHOLD_S:
+                                # v2 P2：stall 自增是热循环内唯一持锁点，且仅跨阈值间隙命中
+                                # （正常流相邻 record 间隔 << 阈值，<0.1% 命中；R1 纪律）
+                                with STATS_LOCK:
+                                    STATS["stalls_total"] += 1
+                            self._t_last_record = now
+                            for buf_line in pending:
+                                self.wfile.write(buf_line)
+                                self._relay_bytes += len(buf_line)
+                            if line:
+                                self.wfile.write(line)
+                                self._relay_bytes += len(line)
+                            self.wfile.flush()
+                            self._relay_chunks += 1
                     pending = []
                     poisoned = False
                     if line == b"":
