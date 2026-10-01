@@ -5391,6 +5391,76 @@ class SettlePersistV3Test(unittest.TestCase):
             mod.STATS["daily_by_key"] = orig
 
 
+class ProbeHistoryV3Test(unittest.TestCase):
+    """v3 probe history (ts, ms) 二元组 + 快照降采样 + /api/probe_history 端点（决策 7）。"""
+
+    def setUp(self) -> None:
+        self.mod = load_proxy_module()
+
+    def test_probe_history_snapshot_downsamples_to_200(self) -> None:
+        mod = self.mod
+        orig_hist = mod._PROBE_STATE["history"]
+        try:
+            # 注入 1000 条 monotonically 递增 ts 的二元组
+            mod._PROBE_STATE["history"] = collections.deque(
+                [(float(i), float(i * 10)) for i in range(1000)])
+            snap = mod.probe_history_snapshot()
+            self.assertLessEqual(len(snap["points"]), 200)
+            self.assertEqual(snap["count_total"], 1000)
+            ts = [p[0] for p in snap["points"]]
+            self.assertEqual(ts, sorted(ts), "points 必须单调 ts")
+        finally:
+            mod._PROBE_STATE["history"] = orig_hist
+
+    def test_probe_history_snapshot_small_returns_all(self) -> None:
+        mod = self.mod
+        orig_hist = mod._PROBE_STATE["history"]
+        try:
+            mod._PROBE_STATE["history"] = collections.deque(
+                [(10.0, 5.0), (11.0, 6.0), (12.0, 7.0)])
+            snap = mod.probe_history_snapshot()
+            self.assertEqual(snap["points"],
+                             [[10.0, 5.0], [11.0, 6.0], [12.0, 7.0]])
+            self.assertEqual(snap["count_total"], 3)
+        finally:
+            mod._PROBE_STATE["history"] = orig_hist
+
+    def test_latency_p90_tuples_equivalent_to_scalar_oracle(self) -> None:
+        mod = self.mod
+        values = [50.0] * 180 + [500.0] * 20
+        ordered = sorted(values)
+        expected = float(ordered[int(0.9 * (len(ordered) - 1))])
+        tuples = [(float(i), v) for i, v in enumerate(values)]
+        self.assertEqual(mod._latency_p90(tuples), expected,
+                         "二元组输入与手工最近秩（标量 oracle）一致")
+        self.assertEqual(mod._latency_p90(values), expected,
+                         "旧标量形态继续支持（AC8 回归）")
+        self.assertEqual(mod._latency_p90([]), 0.0)
+
+    def test_probe_spike_due_tuples(self) -> None:
+        mod = self.mod
+        f = mod._probe_spike_due
+        # 全平 → 无突增
+        self.assertFalse(f([(0.0, 50.0)] * 200))
+        # 180×50 + 20×500：基线 P90≈50，最近 20 P90=500 > 100 → 告警
+        self.assertTrue(f([(0.0, 50.0)] * 180 + [(0.0, 500.0)] * 20))
+
+    def test_probe_history_endpoint_returns_json(self) -> None:
+        upstream_port = make_fake_upstream(False)
+        proxy_port = free_port()
+        proc = start_proxy(upstream_port, proxy_port,
+                           extra_env={"CTYUN_PROBE_INTERVAL_S": "3600"})
+        try:
+            _, body, _ = admin_get(proc.admin_port, "/api/probe_history")
+            snap = json.loads(body.decode("utf-8"))
+            self.assertIn("points", snap)
+            self.assertIn("count_total", snap)
+            self.assertIsInstance(snap["points"], list)
+        finally:
+            stop_proxy(proc)
+            stop_fake_upstreams()
+
+
 class RequestIdTest(unittest.TestCase):
     """P1 地基：request id / upstream host / ttfb / stream / outcome 全链路。
 

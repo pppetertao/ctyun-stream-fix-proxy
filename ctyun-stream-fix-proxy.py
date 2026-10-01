@@ -936,7 +936,7 @@ _PROBE_STATE = {      # PROBE_LOCK 保护（探测线程写 / probe_state_snapsh
     "consecutive_failures": 0,
     "last_failure_alert_ts": 0.0,   # 连续失败告警去抖时间戳
     "last_spike_alert_ts": 0.0,     # 延迟突增告警去抖时间戳（同类去抖，两桶独立）
-    "history": collections.deque(maxlen=PROBE_HISTORY_MAX),  # 成功 probe 延迟（ms）历史
+    "history": collections.deque(maxlen=PROBE_HISTORY_MAX),  # 成功 probe (ts, ms) 历史（v3 二元组）
 }
 STARTED_AT = time.time()
 RECENT_REQUESTS = collections.deque(maxlen=100)  # {"ts","method","path","status","dur_ms","filtered","model","rid","upstream_host","ttfb_ms","stream","tokens","bytes_out","chunks","outcome"}
@@ -1406,18 +1406,26 @@ def load_stats_events(path: str) -> list:
 
 
 def _latency_p90(samples) -> float:
-    """延迟样本（ms，可迭代）的 P90（最近秩法：idx = int(0.9 * (n - 1))）。
-    空序列 → 0.0。样本上限 PROBE_HISTORY_MAX，排序成本可忽略（每成功 probe 一次）。"""
+    """延迟样本 P90（最近秩法：idx = int(0.9 * (n - 1))），空 → 0.0。
+
+    v3 双形态：接受 ms 标量可迭代（旧口径）或 (ts, ms) 二元组可迭代（probe history），
+    自动按首元素形态选择排序键。样本上限 PROBE_HISTORY_MAX，排序成本可忽略。
+    """
     if not samples:
         return 0.0
-    ordered = sorted(samples)
+    first = next(iter(samples))
+    if isinstance(first, tuple):
+        ordered = sorted(ms for _, ms in samples)
+    else:
+        ordered = sorted(samples)
     return float(ordered[int(0.9 * (len(ordered) - 1))])
 
 
 def _probe_spike_due(history, factor: float = PROBE_LATENCY_SPIKE_FACTOR) -> bool:
     """延迟突增判定：最近 20 次成功 probe 的 P90 > 全历史 P90 × factor 且样本 ≥ 20。
 
-    history：成功 probe 延迟（ms）deque（新在尾）；len < 20 → False（样本不足不告警）。
+    history：成功 probe (ts, ms) 二元组 deque（v3 双形态，_latency_p90 内部处理）；
+    len < 20 → False（样本不足不告警）。
     """
     if len(history) < 20:
         return False
@@ -1491,7 +1499,9 @@ def _probe_loop() -> None:
             state["last_probe_latency_ms"] = round(latency_ms, 1)
             if ok:
                 state["consecutive_failures"] = 0
-                state["history"].append(round(latency_ms, 1))
+                # v3 P10：条目改 (ts, ms) 二元组（ts 重用已写入的 last_probe_ts）
+                state["history"].append((state["last_probe_ts"],
+                                         round(latency_ms, 1)))
                 if _probe_spike_due(state["history"]):
                     now = time.time()
                     if now - state["last_spike_alert_ts"] >= PROBE_ALERT_DEBOUNCE_S:
@@ -1527,6 +1537,20 @@ def probe_state_snapshot() -> dict:
             "probe_enabled": PROBE_ENABLED,
         }
     return snap
+
+
+def probe_history_snapshot() -> dict:
+    """P10 趋势线数据源：PROBE_LOCK 内取 history 浅拷贝，均匀抽稀 ≤200 点。
+
+    返回 {"points": [[ts, ms], ...], "count_total": n}。step = max(1, n // 200)，
+    points 保持追加序（时间单调）。probe_state_snapshot 6 键契约不动（本函数独立端点）。
+    """
+    with PROBE_LOCK:
+        history = list(_PROBE_STATE["history"])
+    total = len(history)
+    step = max(1, total // 200)
+    points = [[ts, ms] for ts, ms in history[::step]]
+    return {"points": points, "count_total": total}
 
 
 def flush_stats_if_dirty(path: str) -> None:
@@ -2481,6 +2505,8 @@ class AdminHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(200, payload)
         elif path == "/api/health":
             self._send_json(200, {"upstream": probe_state_snapshot()})
+        elif path == "/api/probe_history":
+            self._send_json(200, probe_history_snapshot())
         elif path == "/api/errors":
             id_str = urllib.parse.parse_qs(
                 urllib.parse.urlsplit(self.path).query).get("id", [None])[0]
