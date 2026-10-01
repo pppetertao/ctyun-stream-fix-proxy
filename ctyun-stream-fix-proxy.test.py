@@ -5461,6 +5461,124 @@ class ProbeHistoryV3Test(unittest.TestCase):
             stop_fake_upstreams()
 
 
+class SnapshotV3Test(unittest.TestCase):
+    """v3 stats_snapshot perf 新键 + daily_by_key 深拷 + percentile 推广（决策 6）。"""
+
+    def setUp(self) -> None:
+        self.mod = load_proxy_module()
+
+    def test_stats_snapshot_contains_v3_keys(self) -> None:
+        mod = self.mod
+        snap = mod.stats_snapshot()
+        self.assertIn("daily_by_key", snap)
+        self.assertIn("hourly_tokens", snap)
+        self.assertIsInstance(snap["hourly_tokens"], list)
+        perf = snap["perf"]
+        for key in ("ttfb_hist_by_model", "phase_p50_ms_by_model",
+                    "phase_p90_ms_by_model", "stalls_by_model",
+                    "qwait_p50_ms_by_model", "qwait_p90_ms_by_model",
+                    "tpm_settle_ratio_p50_by_model",
+                    "tpm_settle_ratio_p90_by_model"):
+            self.assertIn(key, perf, "perf 缺 v3 键 %s" % key)
+
+    def test_qwait_percentile_matches_nearest_rank(self) -> None:
+        mod = self.mod
+        orig = mod.STATS["qwait_ms_by_model"]
+        mod.STATS["qwait_ms_by_model"] = {}
+        try:
+            samples = [float((i * 7) % 100) for i in range(100)]
+            for v in samples:
+                mod._record_request("POST", "/q", 200, 1.0, 0, model="m1",
+                                    qwait_ms=v)
+            snap = mod.stats_snapshot()
+            perf = snap["perf"]
+            ordered = sorted(samples)
+            expected_p90 = round(float(ordered[int(0.9 * (len(ordered) - 1))]), 1)
+            expected_p50 = round(float(ordered[int(0.5 * (len(ordered) - 1))]), 1)
+            self.assertEqual(perf["qwait_p90_ms_by_model"]["m1"], expected_p90)
+            self.assertEqual(perf["qwait_p50_ms_by_model"]["m1"], expected_p50)
+        finally:
+            mod.STATS["qwait_ms_by_model"] = orig
+
+    def test_settle_ratio_percentile_matches_nearest_rank(self) -> None:
+        mod = self.mod
+        orig_b = mod.TPM_BUCKETS
+        orig_r = mod.STATS["tpm_settle_ratio_by_model"]
+        mod.TPM_BUCKETS = {}
+        mod.STATS["tpm_settle_ratio_by_model"] = {}
+        try:
+            bucket = mod._TpmBucket()
+            bucket.used = 0  # .used 是 deque 子类的附加属性，须显式初始化
+            mod.TPM_BUCKETS[("k1", "m1")] = bucket
+            # 50 个样本：0.5, 0.6, ..., 1.4（10 个值各 5 次）
+            for i in range(50):
+                ratio = 0.5 + (i % 10) * 0.1
+                mod.tpm_settle("k1", 100, int(100 * ratio), "m1")
+            ordered = sorted(
+                [0.5 + (i % 10) * 0.1 for i in range(50)])
+            expected_p90 = round(float(ordered[int(0.9 * (len(ordered) - 1))]), 3)
+            snap = mod.stats_snapshot()
+            self.assertEqual(
+                snap["perf"]["tpm_settle_ratio_p90_by_model"]["m1"],
+                expected_p90)
+        finally:
+            mod.TPM_BUCKETS = orig_b
+            mod.STATS["tpm_settle_ratio_by_model"] = orig_r
+
+    def test_hourly_tokens_json_serializable(self) -> None:
+        mod = self.mod
+        mod._record_request("POST", "/h", 200, 1.0, 0, model="m1",
+                            tokens_prompt=5, tokens_completion=2)
+        snap = mod.stats_snapshot()
+        self.assertIsInstance(snap["hourly_tokens"], list)
+        self.assertGreaterEqual(len(snap["hourly_tokens"]), 1)
+        self.assertIn("hour_start_ts", snap["hourly_tokens"][-1])
+        json.dumps(snap)  # deque 裸引用会 TypeError——能 dump 即证明已安全转换
+
+    def test_ttfb_hist_by_model_in_perf(self) -> None:
+        mod = self.mod
+        orig = mod.STATS["ttfb_hist"]
+        mod.STATS["ttfb_hist"] = {"m1": [0] * 9, "m2": [0] * 9}
+        try:
+            snap = mod.stats_snapshot()
+            self.assertEqual(snap["perf"]["ttfb_hist_by_model"],
+                             {"m1": [0] * 9, "m2": [0] * 9})
+        finally:
+            mod.STATS["ttfb_hist"] = orig
+
+    def test_daily_by_key_snapshot_is_deep_copy(self) -> None:
+        mod = self.mod
+        orig = mod.STATS["daily_by_key"]
+        mod.STATS["daily_by_key"] = {}
+        try:
+            mod._record_request("POST", "/k", 200, 1.0, 0, model="m1",
+                                key_id12="abcdef123456", tokens_prompt=10)
+            snap = mod.stats_snapshot()
+            entry = snap["daily_by_key"][mod.today_key()]["abcdef123456"]
+            self.assertEqual(entry["tokens_prompt"], 10)
+            # 深拷贝验证：篡改 snap 不影响 STATS
+            entry["tokens_prompt"] = 999
+            self.assertEqual(
+                mod.STATS["daily_by_key"][mod.today_key()]["abcdef123456"][
+                    "tokens_prompt"], 10)
+        finally:
+            mod.STATS["daily_by_key"] = orig
+
+    def test_phase_percentile_by_model(self) -> None:
+        mod = self.mod
+        orig = mod.STATS["phase_ms_by_model"]
+        mod.STATS["phase_ms_by_model"] = {}
+        try:
+            mod._record_request("POST", "/p", 200, 1.0, 0, model="m1",
+                                phase_ms={"connect": 50.0, "headers": 150.0,
+                                          "body": 400.0})
+            p50 = mod.stats_snapshot()["perf"]["phase_p50_ms_by_model"]["m1"]
+            self.assertEqual(set(p50), {"connect", "headers", "body"})
+            self.assertGreaterEqual(p50["connect"], 0)
+        finally:
+            mod.STATS["phase_ms_by_model"] = orig
+
+
 class RequestIdTest(unittest.TestCase):
     """P1 地基：request id / upstream host / ttfb / stream / outcome 全链路。
 

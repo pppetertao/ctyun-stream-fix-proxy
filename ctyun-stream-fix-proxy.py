@@ -1421,6 +1421,16 @@ def _latency_p90(samples) -> float:
     return float(ordered[int(0.9 * (len(ordered) - 1))])
 
 
+def _percentile(samples, q: float) -> float:
+    """样本（可迭代，元素可比）的 q 分位（最近秩法：idx = int(q * (n - 1))）。
+    空序列 → 0.0。_latency_p90 = _percentile(samples, 0.9) 的推广（v3 P8/T4 分位用）。
+    """
+    if not samples:
+        return 0.0
+    ordered = sorted(samples)
+    return float(ordered[int(q * (len(ordered) - 1))])
+
+
 def _probe_spike_due(history, factor: float = PROBE_LATENCY_SPIKE_FACTOR) -> bool:
     """延迟突增判定：最近 20 次成功 probe 的 P90 > 全历史 P90 × factor 且样本 ≥ 20。
 
@@ -1870,6 +1880,9 @@ def stats_snapshot() -> dict:
         snap["daily_by_model"] = {
             d: {m: dict(v) for m, v in models.items()}
             for d, models in STATS["daily_by_model"].items()}
+        snap["daily_by_key"] = {
+            d: {k: dict(v) for k, v in keys.items()}
+            for d, keys in STATS["daily_by_key"].items()}
         snap["recent"] = list(RECENT_REQUESTS)
         snap["poison_previews"] = list(POISON_PREVIEWS)
         snap["events"] = [dict(e) for e in EVENTS]  # 逐条浅拷贝（对齐 daily 模式），oldest→newest
@@ -1882,6 +1895,13 @@ def stats_snapshot() -> dict:
                                              for m, ring in STATS["tpm_settle_ratio_by_model"].items()}
         ttfb_hist = {m: list(h) for m, h in STATS["ttfb_hist"].items()}
         phase_hist = {k: list(v) for k, v in STATS["phase_ms"].items()}
+        phase_by_model = {m: {k: list(v) for k, v in hists.items()}
+                          for m, hists in STATS["phase_ms_by_model"].items()}
+        qwait_by_model = {m: list(ring)
+                          for m, ring in STATS["qwait_ms_by_model"].items()}
+        settle_by_model = {m: list(ring)
+                           for m, ring in STATS["tpm_settle_ratio_by_model"].items()}
+        stalls_by_model = dict(STATS["stalls_by_model"])
         rates = dict(STATS["rates"])
         stalls_total = STATS["stalls_total"]
         recent_len = len(RECENT_REQUESTS)
@@ -1896,7 +1916,14 @@ def stats_snapshot() -> dict:
     perf = {"ttfb_p50_ms_by_model": {}, "ttfb_p90_ms_by_model": {},
             "phase_p50_ms": {}, "bytes_per_s": 0.0, "chunks_per_s": 0.0,
             "tokens_per_s": 0.0, "stalls_total": stalls_total,
-            "stream_share": 0.0}
+            "stream_share": 0.0,
+            # v3：P1 直方图数据源 + per-model 分位（P6/P7/P8/T4）
+            "ttfb_hist_by_model": ttfb_hist,
+            "phase_p50_ms_by_model": {}, "phase_p90_ms_by_model": {},
+            "stalls_by_model": stalls_by_model,
+            "qwait_p50_ms_by_model": {}, "qwait_p90_ms_by_model": {},
+            "tpm_settle_ratio_p50_by_model": {},
+            "tpm_settle_ratio_p90_by_model": {}}
     for model, hist in ttfb_hist.items():
         perf["ttfb_p50_ms_by_model"][model] = round(
             hist_percentile(hist, HIST_BUCKETS_MS, 0.5), 1)
@@ -1905,6 +1932,23 @@ def stats_snapshot() -> dict:
     for name in ("connect", "headers", "body"):
         perf["phase_p50_ms"][name] = round(
             hist_percentile(phase_hist[name], HIST_BUCKETS_MS, 0.5), 1)
+    # v3 P6：per-model 三阶段分位（9 桶直方图，与全局同口径）
+    for model, hists in phase_by_model.items():
+        perf["phase_p50_ms_by_model"][model] = {
+            name: round(hist_percentile(hists[name], HIST_BUCKETS_MS, 0.5), 1)
+            for name in ("connect", "headers", "body")}
+        perf["phase_p90_ms_by_model"][model] = {
+            name: round(hist_percentile(hists[name], HIST_BUCKETS_MS, 0.9), 1)
+            for name in ("connect", "headers", "body")}
+    # v3 P8/T4：qwait 与结算偏差最近秩分位（_percentile 推广，round 口径与 AC5 手工计算一致）
+    for model, samples in qwait_by_model.items():
+        perf["qwait_p50_ms_by_model"][model] = round(_percentile(samples, 0.5), 1)
+        perf["qwait_p90_ms_by_model"][model] = round(_percentile(samples, 0.9), 1)
+    for model, samples in settle_by_model.items():
+        perf["tpm_settle_ratio_p50_by_model"][model] = round(
+            _percentile(samples, 0.5), 3)
+        perf["tpm_settle_ratio_p90_by_model"][model] = round(
+            _percentile(samples, 0.9), 3)
     elapsed = time.monotonic() - rates["window_start"]
     if elapsed < 60.0 and elapsed > 0:
         # 窗口过期（≥60s 无请求）时速率报 0：无近期流量（Anchor Reconciliation）
