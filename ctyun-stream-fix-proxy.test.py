@@ -1145,6 +1145,26 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         status3, qwait3 = mod.tpm_admit("key:big", mod.TPM_LIMIT + 1, "m:big")
         self.assertEqual(status3, "ok")
 
+    def test_tpm_snapshot_keeps_rejected_after_window_roll(self) -> None:
+        """窗口滚空（used<=0、无 waiter）的桶若曾有 rejected/timeouts，快照必须保留。"""
+        mod = self.mod
+        self._tpm_cleanup(mod)
+        # 制造 rejected：先占满预算，再硬拒一笔超大
+        mod.tpm_admit("key:rej", mod.TPM_LIMIT, "m:rej")
+        status, _ = mod.tpm_admit("key:rej", mod.TPM_LIMIT + 1, "m:rej")
+        self.assertEqual(status, "full")
+        # 模拟窗口滚过：条目清空、used 归零（rejected 计数仍在）
+        bucket = mod.TPM_BUCKETS[("key:rej", "m:rej")]
+        bucket.clear()
+        bucket.used = 0
+        snap = mod.tpm_snapshot()
+        entry = next((b for b in snap["buckets"]
+                      if b["key"] == "sha256:" + "key:rej"[:12]
+                      and b["model"] == "m:rej"), None)
+        self.assertIsNotNone(
+            entry, "rejected>0 的空桶不得被展示层过滤吞掉")
+        self.assertEqual(entry["rejected"], 1)
+
     def test_tpm_admit_queue_full(self) -> None:
         mod = self.mod
         self._tpm_cleanup(mod)

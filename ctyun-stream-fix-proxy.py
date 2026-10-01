@@ -619,8 +619,10 @@ def tpm_snapshot() -> dict:
         for (key_id, model), bucket in TPM_BUCKETS.items():
             _tpm_prune(bucket, now)
             if bucket.used <= 0 and not any(
-                    (w.key_id, w.model) == (key_id, model) for w in TPM_WAITERS):
-                continue  # 空桶不展示（噪声）
+                    (w.key_id, w.model) == (key_id, model) for w in TPM_WAITERS) \
+                    and not _tpm_rejected.get((key_id, model)) \
+                    and not _tpm_timeouts.get((key_id, model)):
+                continue  # 空桶不展示（噪声）；有拒绝/超时计数的桶保留（观测价值）
             buckets.append({
                 "key": "sha256:" + key_id[:12],
                 "model": model,
