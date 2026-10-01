@@ -2797,6 +2797,206 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         finally:
             stop_fake_upstreams()
 
+    def test_tpm_calibrate_constants_defaults(self) -> None:
+        mod = self.mod
+        self.assertEqual(mod.TPM_CALIBRATE_INPUT_BYTES, 240000)
+        self.assertEqual(mod.TPM_CALIBRATE_STEP_TOKENS, 5000)
+        self.assertEqual(mod.TPM_CALIBRATE_MAX_TOKENS, 1)
+        self.assertEqual(mod.TPM_CALIBRATE_BATCH_GAP_S, 2.0)
+        self.assertEqual(mod.TPM_CALIBRATE_MAX_DURATION_S, 240)
+        self.assertEqual(mod.TPM_CALIBRATE_MIN_INTERVAL_S, 1800)
+        self.assertEqual(mod.TPM_CALIBRATE_HARD_CAP_TOKENS, 400000)
+        self.assertEqual(mod.TPM_CALIBRATE_SETTLE_WAIT_S, 60)
+        self.assertEqual(mod.TPM_SAMPLES_MAX, 200)
+        self.assertEqual(mod.TPM_SAMPLES_RETENTION_DAYS, 30)
+        self.assertEqual(mod.TPM_PROBE_RESULTS_MAX, 5)
+
+    def test_tpm_calibrate_constants_env_seam(self) -> None:
+        import subprocess
+        code = (
+            "import os; "
+            "os.environ['CTYUN_CALIBRATE_INPUT_BYTES']='111'; "
+            "os.environ['CTYUN_CALIBRATE_STEP_TOKENS']='222'; "
+            "os.environ['CTYUN_CALIBRATE_MAX_TOKENS']='3'; "
+            "os.environ['CTYUN_CALIBRATE_BATCH_GAP_S']='0.5'; "
+            "os.environ['CTYUN_CALIBRATE_MAX_DURATION_S']='10'; "
+            "os.environ['CTYUN_CALIBRATE_MIN_INTERVAL_S']='9'; "
+            "os.environ['CTYUN_CALIBRATE_HARD_CAP_TOKENS']='999'; "
+            "os.environ['CTYUN_CALIBRATE_SETTLE_WAIT_S']='7'; "
+            "os.environ['CTYUN_TPM_SAMPLES_MAX']='4'; "
+            "os.environ['CTYUN_TPM_SAMPLES_RETENTION_DAYS']='5'; "
+            "import importlib.util, sys; "
+            "spec = importlib.util.spec_from_file_location('m', %r); "
+            "m = importlib.util.module_from_spec(spec); "
+            "spec.loader.exec_module(m); "
+            "print(m.TPM_CALIBRATE_INPUT_BYTES, m.TPM_CALIBRATE_STEP_TOKENS, "
+            "m.TPM_CALIBRATE_MAX_TOKENS, m.TPM_CALIBRATE_BATCH_GAP_S, "
+            "m.TPM_CALIBRATE_MAX_DURATION_S, m.TPM_CALIBRATE_MIN_INTERVAL_S, "
+            "m.TPM_CALIBRATE_HARD_CAP_TOKENS, m.TPM_CALIBRATE_SETTLE_WAIT_S, "
+            "m.TPM_SAMPLES_MAX, m.TPM_SAMPLES_RETENTION_DAYS, m.TPM_PROBE_RESULTS_MAX)"
+            % PROXY_SCRIPT)
+        out = subprocess.check_output([sys.executable, "-c", code], text=True,
+                                      timeout=30).strip()
+        self.assertEqual(out.split(),
+                         ["111", "222", "3", "0.5", "10.0", "9.0", "999", "7.0",
+                          "4", "5", "5"])
+
+    def test_load_tpm_body_err_samples_fault_tolerant(self) -> None:
+        mod = self.mod
+        tmp = tempfile.mkdtemp(prefix="ctyun-proxy-unit-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        path = os.path.join(tmp, "settings.json")
+        self.assertEqual(mod.load_tpm_body_err_samples(path), {})   # 缺文件
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("{not json")
+        self.assertEqual(mod.load_tpm_body_err_samples(path), {})   # 损坏 JSON
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(["not", "dict"], fh)
+        self.assertEqual(mod.load_tpm_body_err_samples(path), {})   # 顶层非 dict
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"other": 1}, fh)
+        self.assertEqual(mod.load_tpm_body_err_samples(path), {})   # 键缺失
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"tpm_body_err_samples": [1, 2]}, fh)
+        self.assertEqual(mod.load_tpm_body_err_samples(path), {})   # 值非 dict
+        now = time.time()
+        fresh = now - 60
+        stale = now - 40 * 86400
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"tpm_body_err_samples": {
+                "kimi": [{"tpm": 31000, "ts": fresh},
+                         {"tpm": 32000, "ts": fresh + 1},
+                         {"tpm": 30000, "ts": stale},        # 超保留期 → 丢
+                         {"tpm": "999", "ts": fresh},         # tpm 非 int → 丢
+                         {"tpm": 28000},                       # 缺 ts → 丢
+                         {"tpm": -5, "ts": fresh},             # tpm ≤0 → 丢
+                         "garbage"],                           # 非 dict → 丢
+                "": [{"tpm": 1, "ts": fresh}],                # 空 model → 丢
+                "x" * 201: [{"tpm": 1, "ts": fresh}],         # model 超长 → 丢
+            }}, fh)
+        out = mod.load_tpm_body_err_samples(path)
+        self.assertEqual(sorted(out.keys()), ["kimi"])
+        self.assertEqual([s["tpm"] for s in out["kimi"]], [31000, 32000])
+
+    def test_load_tpm_body_err_samples_count_cap(self) -> None:
+        mod = self.mod
+        tmp = tempfile.mkdtemp(prefix="ctyun-proxy-unit-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        path = os.path.join(tmp, "settings.json")
+        now = time.time()
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"tpm_body_err_samples": {
+                "m": [{"tpm": 1000 + i, "ts": now - 100 + i} for i in range(10)]}}, fh)
+        orig = mod.TPM_SAMPLES_MAX
+        mod.TPM_SAMPLES_MAX = 3
+        self.addCleanup(setattr, mod, "TPM_SAMPLES_MAX", orig)
+        out = mod.load_tpm_body_err_samples(path)
+        self.assertEqual(len(out["m"]), 3)
+        self.assertEqual([s["tpm"] for s in out["m"]], [1007, 1008, 1009],
+                         "keep newest 3 by ts")
+
+    def test_load_tpm_probe_results_fault_tolerant_and_prune(self) -> None:
+        mod = self.mod
+        tmp = tempfile.mkdtemp(prefix="ctyun-proxy-unit-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        path = os.path.join(tmp, "settings.json")
+        now = time.time()
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"tpm_probe_results": {
+                "kimi": [
+                    {"threshold": 31000, "ts": now - 10,
+                     "outcome": "rejected", "batches": 7, "consumed": 35123},
+                    {"threshold": 32000, "ts": now - 5,
+                     "outcome": "capped", "batches": 80, "consumed": 400123},
+                    {"threshold": 0, "ts": now},              # threshold ≤0 → 丢
+                    {"threshold": "x", "ts": now},             # 非 int → 丢
+                ],
+                "m2": [{"threshold": 1000 + i, "ts": now - 60 + i} for i in range(7)],
+            }}, fh)
+        out = mod.load_tpm_probe_results(path)
+        self.assertEqual(sorted(out.keys()), ["kimi", "m2"])
+        kim = out["kimi"]
+        self.assertEqual([r["threshold"] for r in kim], [31000, 32000])
+        self.assertEqual(kim[0]["outcome"], "rejected")
+        self.assertEqual(kim[0]["batches"], 7)
+        self.assertEqual(kim[0]["consumed"], 35123)
+        self.assertEqual([r["threshold"] for r in out["m2"]], [1002, 1003, 1004, 1005, 1006],
+                         "keep newest 5 of 7")
+
+    def test_record_tpm_body_err_sample_appends_and_saves(self) -> None:
+        mod = self.mod
+        tmp = tempfile.mkdtemp(prefix="ctyun-proxy-unit-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        path = os.path.join(tmp, "settings.json")
+        mod.PERSISTED_BODY_ERR_SAMPLES.clear()
+        self.addCleanup(mod.PERSISTED_BODY_ERR_SAMPLES.clear)
+        mod.record_tpm_body_err_sample("kimi", 31038, time.time() - 1)
+        mod.record_tpm_body_err_sample("kimi", 33227, time.time())
+        mod.record_tpm_body_err_sample(None, 1, time.time())    # 非法 model → 忽略
+        mod.record_tpm_body_err_sample("kimi", -1, time.time()) # 非法 tpm → 忽略
+        self.assertEqual(len(mod.PERSISTED_BODY_ERR_SAMPLES["kimi"]), 2)
+        mod.save_stats_counters(path)
+        with open(path, encoding="utf-8") as fh:
+            payload = json.load(fh)
+        self.assertIn("tpm_body_err_samples", payload)
+        saved = payload["tpm_body_err_samples"]["kimi"]
+        self.assertEqual([s["tpm"] for s in saved], [31038, 33227])
+        reloaded = mod.load_tpm_body_err_samples(path)
+        self.assertEqual([s["tpm"] for s in reloaded["kimi"]], [31038, 33227])
+
+    def test_record_tpm_probe_result_and_save_roundtrip(self) -> None:
+        mod = self.mod
+        tmp = tempfile.mkdtemp(prefix="ctyun-proxy-unit-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        path = os.path.join(tmp, "settings.json")
+        mod.PROBE_RESULTS.clear()
+        self.addCleanup(mod.PROBE_RESULTS.clear)
+        mod.record_tpm_probe_result("kimi", {
+            "threshold": 31000, "ts": time.time() - 1,
+            "outcome": "rejected", "batches": 7, "consumed": 35123})
+        mod.record_tpm_probe_result("kimi", {})  # 缺 threshold → 忽略
+        self.assertEqual(len(mod.PROBE_RESULTS["kimi"]), 1)
+        mod.save_stats_counters(path)
+        with open(path, encoding="utf-8") as fh:
+            payload = json.load(fh)
+        self.assertIn("tpm_probe_results", payload)
+        saved = payload["tpm_probe_results"]["kimi"]
+        self.assertEqual(saved[0]["threshold"], 31000)
+        self.assertEqual(saved[0]["outcome"], "rejected")
+        reloaded = mod.load_tpm_probe_results(path)
+        self.assertEqual(reloaded["kimi"][0]["threshold"], 31000)
+
+    def test_save_prunes_stale_and_overcap_samples(self) -> None:
+        """save 原地 prune：超期条目 + 超上限条目被裁，内存态同步收缩。"""
+        mod = self.mod
+        tmp = tempfile.mkdtemp(prefix="ctyun-proxy-unit-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        path = os.path.join(tmp, "settings.json")
+        mod.PERSISTED_BODY_ERR_SAMPLES.clear()
+        mod.PROBE_RESULTS.clear()
+        self.addCleanup(mod.PERSISTED_BODY_ERR_SAMPLES.clear)
+        self.addCleanup(mod.PROBE_RESULTS.clear)
+        now = time.time()
+        # body-err：5 条近期 + 1 条过期
+        for i in range(5):
+            mod.record_tpm_body_err_sample("m", 1000 + i, now - 100 + i)
+        mod.record_tpm_body_err_sample("m", 9999, now - 40 * 86400)
+        # probe：7 条 → prune 至 5
+        for i in range(7):
+            mod.record_tpm_probe_result("m", {"threshold": 100 + i, "ts": now - 60 + i})
+        orig = mod.TPM_SAMPLES_MAX
+        mod.TPM_SAMPLES_MAX = 3
+        self.addCleanup(setattr, mod, "TPM_SAMPLES_MAX", orig)
+        mod.save_stats_counters(path)
+        self.assertEqual([s["tpm"] for s in mod.PERSISTED_BODY_ERR_SAMPLES["m"]],
+                         [1002, 1003, 1004])
+        self.assertEqual([r["threshold"] for r in mod.PROBE_RESULTS["m"]],
+                         [102, 103, 104, 105, 106])
+        with open(path, encoding="utf-8") as fh:
+            payload = json.load(fh)
+        self.assertEqual([s["tpm"] for s in payload["tpm_body_err_samples"]["m"]],
+                         [1002, 1003, 1004])
+
 
 class StopProxyKillPathTest(unittest.TestCase):
     """Episode B：stop_proxy helper 的强杀路径与 None 安全。"""

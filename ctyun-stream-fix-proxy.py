@@ -18,6 +18,7 @@ import hmac
 import http.client
 import http.server
 import json
+import math
 import os
 import re
 import signal
@@ -109,6 +110,20 @@ TPM_QUEUE_TIMEOUT_S = float(os.environ.get("CTYUN_TPM_QUEUE_TIMEOUT_S", "120"))
 TPM_TOKEN_RATIO = float(os.environ.get("CTYUN_TPM_TOKEN_RATIO", "0.25"))
 TPM_KEY_CAP = int(os.environ.get("CTYUN_TPM_KEY_CAP", "64"))
 
+# TPM 校准常量（主动校准探测；全部 env seam 以便测试加速）
+TPM_CALIBRATE_INPUT_BYTES = int(os.environ.get("CTYUN_CALIBRATE_INPUT_BYTES", "240000"))
+TPM_CALIBRATE_STEP_TOKENS = int(os.environ.get("CTYUN_CALIBRATE_STEP_TOKENS", "5000"))
+TPM_CALIBRATE_MAX_TOKENS = int(os.environ.get("CTYUN_CALIBRATE_MAX_TOKENS", "1"))
+TPM_CALIBRATE_BATCH_GAP_S = float(os.environ.get("CTYUN_CALIBRATE_BATCH_GAP_S", "2.0"))
+TPM_CALIBRATE_MAX_DURATION_S = float(os.environ.get("CTYUN_CALIBRATE_MAX_DURATION_S", "240"))
+TPM_CALIBRATE_MIN_INTERVAL_S = float(os.environ.get("CTYUN_CALIBRATE_MIN_INTERVAL_S", "1800"))
+TPM_CALIBRATE_HARD_CAP_TOKENS = int(os.environ.get("CTYUN_CALIBRATE_HARD_CAP_TOKENS", "400000"))
+TPM_CALIBRATE_SETTLE_WAIT_S = float(os.environ.get("CTYUN_CALIBRATE_SETTLE_WAIT_S", "60"))
+# 样本/探测结果持久化上限（R7：防持久化膨胀）
+TPM_SAMPLES_MAX = int(os.environ.get("CTYUN_TPM_SAMPLES_MAX", "200"))
+TPM_SAMPLES_RETENTION_DAYS = int(os.environ.get("CTYUN_TPM_SAMPLES_RETENTION_DAYS", "30"))
+TPM_PROBE_RESULTS_MAX = 5  # 每模型探测结果最近保留条数（R7；无需 env seam）
+
 # per-model 预算 env seam（决策 2）：仅作一次性迁移 seed 用（main() 启动时解析并落盘
 # tpm_model_budgets）；运行时限流预算唯一权威 = TPM_MODEL_BUDGETS。
 TPM_LIMIT_BY_MODEL: dict = _parse_tpm_limit_by_model(
@@ -116,6 +131,10 @@ TPM_LIMIT_BY_MODEL: dict = _parse_tpm_limit_by_model(
 # 启用模型集合（决策 2）：{model: int budget}，_CFG_LOCK 护写（读侧无锁靠引用赋值原子）。
 # 仅集合内模型走 tpm_admit 预算判定（opt-in）；main() 启动由持久化 / env 迁移 / 默认 seed 回填。
 TPM_MODEL_BUDGETS: dict = {}
+# 持久化 body-err 样本与探测结果内存态（决策 2 同款锁纪律：_CFG_LOCK 护写，
+# 读侧无锁靠引用赋值原子；main() 启动由持久化加载回填，save_stats_counters 落盘）
+PERSISTED_BODY_ERR_SAMPLES: dict = {}  # {model: [{"tpm": int, "ts": float}, ...]}
+PROBE_RESULTS: dict = {}               # {model: [{"threshold": int, "ts": float, ...}, ...]}
 
 PRIMED_TAIL_CAP = 262144  # finish hold 尾段缓冲上限（超限 fail-open 防内存膨胀）
 
@@ -1130,6 +1149,70 @@ def _safe_log_stderr(msg: str) -> None:
         LOG_RING.append({"seq": _LOG_SEQ, "line": msg})
 
 
+def _prune_body_err_samples(samples: dict) -> None:
+    """原地 prune 持久化 body-err 样本（R7；save 时执行，同 _prune_daily 模式）。
+
+    逐模型：丢弃保留窗口（TPM_SAMPLES_RETENTION_DAYS 天）之外的条目；
+    条数超 TPM_SAMPLES_MAX → 按 ts 升序保留最新 TPM_SAMPLES_MAX 条（最旧先弃）。
+    非法键（非 str 模型名 / 空模型名）直接丢弃。
+    """
+    cutoff = time.time() - TPM_SAMPLES_RETENTION_DAYS * 86400
+    for model in list(samples.keys()):
+        if not isinstance(model, str) or not model:
+            del samples[model]
+            continue
+        items = samples[model]
+        if not isinstance(items, list):
+            del samples[model]
+            continue
+        kept = [item for item in items
+                if isinstance(item, dict)
+                and isinstance(item.get("tpm"), int)
+                and not isinstance(item.get("tpm"), bool)
+                and item["tpm"] > 0
+                and isinstance(item.get("ts"), (int, float))
+                and not isinstance(item.get("ts"), bool)
+                and math.isfinite(item["ts"])
+                and item["ts"] >= max(cutoff, 0)]
+        if len(kept) > TPM_SAMPLES_MAX:
+            kept.sort(key=lambda item: item["ts"])
+            kept = kept[-TPM_SAMPLES_MAX:]
+        if kept:
+            samples[model] = kept
+        else:
+            del samples[model]
+
+
+def _prune_probe_results(results: dict) -> None:
+    """原地 prune 探测结果（R7）：每模型只保留最近 TPM_PROBE_RESULTS_MAX 条（按 ts 升序截尾）。
+    条目校验与 _prune_body_err_samples 同款；threshold int>0、ts 有限数值；模型名非空 str。
+    """
+    for model in list(results.keys()):
+        if not isinstance(model, str) or not model:
+            del results[model]
+            continue
+        items = results[model]
+        if not isinstance(items, list):
+            del results[model]
+            continue
+        kept = [item for item in items
+                if isinstance(item, dict)
+                and isinstance(item.get("threshold"), int)
+                and not isinstance(item.get("threshold"), bool)
+                and item["threshold"] > 0
+                and isinstance(item.get("ts"), (int, float))
+                and not isinstance(item.get("ts"), bool)
+                and math.isfinite(item["ts"])
+                and item["ts"] >= 0]
+        if len(kept) > TPM_PROBE_RESULTS_MAX:
+            kept.sort(key=lambda item: item["ts"])
+            kept = kept[-TPM_PROBE_RESULTS_MAX:]
+        if kept:
+            results[model] = kept
+        else:
+            del results[model]
+
+
 def save_stats_counters(path: str) -> None:
     """把累计计数、按天分桶与当前上游端点全量写入持久化文件（SIGTERM / set_upstream_base 共用）。"""
     with STATS_LOCK:
@@ -1150,6 +1233,12 @@ def save_stats_counters(path: str) -> None:
         capture_enabled = CAPTURE_ERRORS
         probe_enabled = PROBE_ENABLED
         budgets = dict(TPM_MODEL_BUDGETS)
+        _prune_body_err_samples(PERSISTED_BODY_ERR_SAMPLES)   # 内存态原地 prune（R7，同 _prune_daily）
+        _prune_probe_results(PROBE_RESULTS)
+        body_err_samples = {m: [dict(s) for s in items]
+                            for m, items in PERSISTED_BODY_ERR_SAMPLES.items()}
+        probe_results = {m: [dict(r) for r in items]
+                         for m, items in PROBE_RESULTS.items()}
     directory = os.path.dirname(path)
     if directory:
         os.makedirs(directory, exist_ok=True)
@@ -1160,6 +1249,8 @@ def save_stats_counters(path: str) -> None:
                    "probe_enabled": probe_enabled,
                    "model_pricing": MODEL_PRICING,
                    "tpm_model_budgets": budgets,
+                   "tpm_body_err_samples": body_err_samples,
+                   "tpm_probe_results": probe_results,
                    "stats": dict(counters, daily=daily, daily_by_model=daily_by_model,
                                  daily_by_key=daily_by_key, events=events)},
                   fh, ensure_ascii=False)
@@ -1215,6 +1306,134 @@ def load_tpm_model_budgets(path: str) -> dict:
             continue
         out[model] = limit
     return out
+
+
+def load_tpm_body_err_samples(path: str) -> dict:
+    """从持久化文件读 tpm_body_err_samples；缺/损坏/非 dict → {}。
+
+    逐条校验（容错同 load_tpm_model_budgets 风格）：model 非空 str 且 ≤200 字符、
+    键数 ≤32；样本条目需 tpm int>0、ts 有限数值 ≥0 且在保留窗口内；
+    非法条目跳过不报错。校验后 prune（条数上限 + 保留窗口，R7）。
+    """
+    data = _load_persist_file(path)
+    val = data.get("tpm_body_err_samples") if isinstance(data, dict) else None
+    if not isinstance(val, dict):
+        return {}
+    out = {}
+    cutoff = time.time() - TPM_SAMPLES_RETENTION_DAYS * 86400
+    for model, items in val.items():
+        if len(out) >= 32:
+            break
+        if not isinstance(model, str) or not model or len(model) > 200:
+            continue
+        cleaned = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            tpm = item.get("tpm")
+            ts = item.get("ts")
+            if not isinstance(tpm, int) or isinstance(tpm, bool) or tpm <= 0:
+                continue
+            if not isinstance(ts, (int, float)) or isinstance(ts, bool):
+                continue
+            if not math.isfinite(ts) or ts < 0 or ts < cutoff:
+                continue
+            cleaned.append({"tpm": tpm, "ts": float(ts)})
+        if len(cleaned) > TPM_SAMPLES_MAX:
+            cleaned.sort(key=lambda item: item["ts"])
+            cleaned = cleaned[-TPM_SAMPLES_MAX:]
+        if cleaned:
+            out[model] = cleaned
+    return out
+
+
+def load_tpm_probe_results(path: str) -> dict:
+    """从持久化文件读 tpm_probe_results；缺/损坏/非 dict → {}。
+
+    逐条校验同 load_tpm_body_err_samples 容错口径：threshold int>0、ts 有限数值 ≥0；
+    保留额外标量字段（outcome/batches/consumed 等，未来兼容）。每模型保留最近
+    TPM_PROBE_RESULTS_MAX 条（R7）。
+    """
+    data = _load_persist_file(path)
+    val = data.get("tpm_probe_results") if isinstance(data, dict) else None
+    if not isinstance(val, dict):
+        return {}
+    out = {}
+    for model, items in val.items():
+        if len(out) >= 32:
+            break
+        if not isinstance(model, str) or not model or len(model) > 200:
+            continue
+        cleaned = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            threshold = item.get("threshold")
+            ts = item.get("ts")
+            if not isinstance(threshold, int) or isinstance(threshold, bool) \
+                    or threshold <= 0:
+                continue
+            if not isinstance(ts, (int, float)) or isinstance(ts, bool):
+                continue
+            if not math.isfinite(ts) or ts < 0:
+                continue
+            kept = {"threshold": threshold, "ts": float(ts)}
+            for extra_key in ("outcome", "batches", "consumed"):
+                value = item.get(extra_key)
+                if isinstance(value, (int, float, str)) and not isinstance(value, bool):
+                    kept[extra_key] = value
+            cleaned.append(kept)
+        if len(cleaned) > TPM_PROBE_RESULTS_MAX:
+            cleaned.sort(key=lambda item: item["ts"])
+            cleaned = cleaned[-TPM_PROBE_RESULTS_MAX:]
+        if cleaned:
+            out[model] = cleaned
+    return out
+
+
+def record_tpm_body_err_sample(model, tpm_value, ts) -> None:
+    """真实流量 body-err 判定为真时追加一条持久化样本（_CFG_LOCK 内 append）。
+
+    仅接受 str 模型名（≤200 字符、非空）、int>0 tpm、有限数值 ts；非法入参直接忽略
+    （调用点在观测路径，追加失败不得影响转发主流程——fail-open）。
+    prune 在 save 时执行（R7），此处不 prune。
+    """
+    if not isinstance(model, str) or not model or len(model) > 200:
+        return
+    if not isinstance(tpm_value, int) or isinstance(tpm_value, bool) or tpm_value <= 0:
+        return
+    if not isinstance(ts, (int, float)) or isinstance(ts, bool) \
+            or not math.isfinite(ts):
+        return
+    with _CFG_LOCK:
+        PERSISTED_BODY_ERR_SAMPLES.setdefault(model, []).append(
+            {"tpm": tpm_value, "ts": float(ts)})
+
+
+def record_tpm_probe_result(model, result) -> None:
+    """校准完成时追加一条探测结果（_CFG_LOCK 内 append；卡 5 校准结束时调用）。
+
+    result 为 calibrate_engine 返回 dict：threshold int>0、ts 有限数值、batches int、
+    consumed int、outcome str；字段缺失/非法 → 忽略（fail-open，不打断校准收尾）。
+    """
+    if not isinstance(model, str) or not model or len(model) > 200:
+        return
+    if not isinstance(result, dict):
+        return
+    threshold = result.get("threshold")
+    ts = result.get("ts")
+    if not isinstance(threshold, int) or isinstance(threshold, bool) or threshold <= 0:
+        return
+    if not isinstance(ts, (int, float)) or isinstance(ts, bool) \
+            or not math.isfinite(ts):
+        return
+    entry = {"threshold": threshold, "ts": float(ts)}
+    for key in ("outcome", "batches", "consumed"):
+        value = result.get(key)
+        if isinstance(value, (int, float, str)) and not isinstance(value, bool):
+            entry[key] = value
+    with _CFG_LOCK:
+        PROBE_RESULTS.setdefault(model, []).append(entry)
 
 
 def load_model_pricing(path: str) -> dict:
