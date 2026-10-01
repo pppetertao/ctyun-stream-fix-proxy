@@ -818,13 +818,38 @@ def logs_snapshot(cursor=None, tail=None) -> dict:
             "oldest_seq": oldest_seq, "ring_max": LOG_RING_MAX}
 
 
-def tpm_body_err_samples(lines: list, model: str) -> list:
-    """从 REQ 行列表提取指定模型 body-err 行的 tpm= 值（决策 4 实证样本源）。
+def tpm_body_err_samples_persisted(samples: dict, model: str) -> list:
+    """从持久化样本 dict 提取指定模型的 tpm 值列表（决策 4 实证样本源的持久化优先来源）。
 
+    样本条目为 {"tpm": int, "ts": float}（load_tpm_body_err_samples 产出形态）；
+    tpm 非法（非 int / bool / ≤0）/条目非 dict 跳过。纯函数：无锁无 IO。
+    """
+    items = samples.get(model)
+    if not isinstance(items, list):
+        return []
+    out = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        tpm = item.get("tpm")
+        if isinstance(tpm, int) and not isinstance(tpm, bool) and tpm > 0:
+            out.append(tpm)
+    return out
+
+
+def tpm_body_err_samples(lines: list, model: str) -> list:
+    """提取指定模型 body-err 行的 tpm= 值：持久化样本优先，LOG_RING 解析兜底。
+
+    持久化优先：PERSISTED_BODY_ERR_SAMPLES（_CFG_LOCK 护写）有该模型样本时直接
+    返回其 tpm 列表（跨重启保留的实证证据 > 本次进程日志）；无持久化样本才解析
+    LOG_RING 行（进程内新样本，重启丢失前的兜底）。
     正则锚定字段序（REQ 行 result 在 model 前、tpm 在 model 后，见 _log）：
     `result=body-err\\b.*\\bmodel=X\\b.*\\btpm=(\\d+)`；不匹配/无 tpm 字段的行跳过。
-    纯函数：无锁无 IO。
+    纯函数：无锁（读侧靠引用赋值原子）无 IO。
     """
+    persisted = tpm_body_err_samples_persisted(PERSISTED_BODY_ERR_SAMPLES, model)
+    if persisted:
+        return persisted
     pattern = re.compile(r"result=body-err\b.*\bmodel=%s\b.*\btpm=(\d+)" % re.escape(model))
     out = []
     for line in lines:
@@ -2435,6 +2460,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 if isinstance(total, int) and total >= 0:
                     tpm_settle(tpm_key, tpm_est, total, model)
                     tpm_final_used = total
+            # 持久化 body-err 实证样本（同非流式分支；body_error 由 _body_err_line 判定）
+            if body_error and model:
+                record_tpm_body_err_sample(model, tpm_final_used, time.time())
             self._log(started, resp.status, result, filtered, model=model, retried=retried,
                       retry_reason=retry_reason,
                       rid=self._req_id, upstream_host=self._upstream_host,
@@ -2486,6 +2514,11 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                                 if isinstance(total, int) and total >= 0:
                                     tpm_settle(tpm_key, tpm_est, total, model)
                                     tpm_final_used = total
+            # 持久化 body-err 实证样本（决策 6）：真实流量判定 body-err 且 tpm 结算值
+            # 有效时追加；校准请求走 _calibrate_send 直连不经 _proxy_relay（R2），
+            # 绝不污染样本源。record 内部对 None/非法值 fail-open 忽略。
+            if body_error and model:
+                record_tpm_body_err_sample(model, tpm_final_used, time.time())
             outcome = classify_outcome(status=resp.status, body_error=body_error)
             self._log(started, resp.status, outcome.log_result, 0, model=model,
                       rid=self._req_id, upstream_host=self._upstream_host,
@@ -4757,6 +4790,11 @@ def main() -> None:
             save_stats_counters(PERSIST_PATH)
         else:
             TPM_MODEL_BUDGETS = {"kimi-k3-oc": 30000}
+    # 持久化 body-err 样本与探测结果装载（决策 6：实证证据跨重启保留）
+    PERSISTED_BODY_ERR_SAMPLES.clear()
+    PERSISTED_BODY_ERR_SAMPLES.update(load_tpm_body_err_samples(PERSIST_PATH))
+    PROBE_RESULTS.clear()
+    PROBE_RESULTS.update(load_tpm_probe_results(PERSIST_PATH))
     # v2 P3：model_pricing 装载（env seam 优先，否则持久化文件；解析失败回落 {}）
     pricing_env = os.environ.get("CTYUN_MODEL_PRICING", "")
     if pricing_env:

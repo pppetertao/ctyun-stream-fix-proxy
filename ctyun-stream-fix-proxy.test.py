@@ -1373,6 +1373,35 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         self.assertEqual(mod.tpm_body_err_samples(lines, "glm-5.3-oc"), [])
         self.assertEqual(mod.tpm_body_err_samples([], "kimi-k3-oc"), [])
 
+    def test_tpm_body_err_samples_persisted(self) -> None:
+        mod = self.mod
+        samples = {
+            "kimi-k3-oc": [{"tpm": 31038, "ts": 1.0}, {"tpm": 33227, "ts": 2.0}],
+            "glm-5.3-oc": [{"tpm": 999, "ts": 1.0}, {"tpm": "bad", "ts": 2.0},
+                            {"tpm": -1, "ts": 3.0}, "garbage", None],
+        }
+        self.assertEqual(mod.tpm_body_err_samples_persisted(samples, "kimi-k3-oc"),
+                         [31038, 33227])
+        self.assertEqual(mod.tpm_body_err_samples_persisted(samples, "glm-5.3-oc"),
+                         [999])
+        self.assertEqual(mod.tpm_body_err_samples_persisted(samples, "absent"), [])
+        self.assertEqual(mod.tpm_body_err_samples_persisted({}, "kimi-k3-oc"), [])
+
+    def test_tpm_body_err_samples_persisted_priority_over_log_ring(self) -> None:
+        mod = self.mod
+        self.addCleanup(mod.PERSISTED_BODY_ERR_SAMPLES.clear)
+        lines = [
+            "REQ POST /chat/completions -> 200 dur=9.5s result=body-err filtered=0 "
+            "model=kimi-k3-oc retried=0 rid=r-1 host=h ttfb=1.0ms stream=1 "
+            "outcome=body_error qwait=0ms tpm=777 ts=T",
+        ]
+        mod.PERSISTED_BODY_ERR_SAMPLES["kimi-k3-oc"] = [{"tpm": 31038, "ts": 1.0}]
+        self.assertEqual(mod.tpm_body_err_samples(lines, "kimi-k3-oc"), [31038],
+                         "persisted sample must take priority over LOG_RING")
+        mod.PERSISTED_BODY_ERR_SAMPLES.clear()
+        self.assertEqual(mod.tpm_body_err_samples(lines, "kimi-k3-oc"), [777],
+                         "without persisted samples LOG_RING parse is the fallback")
+
     def test_tpm_budget_recommend_with_samples(self) -> None:
         mod = self.mod
         lines = [
@@ -4586,6 +4615,66 @@ class AdminIntegrationTest(unittest.TestCase):
         """未知路径仍返回 404（确保 /api/tpm_stats 路由不破坏 else 分支）。"""
         status, _, _ = admin_get(self.proc.admin_port, "/api/nonexistent")
         self.assertEqual(status, 404)
+
+    def test_body_err_samples_persist_across_restart(self) -> None:
+        """AC4：seed_persist 预写样本 → /api/tpm_settings 反映（recommended 按
+        min×0.9 千位向下）；真实 body-err 流量 → 样本增加；SIGTERM → 持久化文件
+        含新样本（save_stats_counters 原子写，跨重启保留）。"""
+        stop_proxy(self.proc)
+        stop_fake_upstreams()
+        seed_ts = time.time() - 60
+        self.proc = start_proxy(
+            self.upstream_port, self.proxy_port,
+            seed_persist={"tpm_body_err_samples": {
+                "kimi-k3-oc": [{"tpm": 31000, "ts": seed_ts}]}})
+        try:
+            _, body_bytes, _ = admin_get(self.proc.admin_port, "/api/tpm_settings")
+            snap = json.loads(body_bytes.decode("utf-8"))
+            by_name = {m["name"]: m for m in snap["models"]}
+            self.assertIn("kimi-k3-oc", by_name,
+                          "seeded model must appear in tpm_settings")
+            rec = by_name["kimi-k3-oc"]["recommend"]
+            self.assertEqual(rec["samples"], 1,
+                             "persisted sample must be reflected, got %r" % rec)
+            self.assertEqual(rec["recommended"], 27000,
+                             "31000*0.9=27900 -> 千位向下 27000, got %r" % rec)
+            # 切到 body-err 假上游并触发真实 body-err 流量（带 Authorization）
+            err_upstream = make_fake_upstream(False, fail_200_error=True)
+            status, _ = admin_post(
+                self.proc.admin_port, "/api/config",
+                json.dumps({"upstream_base": "http://127.0.0.1:%d" % err_upstream}
+                           ).encode("utf-8"))
+            self.assertEqual(status, 200)
+            conn = http.client.HTTPConnection("127.0.0.1", self.proc.proxy_port,
+                                              timeout=10)
+            req_body = b'{"model":"kimi-k3-oc","messages":[{"role":"user","content":"hi"}]}'
+            conn.request("POST", "/v1/chat/completions", body=req_body,
+                         headers={"Content-Type": "application/json",
+                                  "Authorization": "Bearer test-token"})
+            resp = conn.getresponse()
+            self.assertEqual(resp.status, 200)
+            resp.read()
+            conn.close()
+            _, body_bytes, _ = admin_get(self.proc.admin_port, "/api/tpm_settings")
+            snap = json.loads(body_bytes.decode("utf-8"))
+            by_name = {m["name"]: m for m in snap["models"]}
+            rec = by_name["kimi-k3-oc"]["recommend"]
+            self.assertEqual(rec["samples"], 2,
+                             "body-err traffic must append a sample, got %r" % rec)
+        finally:
+            # SIGTERM → save_stats_counters 落盘（含新样本）
+            self.proc.send_signal(signal.SIGTERM)
+            self.proc.wait(timeout=10)
+        with open(os.path.join(self.proc.persist_dir, "settings.json"),
+                  encoding="utf-8") as fh:
+            payload = json.load(fh)
+        self.assertIn("tpm_body_err_samples", payload,
+                      "persisted file must carry tpm_body_err_samples")
+        saved = payload["tpm_body_err_samples"]["kimi-k3-oc"]
+        self.assertEqual(len(saved), 2, "SIGTERM flush must persist the new sample")
+        self.assertEqual(saved[0]["tpm"], 31000)
+        self.assertGreater(saved[1]["tpm"], 0)
+        self.assertGreater(saved[1]["ts"], saved[0]["ts"])
 
 
 class BodyErrorTest(unittest.TestCase):
