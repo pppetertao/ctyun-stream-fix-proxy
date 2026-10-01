@@ -433,6 +433,31 @@ def kill_registered(timeout: float = 2.0) -> list:
     return force_killed
 
 
+def stop_proxy(proc, timeout: float = 10.0) -> bool:
+    """terminate → wait(timeout)；超时则 kill 再 wait(5)。
+    随后 stderr_text + rmtree persist_dir。返回是否强杀过。
+    proc 为 None 或已 reap 安全退出（poll 判活，免 ChildProcessError）。"""
+    if proc is None:
+        return False
+    killed = False
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            killed = True
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass  # SIGKILL 已发出，内核回收只是调度时序问题（同 kill_registered）
+    stderr_text(proc)
+    pd = getattr(proc, "persist_dir", None)
+    if pd:
+        shutil.rmtree(pd, ignore_errors=True)
+    return killed
+
+
 def free_port() -> int:
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))
@@ -2532,6 +2557,45 @@ class ProxyDashboardUnitTest(unittest.TestCase):
                 mod.UPSTREAM_BASE = orig_base
         finally:
             stop_fake_upstreams()
+
+
+class StopProxyKillPathTest(unittest.TestCase):
+    """Episode B：stop_proxy helper 的强杀路径与 None 安全。"""
+
+    def test_stop_proxy_none_safe(self) -> None:
+        self.assertFalse(stop_proxy(None), "stop_proxy(None) 必须安全返回 False")
+
+    def test_stop_proxy_kills_sigterm_ignoring_proc(self) -> None:
+        proc = subprocess.Popen(
+            [sys.executable, "-c",
+             "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN);"
+             " time.sleep(30)"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        proc.stderr_buf = []  # stop_proxy 会调 stderr_text（要求 stderr_buf 视图）
+        time.sleep(0.5)  # 等子进程解释器装好 SIG_IGN handler（否则竞态：SIGTERM 按默认行为杀死）
+        try:
+            self.assertIsNone(proc.poll(), "就绪守卫：子进程必须仍在运行")
+            killed = stop_proxy(proc, timeout=0.5)
+            self.assertTrue(killed, "忽略 SIGTERM 的进程必须被强杀并返回 True")
+            self.assertIsNotNone(proc.poll(), "强杀后进程必须已退出")
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+
+    def test_stop_proxy_normal_terminate_not_killed(self) -> None:
+        proc = subprocess.Popen([sys.executable, "-c", "time.sleep(30)"],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        proc.stderr_buf = []
+        time.sleep(0.3)  # 解释器就绪，避免启动竞态污染语义
+        try:
+            killed = stop_proxy(proc, timeout=10.0)
+            self.assertFalse(killed, "正常 SIGTERM 退出的进程不得报强杀")
+            self.assertIsNotNone(proc.poll())
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
 
 
 class DashboardV2SkeletonTest(unittest.TestCase):
