@@ -53,6 +53,50 @@ DONE_RE = re.compile(rb"^data:\s*\[DONE\]\s*$")
 EMPTY_RETRY_MAX = int(os.environ.get("CTYUN_EMPTY_RETRY", "1"))  # env seam，惯例同 SEND_TIMEOUT_S
 HEADER_RETRY_MAX = max(0, int(os.environ.get("CTYUN_HEADER_RETRY", "1")))
 
+# per-model 预算解析（fail-open；模块加载时即调用 → 前置于此，保证常量区 :63 可见）
+def _parse_tpm_limit_by_model_log(item: str) -> None:
+    # 模块加载时（常量区）_safe_log_stderr（:783）尚未定义，内联其等价实现；
+    # 吞掉的是 stderr 写失败的 OSError（BrokenPipeError/ENOSPC 等）：stderr 是
+    # best-effort 诊断出口，无备用通道，且失败不得传播——传播会中断模块导入。
+    try:
+        print("ctyun-stream-fix-proxy: CTYUN_TPM_LIMIT_BY_MODEL: "
+              "skip malformed entry %r" % item, file=sys.stderr, flush=True)
+    except OSError:
+        pass
+
+
+def _parse_tpm_limit_by_model(env_str: str) -> dict:
+    """解析 CTYUN_TPM_LIMIT_BY_MODEL（"model:limit,model:limit"）→ {model: limit}。
+
+    fail-open：逐项 split(":")，非两项 / limit 非 int / limit 负值 → 跳过该项并
+    stderr 一行；空串 / 全畸形 → {}。内置默认（kimi-k3-oc:30000）不并入本表，
+    由 tpm_limit_for 兜底——保证快照 config.limit_by_model 原样展示 env 表。
+    """
+    result = {}
+    if not env_str or not env_str.strip():
+        return result
+    for item in env_str.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        parts = item.split(":")
+        if len(parts) != 2 or not parts[0].strip():
+            _parse_tpm_limit_by_model_log(item)
+            continue
+        model = parts[0].strip()
+        try:
+            limit = int(parts[1].strip())
+        except ValueError:
+            # 吞掉的是非整数值（"abc" 等）：fail-open 跳过该项并已 log，无其他路径可达。
+            _parse_tpm_limit_by_model_log(item)
+            continue
+        if limit < 0:
+            _parse_tpm_limit_by_model_log(item)
+            continue
+        result[model] = limit
+    return result
+
+
 # TPM rate limiting（per-key 滚动窗口 + FIFO 排队）
 TPM_LIMIT = int(os.environ.get("CTYUN_TPM_LIMIT", "110000"))
 TPM_WINDOW_S = int(os.environ.get("CTYUN_TPM_WINDOW_S", "60"))
@@ -60,6 +104,12 @@ TPM_QUEUE_MAX = int(os.environ.get("CTYUN_TPM_QUEUE_MAX", "20"))
 TPM_QUEUE_TIMEOUT_S = float(os.environ.get("CTYUN_TPM_QUEUE_TIMEOUT_S", "120"))
 TPM_TOKEN_RATIO = float(os.environ.get("CTYUN_TPM_TOKEN_RATIO", "0.25"))
 TPM_KEY_CAP = int(os.environ.get("CTYUN_TPM_KEY_CAP", "64"))
+
+# per-model 预算（决策 2）：env seam "model:limit,model:limit"（逗号分隔）；
+# 解析 fail-open 见 _parse_tpm_limit_by_model；内置默认不并入本表以保快照原样展示。
+TPM_LIMIT_BY_MODEL: dict = _parse_tpm_limit_by_model(
+    os.environ.get("CTYUN_TPM_LIMIT_BY_MODEL", ""))
+_TPM_LIMIT_BY_MODEL_BUILTIN: dict = {"kimi-k3-oc": 30000}  # 实证 31k 触顶留余量；env 表优先覆盖
 
 PRIMED_TAIL_CAP = 262144  # finish hold 尾段缓冲上限（超限 fail-open 防内存膨胀）
 
@@ -365,6 +415,20 @@ def estimate_request_tokens(body):
         if isinstance(mt, int) and not isinstance(mt, bool) and mt > 0:
             base += mt
     return base
+
+
+def tpm_limit_for(model) -> int:
+    """per-model 预算查询：env 表 → 内置默认表 → 全局 TPM_LIMIT。
+
+    model 为 None / 空字符串 / 查不到 → 回退 TPM_LIMIT（全局默认）。"""
+    if model:
+        limit = TPM_LIMIT_BY_MODEL.get(model)
+        if limit is not None:
+            return limit
+        limit = _TPM_LIMIT_BY_MODEL_BUILTIN.get(model)
+        if limit is not None:
+            return limit
+    return TPM_LIMIT
 
 
 def _tpm_prune(bucket, now: float) -> None:

@@ -915,6 +915,8 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         self.assertEqual(mod.TPM_QUEUE_TIMEOUT_S, 120)
         self.assertEqual(mod.TPM_TOKEN_RATIO, 0.25)
         self.assertEqual(mod.TPM_KEY_CAP, 64)
+        self.assertEqual(mod._TPM_LIMIT_BY_MODEL_BUILTIN, {"kimi-k3-oc": 30000})
+        self.assertIsInstance(mod.TPM_LIMIT_BY_MODEL, dict)
         self.assertEqual(mod.CLASS_TPM_LIMITED, "tpm_limited")
         self.assertEqual(mod.ERR_KIND_TPM_QUEUE_FULL, "tpm_queue_full")
         self.assertEqual(mod.ERR_KIND_TPM_QUEUE_TIMEOUT, "tpm_queue_timeout")
@@ -936,19 +938,65 @@ class ProxyDashboardUnitTest(unittest.TestCase):
             "os.environ['CTYUN_TPM_QUEUE_TIMEOUT_S']='10'; "
             "os.environ['CTYUN_TPM_TOKEN_RATIO']='0.3'; "
             "os.environ['CTYUN_TPM_KEY_CAP']='8'; "
+            "os.environ['CTYUN_TPM_LIMIT_BY_MODEL']='kimi:5000,glm:6000'; "
             "import importlib.util, sys; "
             "spec = importlib.util.spec_from_file_location('m', %r); "
             "m = importlib.util.module_from_spec(spec); "
             "spec.loader.exec_module(m); "
             "print(m.TPM_LIMIT, m.TPM_WINDOW_S, m.TPM_QUEUE_MAX, "
-            "m.TPM_QUEUE_TIMEOUT_S, m.TPM_TOKEN_RATIO, m.TPM_KEY_CAP)"
+            "m.TPM_QUEUE_TIMEOUT_S, m.TPM_TOKEN_RATIO, m.TPM_KEY_CAP, "
+            "repr(m.TPM_LIMIT_BY_MODEL))"
         ) % PROXY_SCRIPT
         proc = subprocess.run([sys.executable, "-c", code],
                               capture_output=True, text=True, timeout=10)
         self.assertEqual(proc.returncode, 0,
                          "env seam subprocess failed stderr:\n" + proc.stderr)
-        parts = proc.stdout.strip().split()
-        self.assertEqual(parts, ["50000", "30", "5", "10.0", "0.3", "8"])
+        parts = proc.stdout.strip().split(" ", 6)
+        self.assertEqual(parts, ["50000", "30", "5", "10.0", "0.3", "8",
+                                 "{'kimi': 5000, 'glm': 6000}"])
+
+    def test_parse_tpm_limit_by_model_normal(self) -> None:
+        f = self.mod._parse_tpm_limit_by_model
+        self.assertEqual(f("kimi:30000,glm:110000"), {"kimi": 30000, "glm": 110000})
+        self.assertEqual(f(" kimi:30000 , glm-5.3-oc:110000 "),
+                         {"kimi": 30000, "glm-5.3-oc": 110000})
+        self.assertEqual(f("kimi:30000"), {"kimi": 30000})
+
+    def test_parse_tpm_limit_by_model_malformed(self) -> None:
+        f = self.mod._parse_tpm_limit_by_model
+        # 非两项 / limit 非 int / 负值 → 跳过
+        self.assertEqual(f("kimi"), {})
+        self.assertEqual(f("kimi:abc"), {})
+        self.assertEqual(f("kimi:-1"), {})
+        # 混合：OK + 畸形的串；有效项保留
+        self.assertEqual(f("kimi:30000,bad,glm:abc,neg:-5,deepseek:110000"),
+                         {"kimi": 30000, "deepseek": 110000})
+        # 空项跳过
+        self.assertEqual(f("kimi:30000,,glm:110000"), {"kimi": 30000, "glm": 110000})
+
+    def test_parse_tpm_limit_by_model_empty(self) -> None:
+        self.assertEqual(self.mod._parse_tpm_limit_by_model(""), {})
+        self.assertEqual(self.mod._parse_tpm_limit_by_model("   "), {})
+
+    def test_tpm_limit_for_fallback_and_env_override(self) -> None:
+        mod = self.mod
+        orig = mod.TPM_LIMIT_BY_MODEL
+        try:
+            # ① env 表空 → kimi 命中内置默认，其余回全局 TPM_LIMIT
+            mod.TPM_LIMIT_BY_MODEL = {}
+            self.assertEqual(mod.tpm_limit_for("kimi-k3-oc"), 30000)
+            self.assertEqual(mod.tpm_limit_for("glm-5.3-oc"), mod.TPM_LIMIT)
+            self.assertEqual(mod.tpm_limit_for(None), mod.TPM_LIMIT)
+            self.assertEqual(mod.tpm_limit_for(""), mod.TPM_LIMIT)
+            self.assertEqual(mod.tpm_limit_for("deepseek-v4-pro-0813-oc"),
+                             mod.TPM_LIMIT)
+            # ② env 表覆盖内置默认
+            mod.TPM_LIMIT_BY_MODEL = {"kimi-k3-oc": 1000, "glm-5.3-oc": 110000}
+            self.assertEqual(mod.tpm_limit_for("kimi-k3-oc"), 1000)
+            self.assertEqual(mod.tpm_limit_for("glm-5.3-oc"), 110000)
+            self.assertEqual(mod.tpm_limit_for("other"), mod.TPM_LIMIT)
+        finally:
+            mod.TPM_LIMIT_BY_MODEL = orig
 
     def _tpm_cleanup(self, mod):
         mod.TPM_BUCKETS.clear()
