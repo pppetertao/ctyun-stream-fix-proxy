@@ -5103,6 +5103,153 @@ class RecordRequestV3Test(unittest.TestCase):
                          "cache_write 不解析，桶字段恒 0（Exclusions）")
 
 
+class RelaySseV3Test(unittest.TestCase):
+    """v3 _relay_sse model kwarg + stalls per-model 双写（决策 3）。
+
+    用 handler stub + fake resp 进程内直驱 _relay_sse：STALL_THRESHOLD_S 降至 0.0
+    后任意相邻 record 间隔即触发 stall，可确定性断言 stalls_total 与
+    stalls_by_model 的双写语义（含 model=None 只增全局）。"""
+
+    def setUp(self) -> None:
+        self.mod = load_proxy_module()
+
+    class _StubHandler:
+        """_relay_sse 可运行的最小 handler stub（wfile/conn/响应三件套）。
+
+        _relay_sse/_send_sse_headers 是 ProxyHandler 真方法，经未绑定调用
+        mod.ProxyHandler._relay_sse(handler, ...) 驱动；stub 只供实例属性。"""
+
+        def __init__(self):
+            self.wfile = io.BytesIO()
+            self._req_id = "req-1"
+            self.close_connection = False
+            self._t_last_record = None
+            self._t_first_byte_mark = None
+            self._relay_bytes = 0
+            self._relay_chunks = 0
+            self._body_err_line = None
+            self._tpm_usage = None
+            self._p3_usage_tokens = None
+
+        class _StubConn:
+            def gettimeout(self): return 600
+            def settimeout(self, _v): pass
+        connection = _StubConn()
+
+        def send_response(self, _code): pass
+        def send_header(self, _k, _v): pass
+        def end_headers(self): pass
+        def _send_sse_headers(self, _resp): pass
+
+    class _FakeSseResp:
+        """fake resp：readline 依序吐行，耗尽后 b"" EOF；getheaders 空即可。"""
+        status = 200
+
+        def __init__(self, lines):
+            self._lines = list(lines)
+            self._i = 0
+
+        def readline(self):
+            if self._i < len(self._lines):
+                line = self._lines[self._i]
+                self._i += 1
+                return line
+            return b""
+
+        def getheaders(self):
+            return [("Content-Type", "text/event-stream")]
+
+    def _drive(self, lines):
+        """统一驱动：STALL_THRESHOLD_S=0.0 下走完 [SSE_A, b"\\n", SSE_DONE, b"\\n"] 流。"""
+        mod = self.mod
+        orig_thresh = mod.STALL_THRESHOLD_S
+        try:
+            mod.STALL_THRESHOLD_S = 0.0
+            handler = self._StubHandler()
+            resp = self._FakeSseResp(lines)
+            return (mod.ProxyHandler._relay_sse(handler, resp, final=True,
+                                                model="m1"), handler)
+        finally:
+            mod.STALL_THRESHOLD_S = orig_thresh
+
+    def test_relay_sse_has_model_kwarg(self) -> None:
+        import inspect
+        sig = inspect.signature(self.mod.ProxyHandler._relay_sse)
+        self.assertIn("model", sig.parameters)
+        self.assertEqual(sig.parameters["model"].default, None)
+
+    def test_stall_increments_global_and_per_model(self) -> None:
+        mod = self.mod
+        orig_sm = dict(mod.STATS["stalls_by_model"])
+        mod.STATS["stalls_by_model"] = {}
+        stalls_before = mod.STATS["stalls_total"]
+        try:
+            (filtered, truncated), handler = self._drive(
+                [SSE_A, b"\n", SSE_DONE, b"\n"])
+            self.assertEqual(filtered, 0)
+            self.assertFalse(truncated)
+            self.assertGreater(mod.STATS["stalls_total"], stalls_before,
+                               "相邻 record 间隔必须计入 stalls_total")
+            self.assertGreater(mod.STATS["stalls_by_model"].get("m1", 0), 0,
+                               "model=m1 时 stalls_by_model[m1] 必须同步 +1")
+        finally:
+            mod.STATS["stalls_by_model"] = orig_sm
+
+    def test_stall_model_none_only_global(self) -> None:
+        mod = self.mod
+        orig_sm = dict(mod.STATS["stalls_by_model"])
+        mod.STATS["stalls_by_model"] = {}
+        orig_thresh = mod.STALL_THRESHOLD_S
+        try:
+            mod.STALL_THRESHOLD_S = 0.0
+            handler = self._StubHandler()
+            resp = self._FakeSseResp([SSE_A, b"\n", SSE_DONE, b"\n"])
+            mod.ProxyHandler._relay_sse(handler, resp, final=True)  # model 默认 None
+            self.assertEqual(mod.STATS["stalls_by_model"], {},
+                             "model=None 不得写 stalls_by_model")
+        finally:
+            mod.STALL_THRESHOLD_S = orig_thresh
+            mod.STATS["stalls_by_model"] = orig_sm
+
+    def test_record_request_kwargs_on_stream_settlement(self) -> None:
+        """流式结算点：_record_request 新 kwargs 全部透传落桶验证。
+        直接调 _record_request 模拟卡 3 完工后的实际调用形态。"""
+        mod = self.mod
+        today = mod.today_key()
+        mod._record_request("POST", "/s", 200, 100.0, 0, model="m1",
+                            stream=1,
+                            tokens_prompt=10, tokens_completion=5,
+                            tokens_cache_read=4, tokens_reasoning=3,
+                            qwait_ms=15, key_id12="abcdef123456",
+                            tokens=22, outcome=mod.CLASS_OK)
+        self.assertEqual(
+            mod.STATS["daily_by_key"][today]["abcdef123456"]["tokens_prompt"], 10)
+        self.assertEqual(
+            mod.STATS["daily_by_key"][today]["abcdef123456"]["tokens_cache_read"], 4)
+        self.assertEqual(
+            mod.STATS["daily_by_key"][today]["abcdef123456"]["tokens_reasoning"], 3)
+        qwait = list(mod.STATS["qwait_ms_by_model"].get("m1", []))
+        self.assertIn(15, qwait)
+
+    def test_record_request_kwargs_on_non_stream_settlement(self) -> None:
+        """非流式结算点：同流式验证、但 stream=0。"""
+        mod = self.mod
+        today = mod.today_key()
+        mod._record_request("POST", "/n", 200, 50.0, 0, model="m2",
+                            stream=0,
+                            tokens_prompt=7, tokens_completion=3,
+                            tokens_cache_read=2, tokens_reasoning=1,
+                            qwait_ms=8, key_id12="deadbeef0001",
+                            tokens=14, outcome=mod.CLASS_OK)
+        by_key = mod.STATS["daily_by_key"][today].get("deadbeef0001")
+        self.assertIsNotNone(by_key)
+        self.assertEqual(by_key["tokens_prompt"], 7)
+        self.assertEqual(by_key["tokens_cache_read"], 2)
+        self.assertEqual(by_key["tokens_reasoning"], 1)
+        # qwait 落 m2 环
+        self.assertIn(8, list(mod.STATS["qwait_ms_by_model"].get("m2", [])))
+
+
 class RequestIdTest(unittest.TestCase):
     """P1 地基：request id / upstream host / ttfb / stream / outcome 全链路。
 

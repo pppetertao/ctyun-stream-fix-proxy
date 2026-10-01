@@ -1998,7 +1998,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 self._tpm_usage = None
                 self._p3_usage_tokens = None
                 filtered, truncated = self._relay_sse(resp,
-                    final=not empty_stream_should_retry(EMPTY_RETRY_MAX))
+                    final=not empty_stream_should_retry(EMPTY_RETRY_MAX),
+                    model=model)
                 body_error = self._body_err_line is not None
             except _EmptyStream as exc:
                 filtered = exc.filtered  # attempt-1 已滤毒缓冲随重试丢弃，filtered 只计交付流
@@ -2037,7 +2038,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 self._body_err_line = None
                 self._tpm_usage = None
                 self._p3_usage_tokens = None
-                filtered, truncated = self._relay_sse(resp, final=True)
+                filtered, truncated = self._relay_sse(resp, final=True,
+                                                      model=model)
                 body_error = self._body_err_line is not None
                 ttfb_ms = round((t_headers_done - t_conn_start) * 1000, 1)
             # v2 P2：首字节口径覆盖 headers 口径（流式 = 首个非毒 record 交付时刻；
@@ -2096,6 +2098,10 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                             bytes_out=self._relay_bytes, chunks=self._relay_chunks,
                             tokens_prompt=p3_tokens[0] if p3_tokens else 0,
                             tokens_completion=p3_tokens[1] if p3_tokens else 0,
+                            tokens_cache_read=p3_tokens[3] if p3_tokens else 0,
+                            tokens_reasoning=p3_tokens[4] if p3_tokens else 0,
+                            qwait_ms=tpm_qwait_ms,
+                            key_id12=tpm_key[:12] if tpm_key else None,
                             phase_ms={"connect": connect_ms, "headers": headers_ms,
                                       "body": body_ms})
         else:
@@ -2141,6 +2147,10 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                             bytes_out=self._relay_bytes, chunks=self._relay_chunks,
                             tokens_prompt=p3_buf_tokens[0] if p3_buf_tokens else 0,
                             tokens_completion=p3_buf_tokens[1] if p3_buf_tokens else 0,
+                            tokens_cache_read=p3_buf_tokens[3] if p3_buf_tokens else 0,
+                            tokens_reasoning=p3_buf_tokens[4] if p3_buf_tokens else 0,
+                            qwait_ms=tpm_qwait_ms,
+                            key_id12=tpm_key[:12] if tpm_key else None,
                             phase_ms={"connect": connect_ms, "headers": headers_ms,
                                       "body": body_ms})
             if outcome.capture:
@@ -2189,7 +2199,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.close_connection = True
 
-    def _relay_sse(self, resp: http.client.HTTPResponse, final: bool) -> tuple:
+    def _relay_sse(self, resp: http.client.HTTPResponse, final: bool,
+                   model=None) -> tuple:
         old_timeout = self.connection.gettimeout()
         self.connection.settimeout(SEND_TIMEOUT_S)
         # v2 P2 打点状态：每 record 一次 monotonic + 整数加法，零锁；stall 自增
@@ -2277,6 +2288,14 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                                 # （正常流相邻 record 间隔 << 阈值，<0.1% 命中；R1 纪律）
                                 with STATS_LOCK:
                                     STATS["stalls_total"] += 1
+                                    # v3 P7：per-model stall——model=None 只增全局
+                                    if model is not None:
+                                        stalls_m = STATS["stalls_by_model"]
+                                        if model not in stalls_m \
+                                                and len(stalls_m) < BY_MODEL_CAP:
+                                            stalls_m[model] = 0
+                                        if model in stalls_m:
+                                            stalls_m[model] += 1
                             self._t_last_record = now
                             for buf_line in pending:
                                 self.wfile.write(buf_line)
