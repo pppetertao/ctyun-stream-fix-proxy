@@ -5250,6 +5250,147 @@ class RelaySseV3Test(unittest.TestCase):
         self.assertIn(8, list(mod.STATS["qwait_ms_by_model"].get("m2", [])))
 
 
+class SettlePersistV3Test(unittest.TestCase):
+    """v3 tpm_settle 比率 + daily_by_key save/load roundtrip（决策 2/4）。"""
+
+    def setUp(self) -> None:
+        self.mod = load_proxy_module()
+
+    def test_tpm_settle_records_ratio(self) -> None:
+        mod = self.mod
+        orig_buckets = mod.TPM_BUCKETS
+        orig_ring = mod.STATS["tpm_settle_ratio_by_model"]
+        mod.TPM_BUCKETS = {}
+        mod.STATS["tpm_settle_ratio_by_model"] = {}
+        try:
+            bucket = mod._TpmBucket()
+            bucket.used = 0  # .used 是 deque 子类的附加属性，须显式初始化（同既有 tpm 测试）
+            mod.TPM_BUCKETS[("k1", "m1")] = bucket
+            # actual=90, est=100 → 0.9
+            mod.tpm_settle("k1", 100, 90, "m1")
+            self.assertEqual(
+                list(mod.STATS["tpm_settle_ratio_by_model"]["m1"]), [0.9],
+                "actual/est=0.9 必须入环")
+            # est=0 / actual<0 → 不追加
+            mod.tpm_settle("k1", 0, 90, "m1")
+            mod.tpm_settle("k1", 100, -5, "m1")
+            self.assertEqual(
+                len(mod.STATS["tpm_settle_ratio_by_model"]["m1"]), 1,
+                "est<=0 或 actual<0 不得追加比率样本")
+            # est==actual → 1.0（delta==0 不退款但比率仍有观测价值）
+            mod.tpm_settle("k1", 100, 100, "m1")
+            self.assertEqual(
+                list(mod.STATS["tpm_settle_ratio_by_model"]["m1"]), [0.9, 1.0])
+        finally:
+            mod.TPM_BUCKETS = orig_buckets
+            mod.STATS["tpm_settle_ratio_by_model"] = orig_ring
+
+    def test_save_stats_counters_includes_daily_by_key(self) -> None:
+        mod = self.mod
+        tmp = tempfile.mkdtemp(prefix="ctyun-proxy-v3bykey-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        path = os.path.join(tmp, "settings.json")
+        today = mod.today_key()
+        orig = mod.STATS["daily_by_key"]
+        mod.STATS["daily_by_key"] = {}
+        try:
+            mod._record_request("POST", "/k", 200, 1.0, 0, model="m1",
+                                key_id12="abcdef123456", tokens_prompt=10,
+                                tokens_completion=5, stream=1)
+            mod.save_stats_counters(path)
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+            self.assertIn("daily_by_key", data.get("stats", {}),
+                          "落盘必须含 daily_by_key 键")
+            entry = data["stats"]["daily_by_key"][today]["abcdef123456"]
+            self.assertEqual(entry["tokens_prompt"], 10)
+            self.assertEqual(entry["stream_requests"], 1)
+            # roundtrip 全等
+            self.assertEqual(
+                mod.load_daily_by_key_buckets(path),
+                mod.STATS["daily_by_key"],
+                "save→load roundtrip 必须全等")
+        finally:
+            mod.STATS["daily_by_key"] = orig
+
+    def test_load_daily_by_key_buckets_tolerant(self) -> None:
+        mod = self.mod
+        loader = getattr(mod, "load_daily_by_key_buckets", None)
+        self.assertIsNotNone(loader, "load_daily_by_key_buckets 必须存在")
+        tmp = tempfile.mkdtemp(prefix="ctyun-proxy-v3bykey-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        path = os.path.join(tmp, "settings.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"stats": {"daily_by_key": {
+                "2026-01-02": {
+                    "abcdef123456": {"requests": 5, "tokens_prompt": 11},
+                    "BAD_KEY_WITH_UPPER": {"requests": 1},
+                    "toolongkeymorethan12": {"requests": 1},
+                    "": {"requests": 1}, "nothex!": {"requests": 1},
+                    "1234": "not-a-dict",
+                }}}}, fh)
+        out = loader(path)
+        self.assertEqual(set(out["2026-01-02"]), {"abcdef123456"},
+                         "非 1-12 位小写 hex 或空 key 必须丢弃")
+        self.assertEqual(set(out["2026-01-02"]["abcdef123456"]),
+                         set(mod._DAILY_BY_KEY_FIELDS), "8 字段白名单清洗")
+        self.assertEqual(out["2026-01-02"]["abcdef123456"]["tokens_prompt"], 11)
+        self.assertEqual(out["2026-01-02"]["abcdef123456"]["tokens_cache_write"], 0)
+        # 损坏 / 非 ISO → {}
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"stats": {"daily_by_key": "not-a-dict"}}, fh)
+        self.assertEqual(loader(path), {})
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"stats": {"daily_by_key": {"20260101": {"abcd": {}}}}}, fh)
+        self.assertEqual(loader(path), {}, "非 ISO 日期 key 必须跳过")
+
+    def test_load_daily_by_key_cap_truncates(self) -> None:
+        mod = self.mod
+        loader = getattr(mod, "load_daily_by_key_buckets", None)
+        self.assertIsNotNone(loader)
+        tmp = tempfile.mkdtemp(prefix="ctyun-proxy-v3bykeycap-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        path = os.path.join(tmp, "settings.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"stats": {"daily_by_key": {
+                "2026-01-02": {"%012x" % i: {"requests": i}
+                               for i in range(mod.BY_KEY_CAP + 10)}}}}, fh)
+        out = loader(path)
+        day = out["2026-01-02"]
+        self.assertEqual(len(day), mod.BY_KEY_CAP,
+                         "超 BY_KEY_CAP 必须按文件出现序截断")
+        self.assertIn("%012x" % (mod.BY_KEY_CAP - 1), day)
+        self.assertNotIn("%012x" % mod.BY_KEY_CAP, day)
+
+    def test_daily_by_key_prune_applies_retention(self) -> None:
+        mod = self.mod
+        orig = mod.STATS["daily_by_key"]
+        mod.STATS["daily_by_key"] = {}
+        tmp = tempfile.mkdtemp(prefix="ctyun-proxy-v3bykeyprune-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        path = os.path.join(tmp, "settings.json")
+        try:
+            # _prune_daily 是「保留最近 N 天」计数 prune（非按龄截断）——
+            # 灌满 RETENTION+10 天触发窗口滚动，验证 daily_by_key 同口径参与
+            base = mod.datetime.date.fromisoformat(mod.today_key())
+            for i in range(mod.DAILY_RETENTION_DAYS + 10):
+                day = (base - mod.datetime.timedelta(days=i)).isoformat()
+                mod.STATS["daily_by_key"][day] = {
+                    "abcdef123456": dict.fromkeys(mod._DAILY_BY_KEY_FIELDS, 0)}
+            mod.save_stats_counters(path)
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+            saved = data["stats"]["daily_by_key"]
+            self.assertEqual(len(saved), mod.DAILY_RETENTION_DAYS,
+                             "daily_by_key 必须与 daily 同口径 prune 到保留窗口")
+            oldest = (base - mod.datetime.timedelta(
+                days=mod.DAILY_RETENTION_DAYS)).isoformat()
+            self.assertNotIn(oldest, saved, "窗口外最旧日期桶必须被 prune")
+            self.assertIn(mod.today_key(), saved)
+        finally:
+            mod.STATS["daily_by_key"] = orig
+
+
 class RequestIdTest(unittest.TestCase):
     """P1 地基：request id / upstream host / ttfb / stream / outcome 全链路。
 

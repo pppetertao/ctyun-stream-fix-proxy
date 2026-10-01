@@ -641,6 +641,18 @@ def tpm_settle(key_id: str, est: int, actual: int, model) -> None:
         if delta != 0:
             bucket.append((now, delta))
         bucket.used = bucket.used + delta
+        # v3 T4：TPM 结算偏差样本（actual/est 比率）入环供分位观测（决策 4）。
+        # 锁序（R1 防死锁）：本函数持 TPM_LOCK，STATS_LOCK 必须在 TPM_LOCK 内获取——
+        # 全库固定 TPM_LOCK → STATS_LOCK。_record_request 只持 STATS_LOCK，
+        # tpm_snapshot 只持 TPM_LOCK——无反向获取路径。
+        # 禁止在 STATS_LOCK 持锁路径上新增任何 TPM_LOCK 获取。
+        if est > 0 and actual >= 0:
+            with STATS_LOCK:
+                ring = STATS["tpm_settle_ratio_by_model"]
+                if model not in ring and len(ring) < BY_MODEL_CAP:
+                    ring[model] = collections.deque(maxlen=SETTLE_RING_MAX)
+                if model in ring:
+                    ring[model].append(actual / est)
         TPM_LOCK.notify_all()
 
 
@@ -1125,9 +1137,12 @@ def save_stats_counters(path: str) -> None:
                                           "finish_retries_total", "header_retries_total")}
         _prune_daily(STATS["daily"])           # 内存态原地 prune（副本 prune 修不了内存增长）
         _prune_daily(STATS["daily_by_model"])  # 内存态原地 prune（副本 prune 修不了内存增长）
+        _prune_daily(STATS["daily_by_key"])    # v3 T1：value-agnostic prune 复用
         daily = {k: dict(v) for k, v in STATS["daily"].items()}  # prune 后拷贝：磁盘与内存一致
         daily_by_model = {d: {m: dict(v) for m, v in models.items()}
                           for d, models in STATS["daily_by_model"].items()}
+        daily_by_key = {d: {k: dict(v) for k, v in keys.items()}
+                        for d, keys in STATS["daily_by_key"].items()}
         events = [dict(e) for e in EVENTS]  # 逐条浅拷贝：磁盘与内存一致（≤100 条）
     with _CFG_LOCK:
         base = UPSTREAM_BASE
@@ -1145,7 +1160,7 @@ def save_stats_counters(path: str) -> None:
                    "model_pricing": MODEL_PRICING,
                    "tpm_model_budgets": budgets,
                    "stats": dict(counters, daily=daily, daily_by_model=daily_by_model,
-                                 events=events)},
+                                 daily_by_key=daily_by_key, events=events)},
                   fh, ensure_ascii=False)
     os.replace(tmp, path)
 
@@ -1315,6 +1330,41 @@ def load_daily_by_model_buckets(path: str) -> dict:
                 value = entry.get(field)
                 clean[field] = value if isinstance(value, int) and value >= 0 else 0
             bucket[model] = clean
+        out[key] = bucket
+    return out
+
+
+def load_daily_by_key_buckets(path: str) -> dict:
+    """读日期→key_id12→_DAILY_BY_KEY_FIELDS 矩阵；缺/损坏/legacy 无 daily_by_key 键 → {}。
+
+    外层 ISO 日期 round-trip 校验同 load_daily_by_model_buckets；内层 key 必须是
+    1-12 位小写 hex 字符串（sha256 前 12 位脱敏口径，决策 2），超 BY_KEY_CAP 按
+    文件出现序截断；8 字段白名单清洗（_DAILY_BY_KEY_FIELDS），坏字段补 0。
+    """
+    stats = _load_persist_file(path).get("stats")
+    raw = stats.get("daily_by_key") if isinstance(stats, dict) else None
+    if not isinstance(raw, dict):
+        return {}
+    out = {}
+    for key, keys in raw.items():
+        try:
+            d = datetime.date.fromisoformat(key)
+        except (ValueError, TypeError):
+            continue
+        if str(d) != key or not isinstance(keys, dict):
+            continue
+        bucket = {}
+        for kid, entry in keys.items():
+            if (not isinstance(kid, str) or not kid or len(kid) > 12
+                    or re.fullmatch(r"[0-9a-f]+", kid) is None):
+                continue  # 非 1-12 位小写 hex → 丢弃（坏数据不崩）
+            if not isinstance(entry, dict) or len(bucket) >= BY_KEY_CAP:
+                continue  # cap 截断：按文件出现序保留前 BY_KEY_CAP 个
+            clean = {}
+            for field in _DAILY_BY_KEY_FIELDS:  # 同 load_daily_buckets 逐字段规则
+                value = entry.get(field)
+                clean[field] = value if isinstance(value, int) and value >= 0 else 0
+            bucket[kid] = clean
         out[key] = bucket
     return out
 
@@ -3655,6 +3705,7 @@ def main() -> None:
     counters = load_stats_counters(PERSIST_PATH)  # 累计计数跨重启续算
     daily = load_daily_buckets(PERSIST_PATH)      # 按天分桶跨重启续算
     daily_by_model = load_daily_by_model_buckets(PERSIST_PATH)  # 按天×模型矩阵跨重启续算
+    daily_by_key = load_daily_by_key_buckets(PERSIST_PATH)  # v3 T1：按天×key 矩阵跨重启续算
     events = load_stats_events(PERSIST_PATH)      # 错误/重试事件流跨重启续算
     CAPTURE_ERRORS = load_capture_errors(PERSIST_PATH)  # 启动时回填开关
     # 迁移 seed（决策 2）：持久化 tpm_model_budgets 为运行时唯一权威；
@@ -3695,6 +3746,7 @@ def main() -> None:
         STATS["header_retries_total"] = counters["header_retries_total"]
         STATS["daily"] = daily
         STATS["daily_by_model"] = daily_by_model
+        STATS["daily_by_key"] = daily_by_key
         EVENTS.clear()
         EVENTS.extend(events)  # 先 clear 后 extend：防 deque 残留叠加
         _stats_dirty = False
