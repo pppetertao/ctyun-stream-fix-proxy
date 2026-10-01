@@ -795,7 +795,7 @@ _PROBE_STATE = {      # PROBE_LOCK 保护（探测线程写 / probe_state_snapsh
 STARTED_AT = time.time()
 RECENT_REQUESTS = collections.deque(maxlen=100)  # {"ts","method","path","status","dur_ms","filtered","model","rid","upstream_host","ttfb_ms","stream","tokens","bytes_out","chunks","outcome"}
 POISON_PREVIEWS = collections.deque(maxlen=20)   # {"ts","preview"} 最近剥除的 record 预览
-EVENTS = collections.deque(maxlen=100)  # {"ts","kind":"proxy"|"upstream"|"retry","model","status"}
+EVENTS = collections.deque(maxlen=100)  # {"ts","kind":"proxy"|"upstream"|"retry"|"probe_alert","model","status"(,"reason" 仅 probe_alert)}
 # 单一全局事件流（kind 区分）而非按 (day,model,kind) 分环：per-key 环形几十个 deque
 # 持久化/清洗成本高，单流 maxlen=100 硬上界等价满足"每 key 有界"，tooltip 按需过滤。
 
