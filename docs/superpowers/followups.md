@@ -6,6 +6,3 @@ ctyun-stream-fix-proxy.py _tpm_rejected/tpm_snapshot（TPM 限流 episode 引入
 
 ctyun-stream-fix-proxy.py TPM_LIMIT 常量（TPM 限流 episode 引入） | 110k 预算对 kimi-k3-oc 形同虚设：2026-09-30 19:08-19:11 kimi 本地 used 仅 ~31k 即遭上游 200 包 TPM 错误（body-err 观测抓到 4 次）；且 0.25 ratio 对 glm 内容低估（settle 后 used 冲至 119470>110k，存在超装窗口） | per-model（或 per-key×model）预算/比率：kimi ~30k、deepseek/glm 110k；新 episode 处理
 
-ctyun-stream-fix-proxy.py:2876 renderLatencyDist（observability-v2 P5 引入） | 空直方图时后端 hist_percentile 返回 0.0，前端 `ms === undefined ? "—"` 分支不可达，延迟分布卡空态显示 3 个 "0ms" 而非 "—"（纯展示口径，有流量后自愈；whole-branch review 置信 65） | 空态改判 `!phases || Object.keys(phases).length===0`；顺手小修
-
-ctyun-stream-fix-proxy.py:2965 renderTriState（observability-v2 P5 引入） | 三态空态占位 span 落在 14px 高 overflow:hidden 的 flex 占比条内，文字被裁切不可读（纯视觉；whole-branch review 置信 55） | 空态时隐藏 .tri-bar 改用独立占位行；顺手小修

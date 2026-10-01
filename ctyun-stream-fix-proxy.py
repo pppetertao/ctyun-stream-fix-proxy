@@ -2876,7 +2876,10 @@ function renderLatencyDist(phases) {
     var name = defs[i][0];
     var label = defs[i][1];
     var ms = phases[name];
-    var w = ms === undefined ? 0 : Math.min(ms / cap, 1) * 460;
+    // 空态判定：hist_percentile 空直方图返 0.0，而 q=0.5 下非空直方图最小值 ≥25ms
+    // （首桶插值下界），故 ms==null||ms===0 ⟺ 空直方图，无误判真实 0ms
+    var has = ms == null || ms === 0;
+    var w = has ? 0 : Math.min(ms / cap, 1) * 460;
     var g = document.createElementNS(svgns, "g");
     var t = document.createElementNS(svgns, "text");
     t.setAttribute("x", 0);
@@ -2887,15 +2890,15 @@ function renderLatencyDist(phases) {
     var r = document.createElementNS(svgns, "rect");
     r.setAttribute("x", 90);
     r.setAttribute("y", 12 + i * 30);
-    r.setAttribute("width", Math.max(2, w).toFixed(1));
+    r.setAttribute("width", (has ? 0 : Math.max(2, w)).toFixed(1));
     r.setAttribute("height", 14);
     r.style.fill = "var(--amber)";
     var v = document.createElementNS(svgns, "text");
-    v.setAttribute("x", 96 + Math.max(2, w));
+    v.setAttribute("x", 96 + (has ? 0 : Math.max(2, w)));
     v.setAttribute("y", 24 + i * 30);
     v.setAttribute("font-size", 12);
     v.style.fill = "var(--text)";
-    v.textContent = ms === undefined ? "—" : fmtDur(ms);
+    v.textContent = has ? "—" : fmtDur(ms);
     g.appendChild(t);
     g.appendChild(r);
     g.appendChild(v);
@@ -2962,9 +2965,11 @@ function renderTriState(snap) {
   }
   var total = ok + deg + fail;
   if (total === 0) {
-    bar.appendChild(el("span", "empty", "暂无 outcome 数据 —— 有请求经过代理后这里会出现三态占比"));
+    bar.style.display = "none";  // 占位移出 14px 高 overflow:hidden 的条，避免文字裁切
+    legend.appendChild(el("span", "empty", "暂无 outcome 数据 —— 有请求经过代理后这里会出现三态占比"));
     return;
   }
+  bar.style.display = "flex";  // 非空恢复内联默认值，防上次空态残留 none
   var wOk = Math.round(ok / total * 100);
   var wDeg = Math.round(deg / total * 100);
   var wFail = 100 - wOk - wDeg;

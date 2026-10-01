@@ -2641,6 +2641,15 @@ class DashboardV2SkeletonTest(unittest.TestCase):
         self.assertGreaterEqual(html.count("textContent"), 1,
                                 "textContent 出现次数必须 ≥ innerHTML（此处 innerHTML=0）")
 
+    def test_v2_empty_state_branches(self) -> None:
+        v2 = self.mod._DASH_JS_V2
+        self.assertIn("ms == null || ms === 0", v2,
+                      "renderLatencyDist 空态必须判 0.0（hist_percentile 空桶值）")
+        self.assertIn("bar.style.display", v2,
+                      "renderTriState 空态必须隐藏占比条")
+        self.assertNotIn('bar.appendChild(el("span", "empty"', v2,
+                         "三态空态占位不得落在 overflow:hidden 的 tri-bar 内")
+
     def test_v2_js_functions_and_wiring(self) -> None:
         js = self.mod._DASH_JS_V2
         for fn in ("renderPerf", "renderTokens", "renderHealth", "renderTriState"):
