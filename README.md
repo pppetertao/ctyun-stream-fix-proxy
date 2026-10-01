@@ -18,9 +18,16 @@
   - 「剥行流带」最近 20 条毒 record 预览 + 累计 sparkline
   - 「按天统计」「按天 × 模型」随所选时间段过滤日期（上月最多 31 行；daily 分桶，双口径错误列）
   - 「模型速度对比」各模型 TTFB P50/P90（进程内直方图分位数）+「延迟分布」连接/响应头/数据体三阶段 P50
-  - 「Token 用量按天 × 模型」prompt/completion tokens（usage 帧抽取，随所选时间段过滤）
+  - 「Token 用量按天 × 模型」prompt/completion/cache/reasoning tokens（usage 帧抽取，cache/reasoning 为 parse-if-present，上游不回传即为 0；随所选时间段过滤）
   - 「三态可用率」ok/degraded/failed 占比条（随所选时间段过滤）
   - 「上游健康」主动探测 HEAD 结果（最近探测时间/延迟/连续失败/开关；探测告警 hover 明细）
+  - v3 观测扩展（按模型区分）：按模型 TTFB 9 桶分布、三阶段 P50/P90 按模型、慢请求 Top 10、按模型错误/重试率（今日）、
+    TPM 限流观测（per key × 模型 60s 窗口 used/remaining/queued/rejected/timeouts）、错误事件流（最近 50 条）、
+    实时流量画像（60s 窗口 + 当日按模型流式占比）、SSE 停顿按模型、TPM 排队等待 P50/P90、
+    估算偏差 actual/est P50/P90、小时级 token 曲线（48h 内存环）、上游探测延迟趋势（7 天抽稀 ≤200 点折线）
+  - 「Token 用量按 API Key」当日 per-key 用量（sha256 前 12 位脱敏，≤64 key/日，跨重启保留）
+  - 「0-token 请求」所选时段零 token 请求计数与占比（被 stall/错误打断的流信号）
+  - 「月末 Token 投影」按本月日均速率预估全月 prompt+completion 总量（纯前端估算）
 - **网页热切上游**：`POST /api/config` 免重启切换上游 base URL（本机免鉴权；局域网访问需 `X-Admin-Token`）
 - **计数口径透明**：顶部「请求数」跨重启持久化；「按天统计」按本地日期分桶、重启续算
 - **launchd 常驻**：KeepAlive 自愈
@@ -67,10 +74,11 @@ launchctl kickstart -k gui/$UID/com.ctyun-stream-fix-proxy
 
 ## API
 
-- `GET /api/stats` — 全量统计 JSON（计数 / daily 分桶 / daily_by_model / recent 100 / 毒行流带 / range_stats 四维度聚合 / range_bounds 四维度窗口闭区间；后两键为加性新增，旧消费者零破坏）
+- `GET /api/stats` — 全量统计 JSON（计数 / daily 分桶 / daily_by_model / daily_by_key / hourly_tokens 48h 内存环 / recent 100 / 毒行流带 / range_stats 四维度聚合 / range_bounds 四维度窗口闭区间；perf 节含按模型 TTFB 9 桶直方图、三阶段 P50/P90、stalls、qwait 与 TPM 结算偏差分位；v3 新键均为加性新增，旧消费者零破坏）
 - `GET /api/config` — 当前上游 base URL
 - `POST /api/config` `{"upstream_base": "..."}` — 热切上游（本机免鉴权，LAN 需 `X-Admin-Token`）
 - `GET /api/health` — 上游健康（最近 probe 时间/延迟/连续失败/开关 `probe_enabled`）
+- `GET /api/probe_history` — 上游探测延迟历史（`{"points": [[ts, ms], ...], "count_total": n}`，均匀抽稀 ≤200 点，时间单调；无鉴权）
 - `POST /api/probe` `{"enabled": true|false}` — 切主动探测开关（本机免鉴权，LAN 需 `X-Admin-Token`；env `CTYUN_PROBE_ENABLED`（`1/true` 开、`0/false` 关）优先，否则持久化顶层 `probe_enabled`，缺省开）
 - `GET /api/errors` — 错误留痕列表（newest-first，不含 body/response）。无鉴权（敏感度与 `/api/stats` 同级）。默认 off（`count:0`、`events:[]`）；关闭开关只停止新增，已留痕事件保留至环自然淘汰，期间 `?id=` 详情仍可读取。
 - `GET /api/errors?id=N` — 单条错误事件详情（含 body/response 快照，≤4096/≤2048 字符）。**需鉴权**：本机（127.0.0.1/::1）放行，非本机需 `X-Admin-Token` 头（与 `POST /api/config` 同一 HMAC 比对）。id 不存在返回 404。
@@ -89,7 +97,7 @@ capture_errors 开关：
 /usr/bin/python3 ctyun-stream-fix-proxy.test.py
 ```
 
-118 个用例。**必须用 `/usr/bin/python3`**：Homebrew 的 Python 3.14 `http.server.HTTPServer` 构造会挂死（进程存活但不 LISTEN、零报错）。
+299 个用例（含 v3 观测扩展：schema 迁移、daily_by_key、usage 五元组、per-model 分位、probe history、dashboard v3 卡）。**必须用 `/usr/bin/python3`**：Homebrew 的 Python 3.14 `http.server.HTTPServer` 构造会挂死（进程存活但不 LISTEN、零报错）。
 
 ## 计数口径
 
@@ -100,6 +108,14 @@ capture_errors 开关：
 | 「按天统计」「按天 × 模型」 | 随所选时间段过滤（最远回溯=上月+当月 ≤62 天 < 90 天 retention） | 主表/副表均是（90 天 prune） |
 | 「最近请求」「剥行流带」 | 最近 100 / 20 条内存窗口 | 否 |
 | 「模型速度对比」「延迟分布」 | 进程内 TTFB 直方图（9 桶）分位数：按模型 P50/P90 + 三阶段全局 P50 | 否（重启清零） |
+| 「按模型 TTFB 分布」「三阶段按模型」「SSE 停顿按模型」 | 进程内直方图/计数（v3 per-model 双写） | 否（重启清零） |
+| 「TPM 排队等待」「估算偏差」分位 | 进程内 per-model 环形（500 样本/模型）最近秩分位 | 否（重启清零） |
+| 「小时级 Token 曲线」 | 48h 内存环（hourly_tokens，整点滚动） | 否（重启清零） |
+| 「TPM 限流观测」 | /api/tpm_stats 60s 窗口 per key × 模型桶 | 拒绝/超时计数随 stats 落盘 |
+| 「错误事件流」 | /api/errors 内存环最近 50 条（capture_errors 开关控制留痕） | 否（环内存态） |
+| 「上游探测延迟趋势」 | /api/probe_history 7 天 30s 采样抽稀 ≤200 点 | 否（内存 deque） |
+| 「Token 用量按 API Key」 | 当日 per-key 8 字段子集（sha256 前 12 位） | 是（daily_by_key 90 天 prune，≤64 key/日） |
+| 「0-token 请求」「月末 Token 投影」 | daily 桶 `requests_zero_token`（tokens=0 且非 5xx 非错误）；投影=前端本月日均×全月天数 | 是（daily 桶）/投影纯前端 |
 | 「Token 用量按天 × 模型」 | usage 帧 prompt/completion tokens，随所选时间段过滤 | 是（daily_by_model 90 天 prune） |
 | 「三态可用率」 | outcome ok/degraded/failed 按天×模型计数聚合，随所选时间段过滤 | 是（daily_by_model 90 天 prune） |
 | 「上游健康」 | 最近一次 probe HEAD 的延迟/成败 + 连续失败计数 | 否（内存态 probe 状态） |

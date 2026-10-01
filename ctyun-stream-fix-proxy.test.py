@@ -2913,6 +2913,56 @@ class DashboardV2SkeletonTest(unittest.TestCase):
         self.assertIn('markEvents(chip, "probe_alert", null, null)', js)
 
 
+class DashboardV3CardsTest(unittest.TestCase):
+    """v3 卡 7/8：新卡容器/函数/接线模块级断言（join 与 innerHTML 门禁沿用 6 段）。"""
+
+    def setUp(self) -> None:
+        self.mod = load_proxy_module()
+
+    def test_v3_overview_containers(self) -> None:
+        tables = self.mod._DASH_SECTIONS_TABLES
+        for cid in ("bykey-body", "zt-count", "zt-ratio", "zt-range",
+                    "q-mtd", "q-days", "q-proj"):
+            self.assertIn('id="%s"' % cid, tables,
+                          "overview 区缺 v3 容器 %s" % cid)
+
+    def test_v3_perf_containers(self) -> None:
+        v2 = self.mod._DASH_SECTIONS_V2
+        for cid in ("ttfb-hist-body", "phase-model-body", "slow-body",
+                    "stability-body", "tpm-obs-body", "err-events-body",
+                    "traffic-model-body", "stalls-body", "qwait-body",
+                    "settle-body", "hourly-svg", "probe-trend",
+                    "tpm-queue-chip", "err-capture-chip"):
+            self.assertIn('id="%s"' % cid, v2, "perf 区缺 v3 容器 %s" % cid)
+
+    def test_v3_token_table_columns(self) -> None:
+        v2 = self.mod._DASH_SECTIONS_V2
+        self.assertIn("<th>cache tokens</th>", v2,
+                      "token 按天×模型表缺 cache 列（T2）")
+        self.assertIn("<th>reasoning tokens</th>", v2,
+                      "token 按天×模型表缺 reasoning 列（T3）")
+
+    def test_v3_js_functions_and_wiring(self) -> None:
+        js = self.mod._DASH_JS_V2
+        for fn in ("renderPerfV3", "renderByKey", "renderZeroToken", "renderQuota",
+                   "renderTtfbHist", "renderPhaseByModel", "renderSlowTop",
+                   "renderStability", "renderTraffic", "renderStalls",
+                   "renderQwait", "renderSettle", "renderHourly",
+                   "loadTpmObs", "loadErrorEvents", "loadProbeTrend"):
+            self.assertIn("function %s(" % fn, js, "V3 JS 缺函数 %s" % fn)
+        self.assertIn('fetch("/api/tpm_stats")', js, "P3 需消费 /api/tpm_stats")
+        self.assertIn('fetch("/api/errors")', js, "P4 需消费 /api/errors")
+        self.assertIn('fetch("/api/probe_history")', js, "P10 需消费 /api/probe_history")
+        self.assertIn("renderPerfV3(snap)", js, "poll 需接线 renderPerfV3")
+        self.assertIn("renderByKey(snap)", js, "poll 需接线 renderByKey")
+        self.assertIn("renderPerfV3(lastSnap || {})", js, "启动需首渲染 perf v3")
+        core = self.mod._DASH_JS_CORE
+        self.assertIn("renderZeroToken(lastSnap)", core,
+                      "applyRange 需零请求重渲染 0-token 卡")
+        self.assertIn("renderQuota(lastSnap)", core,
+                      "applyRange 需零请求重渲染月末投影卡")
+
+
 class DashboardTabsSkeletonTest(unittest.TestCase):
     """P6：页面级 tab 分页骨架（模块级常量断言，无需子进程）。"""
 
@@ -3018,8 +3068,16 @@ class AdminIntegrationTest(unittest.TestCase):
                     "finish_retries_total",
                     "active",
                     "uptime_s", "upstream_base", "upstream_source",
-                    "recent", "poison_previews"):
+                    "recent", "poison_previews",
+                    "daily_by_key", "hourly_tokens"):
             self.assertIn(key, snap)
+        for key in ("ttfb_hist_by_model", "phase_p50_ms_by_model",
+                    "phase_p90_ms_by_model", "stalls_by_model",
+                    "qwait_p50_ms_by_model", "qwait_p90_ms_by_model",
+                    "tpm_settle_ratio_p50_by_model",
+                    "tpm_settle_ratio_p90_by_model"):
+            self.assertIn(key, snap["perf"],
+                          "/api/stats perf 缺 v3 键 %s" % key)
         self.assertEqual(snap["upstream_base"],
                          "http://127.0.0.1:%d" % self.upstream_port)
         self.assertEqual(snap["upstream_source"], "env")
@@ -3119,16 +3177,18 @@ class AdminIntegrationTest(unittest.TestCase):
         self.assertIn("<th>重试</th>", html)
         self.assertIn('colspan="6"', html)
         self.assertIn('id="daily-model-body"', html)
-        # v3：按天×模型表 7 列与主表数值列对齐（代理错误/上游5xx）+ 错误行高亮
-        self.assertEqual(html.count("<th>代理错误</th>"), 2)
-        self.assertEqual(html.count("<th>上游5xx</th>"), 2)
+        # v3：按天×模型表 7 列与主表数值列对齐（代理错误/上游5xx）+ 错误行高亮；
+        # 卡 8 P2 稳定性表为两列各第 3 处
+        self.assertEqual(html.count("<th>代理错误</th>"), 3)
+        self.assertEqual(html.count("<th>上游5xx</th>"), 3)
         self.assertIn('colspan="7"', html)
         self.assertIn("String(ent.errors_proxy || 0)", html)
         self.assertIn("String(ent.errors_upstream || 0)", html)
         self.assertIn("(ent.errors_proxy || 0) + (ent.errors_upstream || 0)", html)
-        # v2.1：按模型重启累计卡已整体移除，标题与口径标注锁定不复活
+        # v2.1：按模型重启累计卡已整体移除，标题与口径标注锁定不复活；
+        # v3 观测扩展按模型区分（spec 决策 9），锁收窄到「重启累计」语义卡
         self.assertNotIn("自上次重启起累计", html)
-        self.assertNotIn("按模型", html)
+        self.assertNotIn("按模型重启累计", html)
         # v1.3：跨天日期分组（纯前端逻辑，静态断言锁定存在性，目检兜底见 Task 3）
         self.assertIn("fmtDate", html)
         self.assertIn("date-row", html)
