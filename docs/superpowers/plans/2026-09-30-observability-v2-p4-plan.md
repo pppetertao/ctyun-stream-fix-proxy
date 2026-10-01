@@ -365,7 +365,7 @@ cd /Users/peter/Documents/project/ctyun-stream-fix-proxy/.worktrees/observabilit
 回归（既有三桶/分类/快照测试不得红）：
 
 ```bash
-/usr/bin/python3 ctyun-stream-fix-proxy.test.py ProxyDashboardUnitTest.test_classify_outcome_priority ProxyDashboardUnitTest.test_classify_outcome_body_error ProxyDashboardUnitTest.test_outcome_tri_state_mapping DailyV2CompatTest.test_roundtrip_16_field_full_equality RequestIdTest; echo "EXIT=$?"
+/usr/bin/python3 ctyun-stream-fix-proxy.test.py ProxyDashboardUnitTest.test_classify_outcome_full_matrix ProxyDashboardUnitTest.test_classify_outcome_body_error DailyV2CompatTest.test_outcome_tri_state_mapping DailyV2CompatTest.test_roundtrip_16_field_full_equality RequestIdTest; echo "EXIT=$?"
 ```
 
 ---
