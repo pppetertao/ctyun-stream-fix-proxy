@@ -27,6 +27,7 @@ import sys
 import threading
 import time
 import urllib.parse
+import uuid
 
 DEFAULT_UPSTREAM_BASE = "https://eaichat.ctyun.cn/ai/platform/v2/cp"
 UPSTREAM_BASE = DEFAULT_UPSTREAM_BASE  # 运行时可变：main() 启动解析 / POST /api/config 热切换
@@ -1072,6 +1073,213 @@ def calibrate_engine(model, send_one, should_abort=None, sleep=None,
         if abort_fn():
             return _result("aborted", last_ok_est, None)
         sleep_fn(TPM_CALIBRATE_BATCH_GAP_S)
+
+
+# v2 P5：校准 daemon 与发送器（决策 9/10）
+_CALIBRATE_BYTES_PER_STEP = max(1, int(TPM_CALIBRATE_STEP_TOKENS
+                                       / max(TPM_TOKEN_RATIO, 0.01)))
+CALIBRATE_LOCK = threading.Lock()
+_LAST_AUTH = None   # 最近一次真实流量的 Authorization 头（R3 凭证来源 a；仅内存）
+_CALIBRATE_TOKEN = None  # calibrate_start 注入的 Bearer token（None=回落 _LAST_AUTH）
+
+_CALIBRATE_STATE = {
+    "running": False,       # bool：校准进行中
+    "task_id": None,        # str：本次校准 uuid 短 hex（12 位）
+    "model": None,          # str：校准目标模型名
+    "started_at": None,     # float：启动时间戳
+    "progress": {"batch": 0, "consumed": 0},
+    "result": None,         # dict：calibrate_engine 返回结果
+    "error": None,          # str：异常消息（R6）
+    "abort": False,         # bool：calibrate_abort 置位，engine 批间隙检查
+    "last_probe_ts": {},    # {model: float}：同模型上次校准完成时间戳（最小间隔判定）
+}
+
+
+def calibrate_state_snapshot() -> dict:
+    """GET /api/tpm_calibrate 轮询快照（短持 CALIBRATE_LOCK）。"""
+    with CALIBRATE_LOCK:
+        return {
+            "running": _CALIBRATE_STATE["running"],
+            "task_id": _CALIBRATE_STATE["task_id"],
+            "model": _CALIBRATE_STATE["model"],
+            "progress": dict(_CALIBRATE_STATE["progress"]),
+            "result": _CALIBRATE_STATE["result"],
+        }
+
+
+def calibrate_start(model, token=None) -> tuple:
+    """POST /api/tpm_calibrate 处理：校验 → 置位 state，由 daemon 消费。
+
+    返回 (http_status, payload_dict)。
+    """
+    if not isinstance(model, str) or not model:
+        return 400, {"error": "model 必须为非空字符串"}
+    with CALIBRATE_LOCK:
+        if _CALIBRATE_STATE["running"]:
+            return 409, {"error": "已有校准任务在进行中（模型 %s），请等待或中止后重试"
+                         % _CALIBRATE_STATE["model"]}
+        last_ts = _CALIBRATE_STATE["last_probe_ts"].get(model)
+        if last_ts is not None and last_ts > 0:
+            elapsed = time.time() - last_ts
+            if elapsed < TPM_CALIBRATE_MIN_INTERVAL_S:
+                return 429, {"error": "模型 %s 距上次校准不足 %ds（已过 %.0fs），"
+                             "请 %ds 后重试"
+                             % (model, TPM_CALIBRATE_MIN_INTERVAL_S, elapsed,
+                                int(TPM_CALIBRATE_MIN_INTERVAL_S - elapsed))}
+        if not token and not _LAST_AUTH:
+            return 400, {"error": "无可用凭证：请先产生一次真实流量，或在请求体提供 token"}
+        task_id = uuid.uuid4().hex[:12]
+        _CALIBRATE_STATE["running"] = True
+        _CALIBRATE_STATE["task_id"] = task_id
+        _CALIBRATE_STATE["model"] = model
+        _CALIBRATE_STATE["started_at"] = time.time()
+        _CALIBRATE_STATE["progress"] = {"batch": 0, "consumed": 0}
+        _CALIBRATE_STATE["result"] = None
+        _CALIBRATE_STATE["error"] = None
+        _CALIBRATE_STATE["abort"] = False
+        global _CALIBRATE_TOKEN
+        _CALIBRATE_TOKEN = token  # None=回落 _LAST_AUTH（daemon 消费后置 None）
+    return 200, {"ok": True, "task_id": task_id}
+
+
+def calibrate_abort() -> bool:
+    """POST /api/tpm_calibrate_abort 处理：置 abort 标志（幂等，不强制杀线程）。"""
+    with CALIBRATE_LOCK:
+        was_running = _CALIBRATE_STATE["running"]
+        _CALIBRATE_STATE["abort"] = True
+    return was_running
+
+
+def _calibrate_send(model, batch, est, auth_token):
+    """单次校准探测发送（R2：http.client 直连 UPSTREAM_BASE，不经 _proxy_relay）。
+
+    body 由 build_calibrate_body 按批次放大 input 填充：batch 1=INPUT_BYTES，
+    每批 +_CALIBRATE_BYTES_PER_STEP 字节（使 estimate 增量 ≈ TPM_CALIBRATE_STEP_TOKENS）。
+    Authorization = auth_token 或 _LAST_AUTH。
+    返回 (status, body_error)；连接异常（OSError / HTTPException，R6 显式分类）
+    → (None, False) 并 _safe_log_stderr 留痕；engine 将连接异常判为
+    CLASS_UPSTREAM_FAULT 走重试路径。
+    """
+    input_bytes = TPM_CALIBRATE_INPUT_BYTES \
+        + (batch - 1) * _CALIBRATE_BYTES_PER_STEP
+    body = build_calibrate_body(model, input_bytes)
+    body_bytes = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    parsed = urllib.parse.urlparse(UPSTREAM_BASE)
+    upstream_path = parsed.path.rstrip("/") + "/v1/chat/completions"
+    headers = {"Content-Type": "application/json"}
+    token = auth_token or _LAST_AUTH
+    if token:
+        headers["Authorization"] = token
+    try:
+        if parsed.scheme == "https":
+            conn = http.client.HTTPSConnection(
+                parsed.hostname, parsed.port, timeout=HEADER_TIMEOUT_S)
+        else:
+            conn = http.client.HTTPConnection(
+                parsed.hostname, parsed.port, timeout=HEADER_TIMEOUT_S)
+        conn.request("POST", upstream_path, body=body_bytes, headers=headers)
+        resp = conn.getresponse()
+        status = resp.status
+        data = resp.read()
+        conn.close()
+    except (OSError, http.client.HTTPException) as exc:
+        # 显式分类（R6）：连接级异常不是限流信号；stderr 留痕，由 engine 判
+        # CLASS_UPSTREAM_FAULT 走重试。
+        _safe_log_stderr("ctyun-stream-fix-proxy: calibrate send failed "
+                         "model=%s batch=%d: %s" % (model, batch, exc))
+        return None, False
+    body_error = False
+    if data:
+        try:
+            parsed_data = json.loads(data.decode("utf-8", "replace"))
+        except ValueError:
+            parsed_data = None  # 非 JSON 响应体 → 无 body error（fail-open）
+        if isinstance(parsed_data, dict):
+            body_error = body_has_error(parsed_data)
+    return status, body_error
+
+
+def _calibrate_log(model, task_id, result, dur_s) -> None:
+    """校准摘要日志（R2：校准不经 relay 的 _log，用同款 REQ 行格式 + probe=1 标记）。
+
+    同时写 stderr 与 LOG_RING（_LOG_SEQ 同 _log 口径递增）；AC7 的
+    /api/logs 含 probe=1 断言依赖本函数。
+    """
+    status = result.get("status")
+    line = ("REQ POST /v1/chat/completions -> %s dur=%.1fs result=calibrate "
+            "filtered=0 model=%s retried=0 retry_reason=- exc=- "
+            "rid=calibrate-%s host=%s ttfb=- stream=0 outcome=%s "
+            "consumed=%d probe=1 ts=%s"
+            % (status if status is not None else "-", dur_s, model, task_id,
+               urllib.parse.urlparse(UPSTREAM_BASE).netloc,
+               result.get("outcome"), result.get("consumed", 0),
+               time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime())))
+    _safe_log_stderr(line)
+    global _LOG_SEQ
+    with LOG_LOCK:
+        _LOG_SEQ += 1
+        LOG_RING.append({"seq": _LOG_SEQ, "line": line})
+
+
+def _calibrate_loop() -> None:
+    """校准 daemon 线程（main() 恒启动一次；无待跑任务时轮询空转）。
+
+    检测 running=True → 取模型与凭证 → 构造 send_one 注入发送器
+    （_calibrate_send 直连 UPSTREAM_BASE，R2）→ 调 calibrate_engine 跑完整校准；
+    结束后写 state.result、复位 running，rejected 时落探测结果（record_tpm_probe_result），
+    写 probe=1 摘要日志（_calibrate_log）。
+    顶层 except Exception：写 _CALIBRATE_STATE["error"] + _safe_log_stderr 后复位
+    running=False——不静默吞掉（R6），供 Dashboard 展示。
+    """
+    while True:
+        time.sleep(1)
+        with CALIBRATE_LOCK:
+            if not _CALIBRATE_STATE["running"]:
+                continue
+            task_id = _CALIBRATE_STATE["task_id"]
+            model = _CALIBRATE_STATE["model"]
+            token = _CALIBRATE_TOKEN
+            _CALIBRATE_TOKEN = None
+        auth_token = token or _LAST_AUTH
+        started = time.time()
+
+        def send_one(batch, est):
+            return _calibrate_send(model, batch, est, auth_token)
+
+        def should_abort():
+            with CALIBRATE_LOCK:
+                return _CALIBRATE_STATE["abort"]
+
+        try:
+            result = calibrate_engine(model, send_one, should_abort=should_abort)
+        except Exception as exc:
+            # 顶层兜底（R6）：写入 state.error + stderr 留痕后复位 running，
+            # 让该线程继续服务（下次 POST 仍可启动新任务）。
+            _safe_log_stderr("ctyun-stream-fix-proxy: calibrate loop failed "
+                             "model=%s: %s" % (model, exc))
+            with CALIBRATE_LOCK:
+                if _CALIBRATE_STATE.get("task_id") == task_id:
+                    _CALIBRATE_STATE["running"] = False
+                    _CALIBRATE_STATE["error"] = "%s: %s" % (
+                        type(exc).__name__, exc)
+            continue
+        with CALIBRATE_LOCK:
+            if _CALIBRATE_STATE.get("task_id") != task_id:
+                continue  # 已被新任务取代：结果丢弃
+            _CALIBRATE_STATE["result"] = result
+            _CALIBRATE_STATE["progress"] = {"batch": result["batches"],
+                                             "consumed": result["consumed"]}
+            _CALIBRATE_STATE["running"] = False
+            _CALIBRATE_STATE["last_probe_ts"][model] = result["ts"]
+        if result["outcome"] == "rejected" and result["threshold"] is not None:
+            record_tpm_probe_result(model, {
+                "threshold": result["threshold"],
+                "ts": result["ts"],
+                "outcome": result["outcome"],
+                "batches": result["batches"],
+                "consumed": result["consumed"],
+            })
+        _calibrate_log(model, task_id, result, time.time() - started)
 
 
 class _EmptyStream(Exception):
@@ -2428,10 +2636,21 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 STATS["active"] -= 1
 
     def _proxy_relay(self, started: float) -> None:
+        if getattr(self, "_calibrate_probe", False):
+            return
         length = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(length) if length > 0 else None
         model = extract_model(body)
         body = normalize_null_assistant_content(body)
+
+        # 记录最近一次真实流量的 Authorization（R3 凭证来源 a：校准默认复用；
+        # 仅内存持有，save_stats_counters 白名单不含它，绝不落盘）
+        auth_header = self.headers.get("Authorization")
+        if auth_header and isinstance(auth_header, str) \
+                and auth_header.startswith("Bearer "):
+            with _CFG_LOCK:
+                global _LAST_AUTH
+                _LAST_AUTH = auth_header
 
         # --- TPM 准入 hook（_open_upstream 之前；重试复用本次准入不重复 charge）---
         tpm_key = tpm_key_id(self.headers.get("Authorization"))
@@ -2923,7 +3142,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
     def _log(self, started: float, status: int, result: str, filtered: int, model=None,
              retried: int = 0, retry_reason: str = "", exc=None,
              rid=None, upstream_host=None, ttfb_ms=None, stream=None,
-             outcome=None, qwait_ms=None, tpm_used=None) -> None:
+             outcome=None, qwait_ms=None, tpm_used=None, probe=None) -> None:
         exc_field = "-"
         if exc is not None:
             exc_field = re.sub(r"\s+", "_",
@@ -2934,6 +3153,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             extra += " qwait=%dms" % qwait_ms
         if tpm_used is not None:
             extra += " tpm=%d" % tpm_used
+        if probe:
+            extra += " probe=1"
         _safe_log_stderr("REQ %s %s -> %d dur=%.1fs result=%s filtered=%d "
                          "model=%s retried=%d retry_reason=%s exc=%s "
                          "rid=%s host=%s ttfb=%s stream=%s outcome=%s%s ts=%s"
@@ -5006,6 +5227,10 @@ def main() -> None:
     # v2 P4：probe daemon（恒启动一次；enabled=False 时空转，见 _probe_loop docstring）
     threading.Thread(target=_probe_loop, daemon=True,
                      name="upstream-probe").start()
+
+    # v2 P5：校准 daemon（恒启动一次；无待跑任务时轮询空转，见 _calibrate_loop docstring）
+    threading.Thread(target=_calibrate_loop, daemon=True,
+                     name="tpm-calibrate").start()
 
     server = http.server.ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), ProxyHandler)
     server.daemon_threads = True

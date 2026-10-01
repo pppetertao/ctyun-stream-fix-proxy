@@ -7700,6 +7700,141 @@ class TpmCalibrateEngineTest(unittest.TestCase):
         self.assertGreaterEqual(result["ts"], before)
 
 
+class TpmCalibrateStateTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.mod = load_proxy_module()
+
+    def setUp(self) -> None:
+        mod = self.mod
+        with mod.CALIBRATE_LOCK:
+            mod._CALIBRATE_STATE.clear()
+            mod._CALIBRATE_STATE.update({
+                "running": False, "task_id": None, "model": None,
+                "started_at": None, "progress": {"batch": 0, "consumed": 0},
+                "result": None, "error": None, "abort": False,
+                "last_probe_ts": {},
+            })
+            mod._CALIBRATE_TOKEN = None
+        mod._LAST_AUTH = None
+
+    def test_calibrate_state_snapshot_initial(self) -> None:
+        snap = self.mod.calibrate_state_snapshot()
+        for key in ("running", "task_id", "model", "progress", "result"):
+            self.assertIn(key, snap)
+        self.assertIs(snap["running"], False)
+        self.assertIsNone(snap["model"])
+
+    def test_calibrate_start_validation_and_auth(self) -> None:
+        mod = self.mod
+        for bad in (None, "", 123, True):
+            status, _ = mod.calibrate_start(bad)
+            self.assertEqual(status, 400, "bad model=%r" % (bad,))
+        mod._LAST_AUTH = None
+        status, payload = mod.calibrate_start("kimi", token=None)
+        self.assertEqual(status, 400)
+        self.assertIn("无可用凭证", payload["error"])
+        status, payload = mod.calibrate_start("kimi", token="Bearer t")
+        self.assertEqual(status, 200)
+        self.assertIn("task_id", payload)
+
+    def test_calibrate_start_sets_state(self) -> None:
+        mod = self.mod
+        status, payload = mod.calibrate_start("kimi", token="t")
+        self.assertEqual(status, 200)
+        with mod.CALIBRATE_LOCK:
+            st = mod._CALIBRATE_STATE
+            self.assertTrue(st["running"])
+            self.assertEqual(st["model"], "kimi")
+            self.assertEqual(st["progress"], {"batch": 0, "consumed": 0})
+            self.assertEqual(st["task_id"], payload["task_id"])
+            self.assertIsNone(st["result"])
+            self.assertFalse(st["abort"])
+
+    def test_calibrate_start_conflict_and_interval(self) -> None:
+        mod = self.mod
+        status, _ = mod.calibrate_start("m1", token="t")
+        self.assertEqual(status, 200)
+        status, payload = mod.calibrate_start("m2", token="t")
+        self.assertEqual(status, 409)
+        self.assertIn("m1", payload["error"])
+        with mod.CALIBRATE_LOCK:
+            mod._CALIBRATE_STATE["last_probe_ts"]["m1"] = time.time()
+            mod._CALIBRATE_STATE["running"] = False
+        # 同模型 < MIN_INTERVAL → 429
+        status, payload = mod.calibrate_start("m1", token="t")
+        self.assertEqual(status, 429)
+        self.assertIn("距上次校准不足", payload["error"])
+        with mod.CALIBRATE_LOCK:
+            self.assertFalse(mod._CALIBRATE_STATE["running"],
+                             "429 must not set running=True")
+        # 清除 last_probe_ts → 200 正常启动
+        with mod.CALIBRATE_LOCK:
+            del mod._CALIBRATE_STATE["last_probe_ts"]["m1"]
+        status, _ = mod.calibrate_start("m1", token="t")
+        self.assertEqual(status, 200)
+
+    def test_calibrate_abort_idempotent(self) -> None:
+        mod = self.mod
+        self.assertFalse(mod.calibrate_abort())  # 无运行任务 → False
+        status, _ = mod.calibrate_start("m", token="t")
+        self.assertEqual(status, 200)
+        self.assertTrue(mod.calibrate_abort())   # 有任务 → True
+        with mod.CALIBRATE_LOCK:
+            self.assertTrue(mod._CALIBRATE_STATE["abort"])
+        self.assertTrue(mod.calibrate_abort())   # 幂等
+
+
+class CalibrateSendTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.mod = load_proxy_module()
+
+    def setUp(self) -> None:
+        self._orig_base = self.mod.UPSTREAM_BASE
+        self._orig_auth = self.mod._LAST_AUTH
+        self.upstream_port = make_fake_upstream(False)
+        self.mod.UPSTREAM_BASE = "http://127.0.0.1:%d" % self.upstream_port
+        self.mod._LAST_AUTH = None
+
+    def tearDown(self) -> None:
+        self.mod.UPSTREAM_BASE = self._orig_base
+        self.mod._LAST_AUTH = self._orig_auth
+        stop_fake_upstreams()
+
+    def test_calibrate_send_200_to_ok(self) -> None:
+        status, body_error = self.mod._calibrate_send(
+            "m", 1, 60013, "Bearer t")
+        self.assertEqual(status, 200)
+        self.assertIs(body_error, False)
+
+    def test_calibrate_send_200_body_error(self) -> None:
+        stop_fake_upstreams()
+        err_port = make_fake_upstream(False, fail_200_error=True)
+        self.mod.UPSTREAM_BASE = "http://127.0.0.1:%d" % err_port
+        status, body_error = self.mod._calibrate_send(
+            "m", 1, 60013, "Bearer t")
+        self.assertEqual(status, 200)
+        self.assertIs(body_error, True)
+
+    def test_calibrate_send_500(self) -> None:
+        stop_fake_upstreams()
+        err_port = make_fake_upstream(False, fail_500=True)
+        self.mod.UPSTREAM_BASE = "http://127.0.0.1:%d" % err_port
+        status, body_error = self.mod._calibrate_send(
+            "m", 3, 70013, "Bearer t")
+        self.assertEqual(status, 500)
+        self.assertIs(body_error, False)
+
+    def test_calibrate_send_connection_refused(self) -> None:
+        free = free_port()
+        self.mod.UPSTREAM_BASE = "http://127.0.0.1:%d" % free
+        status, body_error = self.mod._calibrate_send(
+            "m", 1, 60013, None)
+        self.assertIsNone(status)
+        self.assertIs(body_error, False)
+
+
 if __name__ == "__main__":
     import atexit
     atexit.register(kill_registered)
