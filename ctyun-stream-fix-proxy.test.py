@@ -4944,6 +4944,165 @@ class SchemaV3MigrationTest(unittest.TestCase):
         self.assertEqual(getattr(mod, "HOURLY_RING_MAX", None), 49)
 
 
+class RecordRequestV3Test(unittest.TestCase):
+    """v3 _record_request 新维度：daily_by_key/phase 双写/qwait 环/hourly/zero_token。"""
+
+    def setUp(self) -> None:
+        self.mod = load_proxy_module()
+
+    def test_daily_by_key_records_tokens(self) -> None:
+        mod = self.mod
+        today = mod.today_key()
+        orig = mod.STATS["daily_by_key"]
+        mod.STATS["daily_by_key"] = {}
+        try:
+            mod._record_request("POST", "/k1", 200, 1.0, 0, model="m1",
+                                key_id12="abcdef123456",
+                                tokens_prompt=10, tokens_completion=5,
+                                tokens_cache_read=4, tokens_reasoning=3,
+                                tokens=22, bytes_out=100, stream=1)
+            entry = mod.STATS["daily_by_key"][today]["abcdef123456"]
+            self.assertEqual(entry["requests"], 1)
+            self.assertEqual(entry["tokens_prompt"], 10)
+            self.assertEqual(entry["tokens_completion"], 5)
+            self.assertEqual(entry["tokens_cache_read"], 4)
+            self.assertEqual(entry["tokens_reasoning"], 3)
+            self.assertEqual(entry["bytes_out"], 100)
+            self.assertEqual(entry["stream_requests"], 1)
+            self.assertEqual(entry["tokens_cache_write"], 0,
+                             "cache_write 不解析，恒 0（Exclusions）")
+        finally:
+            mod.STATS["daily_by_key"] = orig
+
+    def test_daily_by_key_cap_stops_new_keys(self) -> None:
+        mod = self.mod
+        today = mod.today_key()
+        orig = mod.STATS["daily_by_key"]
+        mod.STATS["daily_by_key"] = {}
+        try:
+            for i in range(mod.BY_KEY_CAP):
+                mod._record_request("POST", "/c", 200, 1.0, 0,
+                                    key_id12="key%012d" % i)
+            mod._record_request("POST", "/c", 200, 1.0, 0,
+                                key_id12="overflow-key-1")
+            day_keys = mod.STATS["daily_by_key"][today]
+            self.assertEqual(len(day_keys), mod.BY_KEY_CAP,
+                             "cap 后新 key 不记录；got %d keys" % len(day_keys))
+            self.assertNotIn("overflow-key-1", day_keys)
+        finally:
+            mod.STATS["daily_by_key"] = orig
+
+    def test_phase_ms_dual_write_global_and_per_model(self) -> None:
+        mod = self.mod
+        before_g = {k: list(v) for k, v in mod.STATS["phase_ms"].items()}
+        orig_m = mod.STATS["phase_ms_by_model"]
+        mod.STATS["phase_ms_by_model"] = {}
+        try:
+            mod._record_request("POST", "/p", 200, 1.0, 0, model="m1",
+                                phase_ms={"connect": 120.0, "headers": 300.0,
+                                          "body": 600.0})
+            # HIST_BUCKETS_MS=(100,250,500,1000,...): 120→idx1, 300→idx2, 600→idx3
+            self.assertEqual(mod.STATS["phase_ms"]["connect"][1],
+                             before_g["connect"][1] + 1, "全局 connect +1")
+            self.assertEqual(mod.STATS["phase_ms"]["headers"][2],
+                             before_g["headers"][2] + 1, "全局 headers +1")
+            self.assertEqual(mod.STATS["phase_ms"]["body"][3],
+                             before_g["body"][3] + 1, "全局 body +1")
+            self.assertEqual(mod.STATS["phase_ms_by_model"]["m1"]["connect"][1], 1)
+            self.assertEqual(mod.STATS["phase_ms_by_model"]["m1"]["headers"][2], 1)
+            self.assertEqual(mod.STATS["phase_ms_by_model"]["m1"]["body"][3], 1)
+        finally:
+            mod.STATS["phase_ms_by_model"] = orig_m
+
+    def test_phase_ms_model_none_only_global(self) -> None:
+        mod = self.mod
+        orig_m = mod.STATS["phase_ms_by_model"]
+        mod.STATS["phase_ms_by_model"] = {}
+        try:
+            mod._record_request("POST", "/p", 200, 1.0, 0,
+                                phase_ms={"connect": 50.0, "headers": 80.0,
+                                          "body": 200.0})
+            self.assertEqual(mod.STATS["phase_ms_by_model"], {},
+                             "model=None 不写 per-model 直方图")
+        finally:
+            mod.STATS["phase_ms_by_model"] = orig_m
+
+    def test_qwait_ring_accumulates(self) -> None:
+        mod = self.mod
+        orig_q = mod.STATS["qwait_ms_by_model"]
+        mod.STATS["qwait_ms_by_model"] = {}
+        try:
+            mod._record_request("POST", "/q", 200, 1.0, 0, model="m1", qwait_ms=15)
+            mod._record_request("POST", "/q", 200, 1.0, 0, model="m1", qwait_ms=25)
+            self.assertEqual(list(mod.STATS["qwait_ms_by_model"]["m1"]), [15, 25])
+            # 无 qwait / 无 model 不落
+            mod._record_request("POST", "/q", 200, 1.0, 0)
+            mod._record_request("POST", "/q", 200, 1.0, 0, model="m2")
+            self.assertEqual(list(mod.STATS["qwait_ms_by_model"]["m1"]), [15, 25])
+            self.assertNotIn("m2", mod.STATS["qwait_ms_by_model"],
+                             "qwait_ms=None 不得建 m2 环")
+        finally:
+            mod.STATS["qwait_ms_by_model"] = orig_q
+
+    def test_hourly_tokens_cross_boundary(self) -> None:
+        mod = self.mod
+        orig_time_func = mod.time.time
+        try:
+            mod.time.time = lambda: 1698825600.0  # 2023-11-01 00:00:00 UTC
+            mod.STATS["hourly_tokens"].clear()
+            mod._record_request("POST", "/h", 200, 1.0, 0, model="m1",
+                                tokens_prompt=10, tokens_completion=5)
+            self.assertEqual(len(mod.STATS["hourly_tokens"]), 1)
+            self.assertEqual(mod.STATS["hourly_tokens"][-1]["hour_start_ts"],
+                             1698825600)
+            self.assertEqual(mod.STATS["hourly_tokens"][-1]["tokens_prompt"], 10)
+            self.assertEqual(mod.STATS["hourly_tokens"][-1]["tokens_completion"], 5)
+            # 同小时追加：累积不新增条目
+            mod.time.time = lambda: 1698827400.0  # +30 min
+            mod._record_request("POST", "/h", 200, 1.0, 0, model="m1",
+                                tokens_prompt=3, tokens_completion=2)
+            self.assertEqual(len(mod.STATS["hourly_tokens"]), 1)
+            self.assertEqual(mod.STATS["hourly_tokens"][-1]["tokens_prompt"], 13)
+            # 跨小时：新增条目
+            mod.time.time = lambda: 1698829200.0  # +1h
+            mod._record_request("POST", "/h", 200, 1.0, 0, model="m1",
+                                tokens_prompt=1, tokens_completion=0)
+            self.assertEqual(len(mod.STATS["hourly_tokens"]), 2)
+            self.assertEqual(mod.STATS["hourly_tokens"][-1]["hour_start_ts"],
+                             1698829200)
+        finally:
+            mod.time.time = orig_time_func
+
+    def test_requests_zero_token_increments(self) -> None:
+        mod = self.mod
+        today = mod.today_key()
+        # tokens=None 且 status<500 → zero_token +1
+        mod._record_request("POST", "/z1", 200, 1.0, 0, model="m1")
+        b = mod.STATS["daily"][today]
+        self.assertEqual(b["requests_zero_token"], 1)
+        # tokens=0 且 status<500 → +1
+        mod._record_request("POST", "/z2", 200, 1.0, 0, model="m1", tokens=0)
+        self.assertEqual(b["requests_zero_token"], 2)
+        # status>=500 → 不计
+        mod._record_request("POST", "/z3", 500, 1.0, 0, model="m1")
+        self.assertEqual(b["requests_zero_token"], 2)
+        # error=True → 不计
+        mod._record_request("POST", "/z4", 200, 1.0, 0, error=True)
+        self.assertEqual(b["requests_zero_token"], 2)
+
+    def test_tokens_cache_read_reasoning_in_daily_bucket(self) -> None:
+        mod = self.mod
+        today = mod.today_key()
+        mod._record_request("POST", "/t", 200, 1.0, 0, model="m1",
+                            tokens_prompt=10, tokens_completion=5,
+                            tokens_cache_read=4, tokens_reasoning=3)
+        b = mod.STATS["daily"][today]
+        self.assertEqual(b["tokens_cache_read"], 4)
+        self.assertEqual(b["tokens_reasoning"], 3)
+        self.assertEqual(b["tokens_cache_write"], 0,
+                         "cache_write 不解析，桶字段恒 0（Exclusions）")
+
+
 class RequestIdTest(unittest.TestCase):
     """P1 地基：request id / upstream host / ttfb / stream / outcome 全链路。
 

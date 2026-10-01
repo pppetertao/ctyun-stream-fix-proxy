@@ -902,7 +902,16 @@ STATS = {"requests_total": 0, "filtered_total": 0, "errors_total": 0,
          "rates": {"bytes_out_total": 0, "chunks_total": 0, "tokens_total": 0,
                    "window_start": time.monotonic(), "window_bytes": 0,
                    "window_chunks": 0, "window_tokens": 0},  # 60s 滑动窗（P2 bytes/chunks；tokens P3 填）
-         "stalls_total": 0}
+         "stalls_total": 0,
+         # v3：per-key/每模型扩展观测（spec 决策 2/3/4/5）
+         "daily_by_key": {},          # {day: {key_id12: _DAILY_BY_KEY_FIELDS 8 字段}}，BY_KEY_CAP 截断
+         "phase_ms_by_model": {},     # {model: {"connect":[0]*9,"headers":[0]*9,"body":[0]*9}}，cap BY_MODEL_CAP
+         "stalls_by_model": {},       # {model: int}，cap BY_MODEL_CAP
+         "qwait_ms_by_model": {},     # {model: deque(maxlen=QWAIT_RING_MAX)}，cap BY_MODEL_CAP
+         "tpm_settle_ratio_by_model": {},  # {model: deque(maxlen=SETTLE_RING_MAX)}，cap BY_MODEL_CAP
+         "hourly_tokens": collections.deque(maxlen=HOURLY_RING_MAX),
+         #  ^ {"hour_start_ts","tokens_prompt","tokens_completion"} 每小时滚动（内存态不持久化）
+         }
 _stats_dirty = False  # STATS_LOCK 保护：计数落盘脏标记（SIGTERM/60s 脏刷消费）
 
 # v2 P4：probe 主动探测状态。独立于 STATS（失败零副作用：不写 STATS 计数、
@@ -1532,7 +1541,10 @@ def _record_request(method: str, path: str, status: int, dur_ms: float,
                     tokens=None, bytes_out: int = 0, outcome=None,
                     chunks: int = 0,
                     tokens_prompt: int = 0, tokens_completion: int = 0,
-                    phase_ms: dict = None) -> None:
+                    phase_ms: dict = None,
+                    # v3：cache_read/reasoning 落桶 + TPM 排队观测 + per-key 标识
+                    tokens_cache_read: int = 0, tokens_reasoning: int = 0,
+                    qwait_ms=None, key_id12=None) -> None:
     global _stats_dirty
     # v2 P4：outcome 兼容两形态——_Outcome namedtuple（落桶用 tri_state 字段）或
     # category 字符串（旧调用点/测试，回退 _outcome_tri_state 纯函数）。
@@ -1570,6 +1582,10 @@ def _record_request(method: str, path: str, status: int, dur_ms: float,
                     entry_dm["tokens_prompt"] += tokens_prompt
                 if tokens_completion > 0:
                     entry_dm["tokens_completion"] += tokens_completion
+                if tokens_cache_read > 0:
+                    entry_dm["tokens_cache_read"] += tokens_cache_read
+                if tokens_reasoning > 0:
+                    entry_dm["tokens_reasoning"] += tokens_reasoning
                 if bytes_out > 0:
                     entry_dm["bytes_out"] += bytes_out
                 if stream:
@@ -1579,6 +1595,8 @@ def _record_request(method: str, path: str, status: int, dur_ms: float,
                     entry_dm["ttfb_count"] += 1
                 if tri_state is not None:
                     entry_dm["outcome_" + tri_state] += 1
+                if not error and status < 500 and (tokens is None or tokens == 0):
+                    entry_dm["requests_zero_token"] += 1
         bucket = STATS["daily"].setdefault(
             today_key(), dict.fromkeys(_DAILY_FIELDS, 0))
         bucket["requests"] += 1
@@ -1587,11 +1605,15 @@ def _record_request(method: str, path: str, status: int, dur_ms: float,
             bucket["errors_proxy"] += 1
         elif status >= 500:
             bucket["errors_upstream"] += 1
-        # v2 P3：daily 总桶增量（与 dm entry 同口径）
+        # v2 P3：daily 总桶增量（与 dm entry 同口径）；v3 追加 cache_read/reasoning
         if tokens_prompt > 0:
             bucket["tokens_prompt"] += tokens_prompt
         if tokens_completion > 0:
             bucket["tokens_completion"] += tokens_completion
+        if tokens_cache_read > 0:
+            bucket["tokens_cache_read"] += tokens_cache_read
+        if tokens_reasoning > 0:
+            bucket["tokens_reasoning"] += tokens_reasoning
         if bytes_out > 0:
             bucket["bytes_out"] += bytes_out
         if stream:
@@ -1601,6 +1623,28 @@ def _record_request(method: str, path: str, status: int, dur_ms: float,
             bucket["ttfb_count"] += 1
         if tri_state is not None:
             bucket["outcome_" + tri_state] += 1
+        if not error and status < 500 and (tokens is None or tokens == 0):
+            bucket["requests_zero_token"] += 1
+        # v3 T1：per-key day 桶（8 字段 _DAILY_BY_KEY_FIELDS），BY_KEY_CAP 独立截断
+        if key_id12:
+            day_keys = STATS["daily_by_key"].setdefault(today_key(), {})
+            entry_k = day_keys.get(key_id12)
+            if entry_k is None and len(day_keys) < BY_KEY_CAP:
+                entry_k = day_keys[key_id12] = dict.fromkeys(_DAILY_BY_KEY_FIELDS, 0)
+            if entry_k is not None:
+                entry_k["requests"] += 1
+                if tokens_prompt > 0:
+                    entry_k["tokens_prompt"] += tokens_prompt
+                if tokens_completion > 0:
+                    entry_k["tokens_completion"] += tokens_completion
+                if tokens_cache_read > 0:
+                    entry_k["tokens_cache_read"] += tokens_cache_read
+                if tokens_reasoning > 0:
+                    entry_k["tokens_reasoning"] += tokens_reasoning
+                if bytes_out > 0:
+                    entry_k["bytes_out"] += bytes_out
+                if stream:
+                    entry_k["stream_requests"] += 1
         if error or status >= 500:
             # 分类优先级与计数一致（error 分支胜过 status>=500）：error=True → proxy，
             # 其余 status>=500 → upstream；499 中断两边都不入流（同计数口径）。
@@ -1624,6 +1668,16 @@ def _record_request(method: str, path: str, status: int, dur_ms: float,
             for name in ("connect", "headers", "body"):
                 STATS["phase_ms"][name][
                     bisect.bisect_right(HIST_BUCKETS_MS, phase_ms[name])] += 1
+            if model:
+                phase_by_model = STATS["phase_ms_by_model"]
+                if model not in phase_by_model and len(phase_by_model) < BY_MODEL_CAP:
+                    phase_by_model[model] = {
+                        "connect": [0] * 9, "headers": [0] * 9, "body": [0] * 9}
+                if model in phase_by_model:
+                    for name in ("connect", "headers", "body"):
+                        phase_by_model[model][name][
+                            bisect.bisect_right(HIST_BUCKETS_MS,
+                                                phase_ms[name])] += 1
         now_mono = time.monotonic()
         rates = STATS["rates"]
         if now_mono - rates["window_start"] >= 60.0:
@@ -1639,6 +1693,23 @@ def _record_request(method: str, path: str, status: int, dur_ms: float,
         if tokens:  # P3 填 tokens；P2 阶段恒 None → 不累计
             rates["tokens_total"] += tokens
             rates["window_tokens"] += tokens
+        # v3 P8：per-model qwait 样本环形记录（决策 4）
+        if qwait_ms is not None and model:
+            qwait_ring = STATS["qwait_ms_by_model"]
+            if model not in qwait_ring and len(qwait_ring) < BY_MODEL_CAP:
+                qwait_ring[model] = collections.deque(maxlen=QWAIT_RING_MAX)
+            if model in qwait_ring:
+                qwait_ring[model].append(qwait_ms)
+        # v3 T6：小时级 token 曲线滚动（决策 5）
+        hour_start = int(time.time() // 3600 * 3600)
+        hourly = STATS["hourly_tokens"]
+        if not hourly or hourly[-1]["hour_start_ts"] != hour_start:
+            hourly.append({"hour_start_ts": hour_start,
+                           "tokens_prompt": 0, "tokens_completion": 0})
+        if tokens_prompt > 0:
+            hourly[-1]["tokens_prompt"] += tokens_prompt
+        if tokens_completion > 0:
+            hourly[-1]["tokens_completion"] += tokens_completion
         _stats_dirty = True
 
 
@@ -1728,6 +1799,13 @@ def stats_snapshot() -> dict:
         snap["recent"] = list(RECENT_REQUESTS)
         snap["poison_previews"] = list(POISON_PREVIEWS)
         snap["events"] = [dict(e) for e in EVENTS]  # 逐条浅拷贝（对齐 daily 模式），oldest→newest
+        # v3：新键含 deque → 转 list 才能过 json.dumps（卡 2 引入键，卡 6 才扩 perf 节，
+        # 序列化安全必须提前）
+        snap["hourly_tokens"] = list(STATS["hourly_tokens"])
+        snap["qwait_ms_by_model"] = {m: list(ring)
+                                     for m, ring in STATS["qwait_ms_by_model"].items()}
+        snap["tpm_settle_ratio_by_model"] = {m: list(ring)
+                                             for m, ring in STATS["tpm_settle_ratio_by_model"].items()}
         ttfb_hist = {m: list(h) for m, h in STATS["ttfb_hist"].items()}
         phase_hist = {k: list(v) for k, v in STATS["phase_ms"].items()}
         rates = dict(STATS["rates"])
