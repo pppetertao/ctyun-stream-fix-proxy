@@ -861,38 +861,93 @@ def tpm_body_err_samples(lines: list, model: str) -> list:
     return out
 
 
-def tpm_budget_recommend(model: str, lines: list) -> dict:
-    """预算推荐（决策 4）：body-err tpm= 样本 min×0.9 千位向下取整；无样本给 hint。
+def tpm_usage_peak(lines: list, model: str):
+    """从 REQ 行列表提取指定模型的历史 tpm= 峰值（usage 保守参考源，决策 4 三源之末）。
 
-    有样本：recommended = (min(samples) * 9 // 10) // 1000 * 1000（最小 1000），
-    choices = [recommended, recommended*3//2//1000*1000, recommended*2] 去重保序，
-    标签「推荐/宽松×1.5/宽松×2」。无样本：recommended=None + hint + 默认三档
-    [TPM_LIMIT//2, TPM_LIMIT, TPM_LIMIT*2]。纯函数（TPM_LIMIT 为模块常量只读）。
+    正则同 tpm_body_err_samples 字段序：`model=X\\b.*\\btpm=(\\d+)`（不限 result）；
+    无匹配 → None。纯函数：无锁无 IO。
     """
-    samples = tpm_body_err_samples(lines, model)
-    if not samples:
-        return {
-            "recommended": None,
-            "samples": 0,
-            "hint": "无上游拒绝证据，建议不限流",
-            "choices": [
-                {"value": TPM_LIMIT // 2, "label": "默认/2"},
-                {"value": TPM_LIMIT, "label": "默认"},
-                {"value": TPM_LIMIT * 2, "label": "默认×2"},
-            ],
-        }
-    base = min(samples)
-    recommended = max(1000, (base * 9 // 10) // 1000 * 1000)
-    values = [recommended, recommended * 3 // 2 // 1000 * 1000, recommended * 2]
-    labels = ["推荐", "宽松×1.5", "宽松×2"]
-    choices = []
-    seen = set()
-    for value, label in zip(values, labels):
-        if value in seen:
+    pattern = re.compile(r"model=%s\b.*\btpm=(\d+)" % re.escape(model))
+    peak = None
+    for line in lines:
+        if not isinstance(line, str):
             continue
-        seen.add(value)
-        choices.append({"value": value, "label": label})
-    return {"recommended": recommended, "samples": len(samples), "choices": choices}
+        match = pattern.search(line)
+        if match:
+            value = int(match.group(1))
+            if peak is None or value > peak:
+                peak = value
+    return peak
+
+
+def tpm_budget_recommend(model: str, lines: list, samples=None, probe=None,
+                         usage=None) -> dict:
+    """预算推荐（决策 4 v2）：三源优先级 探测实测 > body-err 样本 > 历史用量。
+
+    - probe 有效（dict 且 threshold int>0）→ source="probe"，recommended =
+      阈值×0.9 千位向下（最小 1000），enabled_advice.suggest=True。
+    - samples 非空 → source="body_err"，recommended = min×0.9 千位向下（最小 1000），
+      suggest=True。samples 参数为 None 时回退 tpm_body_err_samples(lines, model)
+      ——该函数内部已持久化样本优先、LOG_RING 兜底。
+    - usage 有效（int>0）→ source="usage_estimate"，recommended = 峰值千位向下
+      （保守参考，最小 1000），suggest=False（无拒绝证据不主动建议启用）。
+      usage 参数为 None 时回退 tpm_usage_peak(lines, model)。
+    - 全无 → recommended=None + hint + source="none"，suggest=False。
+    返回 dict 无 choices 键（二选一预算设置的硬需求，spec AC12）。
+    纯函数：无锁无 IO（TPM_LIMIT 只读）。
+    """
+    threshold = None
+    if isinstance(probe, dict):
+        value = probe.get("threshold")
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            threshold = value
+    if threshold is not None:
+        return {
+            "recommended": max(1000, (threshold * 9 // 10) // 1000 * 1000),
+            "samples": 0,
+            "enabled_advice": {
+                "suggest": True,
+                "reason": "探测实测：上游拒绝阈值 %d tokens（×0.9 推荐）" % threshold,
+            },
+            "source": "probe",
+            "probe": probe,
+        }
+    if samples is None:
+        samples = tpm_body_err_samples(lines, model)
+    if samples:
+        base = min(samples)
+        recommended = max(1000, (base * 9 // 10) // 1000 * 1000)
+        return {
+            "recommended": recommended,
+            "samples": len(samples),
+            "enabled_advice": {
+                "suggest": True,
+                "reason": "上游拒绝实证：%d 条样本，min×0.9 推荐" % len(samples),
+            },
+            "source": "body_err",
+            "probe": probe,
+        }
+    peak = usage if isinstance(usage, int) and not isinstance(usage, bool) \
+        and usage > 0 else tpm_usage_peak(lines, model)
+    if peak:
+        return {
+            "recommended": max(1000, peak // 1000 * 1000),
+            "samples": 0,
+            "enabled_advice": {
+                "suggest": False,
+                "reason": "仅历史用量峰值 %d 参考，无拒绝证据" % peak,
+            },
+            "source": "usage_estimate",
+            "probe": probe,
+        }
+    return {
+        "recommended": None,
+        "samples": 0,
+        "hint": "无上游拒绝证据，建议不限流",
+        "enabled_advice": {"suggest": False, "reason": "无可用证据"},
+        "source": "none",
+        "probe": probe,
+    }
 
 
 def tpm_settings_snapshot() -> dict:
@@ -911,14 +966,23 @@ def tpm_settings_snapshot() -> dict:
         names.update(k for k in day.keys())
     with _CFG_LOCK:
         budgets = dict(TPM_MODEL_BUDGETS)
+        persist_samples = dict(PERSISTED_BODY_ERR_SAMPLES)
+        probe_results = dict(PROBE_RESULTS)
     names.update(budgets.keys())
     models = []
     for name in sorted(n for n in names if n):
+        persisted = tpm_body_err_samples_persisted(persist_samples, name)
+        if not persisted:
+            persisted = tpm_body_err_samples(lines, name)
+        probe_items = probe_results.get(name)
+        probe = probe_items[-1] if probe_items else None
+        usage_peak = tpm_usage_peak(lines, name)
         models.append({
             "name": name,
             "enabled": name in budgets,
             "budget": budgets.get(name),
-            "recommend": tpm_budget_recommend(name, lines),
+            "recommend": tpm_budget_recommend(name, lines, samples=persisted,
+                                              probe=probe, usage=usage_peak),
         })
     return {"models": models, "default_limit": TPM_LIMIT}
 

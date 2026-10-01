@@ -1419,9 +1419,9 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         # min=31038 → 31038*9//10=27934 → //1000*1000=27000
         self.assertEqual(rec["recommended"], 27000)
         self.assertEqual(rec["samples"], 3)
-        # choices: [27000, 27000*3//2//1000*1000=40000, 54000]
-        self.assertEqual([c["value"] for c in rec["choices"]], [27000, 40000, 54000])
-        self.assertEqual(rec["choices"][0]["label"], "推荐")
+        self.assertNotIn("choices", rec)
+        self.assertEqual(rec["source"], "body_err")
+        self.assertIs(rec["enabled_advice"]["suggest"], True)
         self.assertNotIn("hint", rec)
 
     def test_tpm_budget_recommend_no_samples(self) -> None:
@@ -1430,8 +1430,9 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         self.assertIsNone(rec["recommended"])
         self.assertEqual(rec["samples"], 0)
         self.assertIn("无上游拒绝证据", rec["hint"])
-        self.assertEqual([c["value"] for c in rec["choices"]],
-                         [mod.TPM_LIMIT // 2, mod.TPM_LIMIT, mod.TPM_LIMIT * 2])
+        self.assertNotIn("choices", rec)
+        self.assertIs(rec["enabled_advice"]["suggest"], False)
+        self.assertEqual(rec["source"], "none")
 
     def test_tpm_settings_snapshot_union_and_sort(self) -> None:
         mod = self.mod
@@ -1461,6 +1462,149 @@ class ProxyDashboardUnitTest(unittest.TestCase):
             mod.STATS["daily_by_model"] = orig_daily
             mod.LOG_RING.clear()
             mod.LOG_RING.extend(orig_ring)
+            self._tpm_cleanup(mod)
+
+    def test_tpm_usage_peak(self) -> None:
+        mod = self.mod
+        lines = [
+            "REQ POST /chat/completions -> 200 dur=9.5s result=ok filtered=0 "
+            "model=kimi-k3-oc retried=0 rid=r-1 host=h ttfb=1.0ms stream=1 "
+            "outcome=ok qwait=0ms tpm=12000 ts=T",
+            "REQ POST /chat/completions -> 200 dur=9.5s result=body-err filtered=0 "
+            "model=kimi-k3-oc retried=0 rid=r-2 host=h ttfb=1.0ms stream=1 "
+            "outcome=body_error qwait=0ms tpm=47850 ts=T",
+            "REQ POST /chat/completions -> 200 dur=9.5s result=ok filtered=0 "
+            "model=deepseek-v4-pro-0813-oc retried=0 rid=r-3 host=h ttfb=1.0ms "
+            "stream=1 outcome=ok qwait=0ms tpm=99999 ts=T",
+            "garbage", None,
+        ]
+        self.assertEqual(mod.tpm_usage_peak(lines, "kimi-k3-oc"), 47850)
+        self.assertEqual(mod.tpm_usage_peak(lines, "deepseek-v4-pro-0813-oc"),
+                         99999)
+        self.assertIsNone(mod.tpm_usage_peak(lines, "absent"))
+        self.assertIsNone(mod.tpm_usage_peak([], "kimi-k3-oc"))
+
+    def test_tpm_budget_recommend_probe_source(self) -> None:
+        """AC2：probe 有效 → recommended = 阈值×0.9 千位向下、source="probe"、
+        无 choices。"""
+        mod = self.mod
+        probe = {"threshold": 31000, "ts": time.time() - 10,
+                 "outcome": "rejected", "batches": 7, "consumed": 35123}
+        rec = mod.tpm_budget_recommend("m", [], samples=None, probe=probe,
+                                       usage=None)
+        self.assertEqual(rec["recommended"], 27000)
+        self.assertEqual(rec["source"], "probe")
+        self.assertNotIn("choices", rec)
+        self.assertIs(rec["enabled_advice"]["suggest"], True)
+        self.assertEqual(rec["probe"]["threshold"], 31000)
+        self.assertEqual(rec["samples"], 0)
+        self.assertNotIn("hint", rec)
+
+    def test_tpm_budget_recommend_source_priority(self) -> None:
+        """AC3：探测实测 > body-err 样本 > 历史用量。"""
+        mod = self.mod
+        probe = {"threshold": 31000, "ts": time.time() - 10}
+        lines = [
+            "REQ POST /chat/completions -> 200 dur=9.5s result=body-err filtered=0 "
+            "model=kimi-k3-oc retried=0 rid=r-1 host=h ttfb=1.0ms stream=1 "
+            "outcome=body_error qwait=0ms tpm=31038 ts=T",
+        ]
+        # 三源同给 → probe 优先
+        rec = mod.tpm_budget_recommend("kimi-k3-oc", lines, samples=[31038],
+                                       probe=probe, usage=99999)
+        self.assertEqual(rec["source"], "probe")
+        self.assertEqual(rec["recommended"], 27000)
+        self.assertNotIn("choices", rec)
+        # 仅 body-err 样本 → body_err
+        rec = mod.tpm_budget_recommend("kimi-k3-oc", lines, samples=[31038, 32375],
+                                       probe=None, usage=99999)
+        self.assertEqual(rec["source"], "body_err")
+        self.assertEqual(rec["recommended"], 27000)
+        self.assertEqual(rec["samples"], 2)
+        # 仅历史用量 → usage_estimate（suggest=False）
+        rec = mod.tpm_budget_recommend("kimi-k3-oc", [], samples=[], probe=None,
+                                       usage=47850)
+        self.assertEqual(rec["source"], "usage_estimate")
+        self.assertEqual(rec["recommended"], 47000)
+        self.assertIs(rec["enabled_advice"]["suggest"], False)
+
+    def test_tpm_budget_recommend_usage_estimate_from_log_ring(self) -> None:
+        """usage=None → 从 lines 解析 tpm 峰值做保守参考。"""
+        mod = self.mod
+        lines = [
+            "REQ POST /chat/completions -> 200 dur=9.5s result=ok filtered=0 "
+            "model=kimi-k3-oc retried=0 rid=r-1 host=h ttfb=1.0ms stream=1 "
+            "outcome=ok qwait=0ms tpm=12000 ts=T",
+            "REQ POST /chat/completions -> 200 dur=9.5s result=ok filtered=0 "
+            "model=kimi-k3-oc retried=0 rid=r-2 host=h ttfb=1.0ms stream=1 "
+            "outcome=ok qwait=0ms tpm=47850 ts=T",
+        ]
+        rec = mod.tpm_budget_recommend("kimi-k3-oc", lines)
+        self.assertEqual(rec["source"], "usage_estimate")
+        self.assertEqual(rec["recommended"], 47000)
+        self.assertIs(rec["enabled_advice"]["suggest"], False)
+        self.assertNotIn("choices", rec)
+
+    def test_tpm_budget_recommend_probe_invalid_ignored(self) -> None:
+        """probe 非 dict / threshold 非法 → 不采信，回落下一优先级。"""
+        mod = self.mod
+        for bad_probe in (None, "x", {}, {"threshold": 0}, {"threshold": "x"},
+                          {"threshold": -5}):
+            rec = mod.tpm_budget_recommend("m", [], samples=None,
+                                           probe=bad_probe, usage=20000)
+            self.assertEqual(rec["source"], "usage_estimate",
+                             "bad probe %r must fall through" % (bad_probe,))
+            self.assertEqual(rec["recommended"], 20000)
+
+    def test_tpm_settings_snapshot_recommend_no_choices(self) -> None:
+        """AC12②：snapshot 每模型 recommend 不含 choices，含 enabled_advice/source；
+        持久化样本走 body_err 源、探测结果走 probe 源。"""
+        mod = self.mod
+        self._tpm_cleanup(mod)
+        orig_recent = list(mod.RECENT_REQUESTS)
+        orig_daily = dict(mod.STATS["daily_by_model"])
+        orig_ring = list(mod.LOG_RING)
+        orig_persist = dict(mod.PERSISTED_BODY_ERR_SAMPLES)
+        orig_probe = dict(mod.PROBE_RESULTS)
+        try:
+            mod.RECENT_REQUESTS.clear()
+            mod.STATS["daily_by_model"] = {mod.today_key(): {}}
+            mod.RECENT_REQUESTS.append({"model": "glm-5.3-oc"})
+            mod.RECENT_REQUESTS.append({"model": "deepseek-v4-pro-0813-oc"})
+            mod.TPM_MODEL_BUDGETS["kimi-k3-oc"] = 30000
+            mod.PERSISTED_BODY_ERR_SAMPLES["kimi-k3-oc"] = [
+                {"tpm": 31000, "ts": time.time() - 5}]
+            mod.PROBE_RESULTS["glm-5.3-oc"] = [
+                {"threshold": 31000, "ts": time.time() - 10}]
+            snap = mod.tpm_settings_snapshot()
+            by_name = {m["name"]: m for m in snap["models"]}
+            for m in snap["models"]:
+                rec = m["recommend"]
+                self.assertNotIn("choices", rec)
+                self.assertIn("enabled_advice", rec)
+                self.assertIn("source", rec)
+            self.assertEqual(by_name["kimi-k3-oc"]["recommend"]["source"],
+                             "body_err")
+            self.assertEqual(by_name["kimi-k3-oc"]["recommend"]["recommended"],
+                             27000)
+            self.assertEqual(by_name["glm-5.3-oc"]["recommend"]["source"],
+                             "probe")
+            self.assertEqual(by_name["glm-5.3-oc"]["recommend"]["recommended"],
+                             27000)
+            # 无证据模型 → none 源
+            self.assertEqual(
+                by_name["deepseek-v4-pro-0813-oc"]["recommend"]["source"],
+                "none", "model with no evidence must be source='none'")
+        finally:
+            mod.RECENT_REQUESTS.clear()
+            mod.RECENT_REQUESTS.extend(orig_recent)
+            mod.STATS["daily_by_model"] = orig_daily
+            mod.LOG_RING.clear()
+            mod.LOG_RING.extend(orig_ring)
+            mod.PERSISTED_BODY_ERR_SAMPLES.clear()
+            mod.PERSISTED_BODY_ERR_SAMPLES.update(orig_persist)
+            mod.PROBE_RESULTS.clear()
+            mod.PROBE_RESULTS.update(orig_probe)
             self._tpm_cleanup(mod)
 
     def test_save_and_load_tpm_model_budgets_roundtrip(self) -> None:
@@ -6859,8 +7003,10 @@ class TpmModelSelectionTest(unittest.TestCase):
         by_name = {m["name"]: m for m in snap["models"]}
         self.assertEqual(by_name["kimi-k3-oc"]["enabled"], True)
         self.assertEqual(by_name["deepseek-v4-pro-0813-oc"]["enabled"], False)
-        self.assertIsInstance(by_name["deepseek-v4-pro-0813-oc"]["recommend"]["choices"],
-                              list)
+        recommend = by_name["deepseek-v4-pro-0813-oc"]["recommend"]
+        self.assertNotIn("choices", recommend)
+        self.assertIn("enabled_advice", recommend)
+        self.assertIn("source", recommend)
 
     def test_save_restart_persist_roundtrip(self) -> None:
         """POST {"tpm_model_budgets": {"glm-5.3-oc": 50000}} → 200 响应含同值；
