@@ -1922,7 +1922,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
     def _send_sse_headers(self, resp) -> None:
         self.send_response(resp.status)
         for name, value in resp.getheaders():
-            if name.lower() in ("content-length", "transfer-encoding", "connection"):
+            if name.lower() in ("content-length", "transfer-encoding", "connection",
+                                "x-request-id"):
                 continue
             self.send_header(name, value)
         self.send_header("X-Request-Id", self._req_id)
@@ -2060,7 +2061,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         self._relay_chunks = 1           # 非流式 = 单 chunk
         self.send_response(resp.status)
         for name, value in resp.getheaders():
-            if name.lower() in ("content-length", "transfer-encoding", "connection"):
+            if name.lower() in ("content-length", "transfer-encoding", "connection",
+                                "x-request-id"):
                 continue
             self.send_header(name, value)
         self.send_header("Content-Length", str(len(data)))
