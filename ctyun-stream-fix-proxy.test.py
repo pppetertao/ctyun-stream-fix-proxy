@@ -2527,6 +2527,37 @@ class ProxyDashboardUnitTest(unittest.TestCase):
             stop_fake_upstreams()
 
 
+class DashboardRefactorEquivalenceTest(unittest.TestCase):
+    """P5 Card 1 一次性守门：拆分前/后 DASHBOARD_HTML 逐字节等价（sha256 快照）。
+
+    Card 2 起 HTML 有意变化（V2 卡片），本类退役——旧内容不退化改由
+    DashboardV2SkeletonTest.test_old_content_intact + 既有 test_dashboard_html_full_page 守护。
+    """
+
+    def setUp(self) -> None:
+        self.mod = load_proxy_module()
+
+    def test_split_join_byte_equivalent(self) -> None:
+        for name in ("_DASH_HEAD", "_DASH_SECTIONS_STATIC", "_DASH_SECTIONS_TABLES",
+                     "_DASH_SECTIONS_V2", "_DASH_JS_CORE", "_DASH_JS_V2"):
+            self.assertTrue(hasattr(self.mod, name), "拆分常量 %s 缺失" % name)
+        self.assertEqual(self.mod._DASH_SECTIONS_V2, "",
+                         "Card 1 阶段 _DASH_SECTIONS_V2 必须为空串（纯重构不加内容）")
+        joined = ("".join([
+            self.mod._DASH_HEAD, self.mod._DASH_SECTIONS_STATIC,
+            self.mod._DASH_SECTIONS_TABLES, self.mod._DASH_SECTIONS_V2,
+            self.mod._DASH_JS_CORE, self.mod._DASH_JS_V2,
+            "</script>\n</body>\n</html>\n",
+        ])).encode("utf-8")
+        self.assertEqual(joined, self.mod.DASHBOARD_HTML,
+                         "DASHBOARD_HTML 必须等于 6 段常量按序 join + 尾部字面量")
+        # 重构前 HTML 快照 sha256（main@bd2554f 实测，24466 字节）
+        self.assertEqual(
+            hashlib.sha256(self.mod.DASHBOARD_HTML).hexdigest(),
+            "2e4dfdb4f602fddb1a7f9484b2c14eb73a97bc6ef1d618874d9acb9276c9539c",
+            "拆分后 HTML 与重构前快照逐字节不一致")
+
+
 class AdminIntegrationTest(unittest.TestCase):
     """admin/dashboard 子进程集成测试（真实 socket，端口与持久化均走 seam）。"""
 

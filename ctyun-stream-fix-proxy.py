@@ -2304,7 +2304,11 @@ class AdminHandler(http.server.BaseHTTPRequestHandler):
 # dashboard（单文件零外部依赖，局域网离线可用）：str 常量而非 f-string，CSS/JS 大括号
 # 零冲突；bytes 字面量放不下中文，故 str + 一次 encode。动态数据一律 textContent，
 # 禁 innerHTML（毒行预览来自上游原始字节，防注入）。
-_DASHBOARD_SRC = """<!doctype html>
+# P5：按页面顺序拆 6 段常量 + 尾部字面量 join 成 DASHBOARD_HTML。join 顺序 = 页面
+# 实际顺序，漏段/错序 → 白屏但后端 200（R5），DashboardV2SkeletonTest 用 join 等式
+# 与容器/函数名断言兜底。_DASH_JS_CORE 前导 </main>/footer/evt-tip/<script> 胶水，
+# 使 _DASH_SECTIONS_V2 的卡片落在 </main> 之前的主网格内；_DASH_SECTIONS_V2 初始空串。
+_DASH_HEAD = """<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
@@ -2387,7 +2391,9 @@ footer .inner { color:var(--dim); font-size:12px; padding-top:4px; padding-botto
   <span class="brand">CTYUN 剥行代理 · 运行台<span class="dot" id="conn-dot"></span></span>
   <span class="uptime" id="uptime">运行时长 --</span>
 </div></header>
-<main>
+"""
+
+_DASH_SECTIONS_STATIC = """<main>
   <section class="card">
     <div class="card-title">上游端点<span class="chip" id="upstream-source">--</span></div>
     <div class="upstream-url dimmed" id="upstream-base">读取中……</div>
@@ -2415,7 +2421,9 @@ footer .inner { color:var(--dim); font-size:12px; padding-top:4px; padding-botto
     <div class="card-title">请求节奏 · 最近 10 分钟（琥珀=请求，红=剥行）</div>
     <svg id="spark" viewBox="0 0 600 64" preserveAspectRatio="none" role="img" aria-label="最近 10 分钟请求柱状图"></svg>
   </section>
-  <section class="card">
+"""
+
+_DASH_SECTIONS_TABLES = """  <section class="card">
     <div class="card-title">按天统计（<span id="daily-title-range">近7天</span>，新在上）</div>
     <div class="table-wrap">
     <table>
@@ -2446,7 +2454,11 @@ footer .inner { color:var(--dim); font-size:12px; padding-top:4px; padding-botto
     </table>
     </div>
   </section>
-</main>
+"""
+
+_DASH_SECTIONS_V2 = ""
+
+_DASH_JS_CORE = """</main>
 <footer><div class="inner">
   顶部统计卡按所选时间段聚合（近3/近7天为含今日的滑动窗口，今日为部分数据；本月/上月为自然月，本地时区）；
   错误数=该时段内「代理错误+上游5xx」合计；活跃连接恒为实时值，不随时间段变化；
@@ -2787,7 +2799,9 @@ function bar(idx, bw, h, H, fill) {
   rect.setAttribute("fill", fill);
   return rect;
 }
-function poll() {
+"""
+
+_DASH_JS_V2 = """function poll() {
   var ctrl = new AbortController();
   var timer = setTimeout(function () { ctrl.abort(); }, 4000);
   fetch("/api/stats", { signal: ctrl.signal })
@@ -2855,11 +2869,13 @@ document.querySelector(".range-tabs").addEventListener("click", function (e) {
 applyRange();
 poll();
 setInterval(poll, 2000);
-</script>
-</body>
-</html>
 """
-DASHBOARD_HTML = _DASHBOARD_SRC.encode("utf-8")
+
+DASHBOARD_HTML = ("".join([
+    _DASH_HEAD, _DASH_SECTIONS_STATIC, _DASH_SECTIONS_TABLES,
+    _DASH_SECTIONS_V2, _DASH_JS_CORE, _DASH_JS_V2,
+    "</script>\n</body>\n</html>\n",
+])).encode("utf-8")
 
 # favicon：32×32 深石板底 + 三根琥珀 SSE 行、中根被删除线剥除（与页面"剥行流带"
 # 同一视觉语言）。构建期用纯 zlib/struct 生成 ICO（内嵌 PNG 格式），运行期只解码。
