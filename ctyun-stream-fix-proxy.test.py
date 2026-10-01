@@ -2859,6 +2859,12 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         with open(path, "w", encoding="utf-8") as fh:
             json.dump({"tpm_body_err_samples": [1, 2]}, fh)
         self.assertEqual(mod.load_tpm_body_err_samples(path), {})   # 值非 dict
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"tpm_body_err_samples": {"kimi": 5}}, fh)
+        self.assertEqual(mod.load_tpm_body_err_samples(path), {})   # per-model 非 list
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"tpm_body_err_samples": {"kimi": None}}, fh)
+        self.assertEqual(mod.load_tpm_body_err_samples(path), {})   # per-model None
         now = time.time()
         fresh = now - 60
         stale = now - 40 * 86400
@@ -2922,6 +2928,12 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         self.assertEqual(kim[0]["consumed"], 35123)
         self.assertEqual([r["threshold"] for r in out["m2"]], [1002, 1003, 1004, 1005, 1006],
                          "keep newest 5 of 7")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"tpm_probe_results": {"kimi": 5}}, fh)
+        self.assertEqual(mod.load_tpm_probe_results(path), {})   # per-model 非 list
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"tpm_probe_results": {"kimi": None}}, fh)
+        self.assertEqual(mod.load_tpm_probe_results(path), {})   # per-model None
 
     def test_record_tpm_body_err_sample_appends_and_saves(self) -> None:
         mod = self.mod

@@ -1327,6 +1327,8 @@ def load_tpm_body_err_samples(path: str) -> dict:
         if not isinstance(model, str) or not model or len(model) > 200:
             continue
         cleaned = []
+        if not isinstance(items, list):
+            continue
         for item in items:
             if not isinstance(item, dict):
                 continue
@@ -1365,6 +1367,8 @@ def load_tpm_probe_results(path: str) -> dict:
         if not isinstance(model, str) or not model or len(model) > 200:
             continue
         cleaned = []
+        if not isinstance(items, list):
+            continue
         for item in items:
             if not isinstance(item, dict):
                 continue
