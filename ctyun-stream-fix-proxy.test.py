@@ -73,6 +73,7 @@ class FakeUpstreamHandler(BaseHTTPRequestHandler):
     bodies = None        # 共享 list：非 None 时按调用序 append 收到的原始请求体 bytes
     head_calls = None    # P4 probe 测试：非 None 时 do_HEAD 按调用序 append 计数
     head_fail = False    # P4 probe 测试：True → do_HEAD 回 500（连续失败告警场景）
+    x_request_id = None  # 非 None → 正常路径响应头携带上游 X-Request-Id（剥除测试用）
 
     def do_POST(self) -> None:
         length = int(self.headers.get("Content-Length") or 0)
@@ -203,6 +204,8 @@ class FakeUpstreamHandler(BaseHTTPRequestHandler):
             body += SSE_DONE
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
+        if self.x_request_id:
+            self.send_header("X-Request-Id", self.x_request_id)
         self.end_headers()
         try:
             self.wfile.write(body)
@@ -237,6 +240,8 @@ class FakeUpstreamHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        if self.x_request_id:
+            self.send_header("X-Request-Id", self.x_request_id)
         self.end_headers()
         self.wfile.write(body)
 
@@ -274,7 +279,8 @@ def make_fake_upstream(poison: bool, tag: str = "/plain", big: bool = False,
                        fail_200_error: bool = False,
                        latency_s: float = 0.0,
                        stall_mid_stream_s: float = 0.0,
-                       tail_delay_after_done_s: float = 0.0) -> int:
+                       tail_delay_after_done_s: float = 0.0,
+                       x_request_id: str = None) -> int:
     attrs = {"poison": poison, "tag": tag, "big": big, "fail_500": fail_500,
              "empty_stream": empty_stream, "empty_stream_calls": empty_stream_calls,
              "blank_stream": blank_stream,
@@ -292,6 +298,7 @@ def make_fake_upstream(poison: bool, tag: str = "/plain", big: bool = False,
              "latency_s": latency_s,
              "stall_mid_stream_s": stall_mid_stream_s,
              "tail_delay_after_done_s": tail_delay_after_done_s,
+             "x_request_id": x_request_id,
              "bodies": [] if record_bodies else None}
     if scripted:
         attrs["calls"] = []
@@ -4553,6 +4560,42 @@ class RequestIdTest(unittest.TestCase):
         m = re.match(r"^r-\d+$", x_request_id or "")
         self.assertIsNotNone(m,
             "502 响应必须带 X-Request-Id，got %r" % x_request_id)
+
+    def test_upstream_x_request_id_stripped_for_sse(self) -> None:
+        """上游自带 X-Request-Id 时 SSE 路径剥除，客户端只收代理 rid 单值。"""
+        upstream_port = make_fake_upstream(False, x_request_id="upstream-rid")
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        self.proc = start_proxy(upstream_port, free_port())
+        conn = http.client.HTTPConnection("127.0.0.1", self.proc.proxy_port, timeout=30)
+        conn.request("POST", "/v1/chat/completions",
+                     body=b'{"model":"m","stream":true,"messages":[]}',
+                     headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        values = resp.msg.get_all("X-Request-Id")
+        resp.read()
+        conn.close()
+        self.assertEqual(values, ["r-1"],
+                         "客户端必须只收到代理 rid 一个值，got %r" % (values,))
+
+    def test_upstream_x_request_id_stripped_for_plain(self) -> None:
+        """上游自带 X-Request-Id 时非流式（/plain → _relay_buffered）路径剥除。"""
+        upstream_port = make_fake_upstream(False, x_request_id="upstream-rid")
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        self.proc = start_proxy(upstream_port, free_port())
+        conn = http.client.HTTPConnection("127.0.0.1", self.proc.proxy_port, timeout=30)
+        conn.request("GET", "/plain")
+        resp = conn.getresponse()
+        values = resp.msg.get_all("X-Request-Id")
+        resp.read()
+        conn.close()
+        self.assertEqual(values, ["r-1"],
+                         "客户端必须只收到代理 rid 一个值，got %r" % (values,))
 
 class TpmAdmitHookTest(unittest.TestCase):
     """TPM 准入 hook 冒烟：est 超预算的带 key 请求空闲放行、忙时 429（不触上游）。"""
