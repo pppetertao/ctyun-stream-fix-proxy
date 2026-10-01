@@ -7511,6 +7511,195 @@ class ProbeEnabledResolutionTest(unittest.TestCase):
         self.assertTrue(mod.load_probe_enabled(path))
 
 
+class TpmCalibrateEngineTest(unittest.TestCase):
+    """校准引擎纯逻辑单测：注入脚本化发送器穷举拒绝/安全阀/abort 时序。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.mod = load_proxy_module()
+
+    def _scripted(self, responses):
+        """按调用序号依次返回 responses，越界重复最后一项。"""
+        calls = {"n": 0}
+
+        def sender(batch, est):
+            calls["n"] += 1
+            idx = min(calls["n"], len(responses)) - 1
+            return responses[idx]
+
+        return sender, calls
+
+    def test_build_calibrate_body_shape(self) -> None:
+        """AC9：max_tokens == TPM_CALIBRATE_MAX_TOKENS、stream == False、
+        messages 内容长度 ≥ TPM_CALIBRATE_INPUT_BYTES；estimate 量级 ≥ 大 input 比例。"""
+        mod = self.mod
+        body = mod.build_calibrate_body("kimi-k3-oc", mod.TPM_CALIBRATE_INPUT_BYTES)
+        self.assertEqual(body["model"], "kimi-k3-oc")
+        self.assertEqual(body["max_tokens"], mod.TPM_CALIBRATE_MAX_TOKENS)
+        self.assertIs(body["stream"], False)
+        content = body["messages"][0]["content"]
+        self.assertGreaterEqual(len(content), mod.TPM_CALIBRATE_INPUT_BYTES)
+        raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        est = mod.estimate_request_tokens(raw)
+        self.assertGreaterEqual(est, int(mod.TPM_CALIBRATE_INPUT_BYTES
+                                         * mod.TPM_TOKEN_RATIO),
+                                "estimate must prove large input magnitude")
+        # 输入字节递增 → est 递增（逐级加压真实作用于准入口径）
+        bigger = mod.build_calibrate_body("kimi-k3-oc",
+                                          mod.TPM_CALIBRATE_INPUT_BYTES + 4000)
+        est_bigger = mod.estimate_request_tokens(
+            json.dumps(bigger, ensure_ascii=False).encode("utf-8"))
+        self.assertGreater(est_bigger, est)
+
+    def test_calibrate_engine_linear_press_first_reject_stops(self) -> None:
+        """AC1：前 N-1 批 200 正常，第 N 批 429 → 首拒即停（不追加确认批次）；
+        threshold = (N-1)*step + base、consumed = 累计 est。"""
+        mod = self.mod
+        step = mod.TPM_CALIBRATE_STEP_TOKENS
+        base = mod.estimate_request_tokens(
+            json.dumps(mod.build_calibrate_body("m", mod.TPM_CALIBRATE_INPUT_BYTES),
+                       ensure_ascii=False).encode("utf-8"))
+        sender, calls = self._scripted([(200, False)] * 4 + [(429, False)])
+        result = mod.calibrate_engine("m", sender, sleep=lambda _: None)
+        self.assertEqual(calls["n"], 5, "first reject must stop, no confirm batch")
+        self.assertEqual(result["outcome"], "rejected")
+        self.assertEqual(result["batches"], 5)
+        self.assertEqual(result["threshold"], base + 4 * step)
+        self.assertEqual(result["consumed"], base * 5 + step * (0 + 1 + 2 + 3 + 4))
+        self.assertEqual(result["status"], 429)
+
+    def test_calibrate_engine_rejects_on_body_error_200(self) -> None:
+        """200 + body_error=True → CLASS_BODY_ERROR → 拒绝（R5 判定协同）。"""
+        mod = self.mod
+        step = mod.TPM_CALIBRATE_STEP_TOKENS
+        base = mod.estimate_request_tokens(
+            json.dumps(mod.build_calibrate_body("m", mod.TPM_CALIBRATE_INPUT_BYTES),
+                       ensure_ascii=False).encode("utf-8"))
+        sender, calls = self._scripted([(200, False), (200, False), (200, True)])
+        result = mod.calibrate_engine("m", sender, sleep=lambda _: None)
+        self.assertEqual(result["outcome"], "rejected")
+        self.assertEqual(result["batches"], 3)
+        self.assertEqual(result["threshold"], base + 2 * step)
+        self.assertEqual(result["status"], 200)
+        self.assertEqual(calls["n"], 3)
+
+    def test_calibrate_engine_hard_cap_stops_before_oversend(self) -> None:
+        """AC6①：下一批将超硬顶 → capped 且不发超限批。"""
+        mod = self.mod
+        base = mod.estimate_request_tokens(
+            json.dumps(mod.build_calibrate_body("m", mod.TPM_CALIBRATE_INPUT_BYTES),
+                       ensure_ascii=False).encode("utf-8"))
+        orig = mod.TPM_CALIBRATE_HARD_CAP_TOKENS
+        mod.TPM_CALIBRATE_HARD_CAP_TOKENS = base + mod.TPM_CALIBRATE_STEP_TOKENS
+        self.addCleanup(setattr, mod, "TPM_CALIBRATE_HARD_CAP_TOKENS", orig)
+        sender, calls = self._scripted([(200, False)])
+        result = mod.calibrate_engine("m", sender, sleep=lambda _: None)
+        self.assertEqual(result["outcome"], "capped")
+        self.assertEqual(result["batches"], 1)
+        self.assertEqual(result["consumed"], base)
+        self.assertEqual(calls["n"], 1, "must not oversend beyond hard cap")
+
+    def test_calibrate_engine_timeout_zero_duration(self) -> None:
+        """AC6②：墙钟上限为 0 → 首轮检查即 timeout，发送器零调用。"""
+        mod = self.mod
+        orig = mod.TPM_CALIBRATE_MAX_DURATION_S
+        mod.TPM_CALIBRATE_MAX_DURATION_S = 0
+        self.addCleanup(setattr, mod, "TPM_CALIBRATE_MAX_DURATION_S", orig)
+        sender, calls = self._scripted([(200, False)])
+        result = mod.calibrate_engine("m", sender, sleep=lambda _: None)
+        self.assertEqual(result["outcome"], "timeout")
+        self.assertEqual(result["batches"], 0)
+        self.assertEqual(calls["n"], 0)
+
+    def test_calibrate_engine_timeout_between_batches(self) -> None:
+        """AC6②：第一批成功，批间真实流逝超过墙钟上限 → timeout，
+        threshold = 最后成功批 est。"""
+        mod = self.mod
+        base = mod.estimate_request_tokens(
+            json.dumps(mod.build_calibrate_body("m", mod.TPM_CALIBRATE_INPUT_BYTES),
+                       ensure_ascii=False).encode("utf-8"))
+        orig = mod.TPM_CALIBRATE_MAX_DURATION_S
+        mod.TPM_CALIBRATE_MAX_DURATION_S = 0.2
+        self.addCleanup(setattr, mod, "TPM_CALIBRATE_MAX_DURATION_S", orig)
+        sender, calls = self._scripted([(200, False)])
+        result = mod.calibrate_engine("m", sender, sleep=lambda _: time.sleep(0.25))
+        self.assertEqual(result["outcome"], "timeout")
+        self.assertEqual(result["batches"], 1)
+        self.assertEqual(result["threshold"], base)
+        self.assertEqual(calls["n"], 1)
+
+    def test_calibrate_engine_abort_between_batches(self) -> None:
+        """abort 在批间隙生效：第二次 abort 检查后返回，发送器不再调用。"""
+        mod = self.mod
+        base = mod.estimate_request_tokens(
+            json.dumps(mod.build_calibrate_body("m", mod.TPM_CALIBRATE_INPUT_BYTES),
+                       ensure_ascii=False).encode("utf-8"))
+        checks = {"n": 0}
+
+        def abort_fn():
+            checks["n"] += 1
+            return checks["n"] >= 2
+
+        sender, calls = self._scripted([(200, False)])
+        result = mod.calibrate_engine("m", sender, should_abort=abort_fn,
+                                      sleep=lambda _: None)
+        self.assertEqual(result["outcome"], "aborted")
+        self.assertEqual(result["batches"], 1)
+        self.assertEqual(result["threshold"], base)
+        self.assertEqual(calls["n"], 1)
+
+    def test_calibrate_engine_upstream_fault_retry_then_abort(self) -> None:
+        """CLASS_UPSTREAM_FAULT（5xx）重试同批一次后仍败 → upstream_error。"""
+        mod = self.mod
+        base = mod.estimate_request_tokens(
+            json.dumps(mod.build_calibrate_body("m", mod.TPM_CALIBRATE_INPUT_BYTES),
+                       ensure_ascii=False).encode("utf-8"))
+        sender, calls = self._scripted([(503, False), (503, False)])
+        result = mod.calibrate_engine("m", sender, sleep=lambda _: None)
+        self.assertEqual(result["outcome"], "upstream_error")
+        self.assertEqual(result["batches"], 1)
+        self.assertEqual(result["status"], 503)
+        self.assertEqual(result["consumed"], base * 2, "retry re-charges same est")
+        self.assertEqual(calls["n"], 2)
+
+    def test_calibrate_engine_connection_error_is_upstream_fault(self) -> None:
+        """status=None（连接异常）→ CLASS_UPSTREAM_FAULT 同路径：重试后 upstream_error。"""
+        mod = self.mod
+        sender, calls = self._scripted([(None, False), (None, False)])
+        result = mod.calibrate_engine("m", sender, sleep=lambda _: None)
+        self.assertEqual(result["outcome"], "upstream_error")
+        self.assertEqual(calls["n"], 2)
+
+    def test_calibrate_engine_retry_succeeds_then_reject(self) -> None:
+        """503 重试一次成功（200）→ 未拒绝继续加压，下一批 429 → rejected。"""
+        mod = self.mod
+        step = mod.TPM_CALIBRATE_STEP_TOKENS
+        base = mod.estimate_request_tokens(
+            json.dumps(mod.build_calibrate_body("m", mod.TPM_CALIBRATE_INPUT_BYTES),
+                       ensure_ascii=False).encode("utf-8"))
+        sender, calls = self._scripted([(503, False), (200, False), (429, False)])
+        result = mod.calibrate_engine("m", sender, sleep=lambda _: None)
+        self.assertEqual(result["outcome"], "rejected")
+        self.assertEqual(result["batches"], 2)
+        self.assertEqual(result["threshold"], base + step)
+        self.assertEqual(result["consumed"],
+                         base * 3 + step, "503 retry + batch1 + batch2")
+        self.assertEqual(calls["n"], 3)
+
+    def test_calibrate_engine_result_ts_and_fields(self) -> None:
+        """返回 dict 六键齐全；ts 为完成时刻时间戳。"""
+        mod = self.mod
+        sender, _ = self._scripted([(429, False)])
+        before = time.time()
+        result = mod.calibrate_engine("m", sender, sleep=lambda _: None)
+        for key in ("threshold", "batches", "consumed", "outcome", "status", "ts"):
+            self.assertIn(key, result)
+        self.assertEqual(result["outcome"], "rejected")
+        self.assertIsInstance(result["threshold"], int)
+        self.assertIsInstance(result["consumed"], int)
+        self.assertGreaterEqual(result["ts"], before)
+
+
 if __name__ == "__main__":
     import atexit
     atexit.register(kill_registered)

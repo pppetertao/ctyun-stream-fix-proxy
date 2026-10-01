@@ -987,6 +987,93 @@ def tpm_settings_snapshot() -> dict:
     return {"models": models, "default_limit": TPM_LIMIT}
 
 
+def build_calibrate_body(model: str, input_bytes: int) -> dict:
+    """构造校准探测请求体（AC9 形态）：单条 user 大 input、max_tokens 压最小、非流式。
+
+    content 以 "x" 填充至 input_bytes 字节（逐级加压：input_bytes 随批次递增）。
+    纯函数：仅依赖入参与模块常量。
+    """
+    return {
+        "model": model,
+        "stream": False,
+        "max_tokens": TPM_CALIBRATE_MAX_TOKENS,
+        "messages": [{"role": "user", "content": "x" * max(0, input_bytes)}],
+    }
+
+
+def calibrate_engine(model, send_one, should_abort=None, sleep=None,
+                     estimate=estimate_request_tokens):
+    """校准引擎（决策 4/5 纯逻辑；发送器/abort/sleep/estimate 全部注入）。
+
+    线性逐批加压：第 batch 批名义 est = base + (batch-1) * TPM_CALIBRATE_STEP_TOKENS，
+    base = estimate(序列化后的 build_calibrate_body(model, TPM_CALIBRATE_INPUT_BYTES))——
+    首批 est 由准入口径 estimate 实测，保证逐级加压真实作用于限流判定（AC9）；
+    序列化口径与真发送器（卡 5）共享：json.dumps(..., ensure_ascii=False).encode("utf-8")。
+    每批经 send_one(batch, est) 发送，返回 (status, body_error)；status=None 表示
+    连接级异常（无 HTTP 响应）。判定复用 classify_outcome：CLASS_BODY_ERROR /
+    CLASS_REQUEST_FAULT（status>=400）→ 拒绝；CLASS_OK / CLASS_POISON_FIXED →
+    未拒绝继续加压；CLASS_UPSTREAM_FAULT（5xx/连接异常）→ 同一批重试一次后仍败
+    → 中止标 upstream_error（不把上游故障误判为阈值，R5）。
+    首拒即停（不追加确认批次）。安全阀：下一批 est 将超过
+    TPM_CALIBRATE_HARD_CAP_TOKENS → capped 且不超发，batches 记已成功发送的批次数
+    （被判超顶那一批未发送，不计入）；墙钟超
+    TPM_CALIBRATE_MAX_DURATION_S → timeout；should_abort() 为真（批间隙检查）
+    → aborted。返回 {"threshold", "batches", "consumed", "outcome", "status", "ts"}：
+    threshold = 拒绝批 est（rejected）或最后成功批 est（timeout/aborted），其余 None。
+    """
+    started = time.monotonic()
+    base = estimate(json.dumps(build_calibrate_body(model, TPM_CALIBRATE_INPUT_BYTES),
+                               ensure_ascii=False).encode("utf-8"))
+    batch = 0
+    consumed = 0
+    last_ok_est = None
+    sleep_fn = sleep if sleep is not None else time.sleep
+    abort_fn = should_abort if should_abort is not None else (lambda: False)
+
+    def _result(outcome, threshold, status, batches=None):
+        return {"threshold": threshold,
+                "batches": batch if batches is None else batches,
+                "consumed": consumed,
+                "outcome": outcome, "status": status, "ts": time.time()}
+
+    def _attempt(batch_num, est):
+        """发送一次，返回 (category, status)；连接异常 → (CLASS_UPSTREAM_FAULT, None)。"""
+        status, body_error = send_one(batch_num, est)
+        if status is None:
+            return CLASS_UPSTREAM_FAULT, None
+        return classify_outcome(status=status, body_error=body_error).category, status
+
+    while True:
+        if abort_fn():
+            return _result("aborted", last_ok_est, None)
+        if time.monotonic() - started >= TPM_CALIBRATE_MAX_DURATION_S:
+            return _result("timeout", last_ok_est, None)
+        batch += 1
+        est = base + (batch - 1) * TPM_CALIBRATE_STEP_TOKENS
+        if consumed + est > TPM_CALIBRATE_HARD_CAP_TOKENS:
+            # 本批未发送：batches 只报已成功发送的批次数（batch - 1）
+            return _result("capped", None, None, batches=batch - 1)
+        category, status = _attempt(batch, est)
+        consumed += est
+        if category in (CLASS_BODY_ERROR, CLASS_REQUEST_FAULT):
+            return _result("rejected", est, status)
+        if category == CLASS_UPSTREAM_FAULT:
+            # 上游故障不是限流信号：同一批重试一次（不递增 batch，est 不变）
+            if abort_fn():
+                return _result("aborted", last_ok_est, None)
+            sleep_fn(TPM_CALIBRATE_BATCH_GAP_S)
+            category, status = _attempt(batch, est)
+            consumed += est
+            if category in (CLASS_BODY_ERROR, CLASS_REQUEST_FAULT):
+                return _result("rejected", est, status)
+            if category == CLASS_UPSTREAM_FAULT:
+                return _result("upstream_error", None, status)
+        last_ok_est = est
+        if abort_fn():
+            return _result("aborted", last_ok_est, None)
+        sleep_fn(TPM_CALIBRATE_BATCH_GAP_S)
+
+
 class _EmptyStream(Exception):
     """priming EOF 仍无 content/[DONE]：携带 filtered 计数与已滤毒缓冲行。"""
     def __init__(self, filtered: int, lines: list, reason: str = "eof-priming"):
