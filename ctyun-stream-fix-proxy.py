@@ -2564,6 +2564,15 @@ _DASH_SECTIONS_STATIC = """<main>
     </form>
     <p class="msg" id="upstream-msg" role="status"></p>
   </section>
+  <section class="card" id="tpm-settings-card">
+    <div class="card-title">TPM 限流设置（勾选启用的模型）</div>
+    <p class="dimmed">仅勾选的模型走限流（桶/排队/429），其余模型直通；预算档位由上游拒绝实证推荐。加载中……</p>
+    <div id="tpm-models"></div>
+    <div class="actions">
+      <button id="tpm-save" type="button">保存限流设置</button>
+      <p class="msg" id="tpm-msg" role="status"></p>
+    </div>
+  </section>
   <section class="card range-tabs" role="tablist" aria-label="统计时间维度">
     <button type="button" class="range-tab" role="tab" data-range="3d">近3天</button>
     <button type="button" class="range-tab" role="tab" data-range="7d">近7天</button>
@@ -3263,6 +3272,102 @@ document.querySelector(".range-tabs").addEventListener("click", function (e) {
 applyRange();
 poll();
 setInterval(poll, 2000);
+function loadTpmSettings() {
+  fetch("/api/tpm_settings")
+    .then(function (resp) {
+      if (!resp.ok) throw new Error("HTTP " + resp.status);
+      return resp.json();
+    })
+    .then(function (data) { renderTpmSettings(data); })
+    .catch(function (err) {
+      var box = $("tpm-models");
+      box.textContent = "";
+      box.appendChild(el("p", "msg err", "读取限流设置失败：" + String(err)));
+    });
+}
+function renderTpmSettings(data) {
+  var box = $("tpm-models");
+  box.textContent = "";
+  var models = data.models || [];
+  if (!models.length) {
+    box.appendChild(el("p", "empty", "暂无模型流量记录"));
+    return;
+  }
+  for (var i = 0; i < models.length; i++) {
+    var m = models[i];
+    var row = el("div", "tpm-row");
+    var check = document.createElement("input");
+    check.type = "checkbox";
+    check.id = "tpm-check-" + i;
+    check.setAttribute("data-model", m.name);
+    check.checked = !!m.enabled;
+    var label = el("label", "", "");
+    label.setAttribute("for", "tpm-check-" + i);
+    label.textContent = m.name;
+    row.appendChild(check);
+    row.appendChild(label);
+    if (m.recommend && m.recommend.choices && m.recommend.choices.length) {
+      var sel = document.createElement("select");
+      sel.id = "tpm-select-" + i;
+      sel.setAttribute("data-model", m.name);
+      sel.setAttribute("aria-label", "预算档位");
+      for (var j = 0; j < m.recommend.choices.length; j++) {
+        var opt = document.createElement("option");
+        opt.value = String(m.recommend.choices[j].value);
+        opt.textContent = m.recommend.choices[j].label + "（" +
+                          m.recommend.choices[j].value + "）";
+        if (m.budget !== null && m.budget !== undefined &&
+            m.recommend.choices[j].value === m.budget) {
+          opt.selected = true;
+        }
+        sel.appendChild(opt);
+      }
+      row.appendChild(sel);
+    }
+    if (m.recommend && m.recommend.hint) {
+      row.appendChild(el("span", "hint", m.recommend.hint));
+    } else if (m.recommend && m.recommend.recommended !== null &&
+               m.recommend.recommended !== undefined) {
+      row.appendChild(el("span", "hint", "推荐 " + m.recommend.recommended +
+                         "（样本 " + m.recommend.samples + "）"));
+    }
+    box.appendChild(row);
+  }
+}
+$("tpm-save").addEventListener("click", function () {
+  var msg = $("tpm-msg");
+  var box = $("tpm-models");
+  var checks = box.querySelectorAll("input[type=checkbox][data-model]");
+  var budgets = {};
+  for (var i = 0; i < checks.length; i++) {
+    if (!checks[i].checked) continue;
+    var model = checks[i].getAttribute("data-model");
+    var sel = box.querySelector("select[data-model='" + model + "']");
+    budgets[model] = sel ? parseInt(sel.value, 10) : 0;
+  }
+  msg.className = "msg wait";
+  msg.textContent = "保存中……";
+  fetch("/api/config", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ tpm_model_budgets: budgets })
+  }).then(function (resp) {
+    return resp.json().then(function (data) { return { status: resp.status, data: data }; });
+  }).then(function (r) {
+    if (r.status === 200) {
+      msg.className = "msg ok";
+      msg.textContent = "已保存，立即生效";
+      loadTpmSettings();
+    } else {
+      msg.className = "msg err";
+      msg.textContent = (r.data && r.data.error) ? r.data.error : ("保存失败：HTTP " + r.status);
+    }
+  }).catch(function (err) {
+    msg.className = "msg err";
+    msg.textContent = "保存失败：" + String(err) + " —— 确认能访问管理接口 /api/config。";
+  });
+});
+loadTpmSettings();
 """
 
 DASHBOARD_HTML = ("".join([
