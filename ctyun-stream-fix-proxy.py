@@ -2546,7 +2546,7 @@ function setConn(ok, errText) {
       " —— 确认代理进程存活：launchctl kickstart -k gui/$UID/com.ctyun-stream-fix-proxy"));
   }
 }
-var EVT_KIND_LABELS = { proxy: "代理错误", upstream: "上游5xx", retry: "空流重试" };
+var EVT_KIND_LABELS = { proxy: "代理错误", upstream: "上游5xx", retry: "空流重试", probe_alert: "上游探测告警" };
 function evtFilter(kind, day, model) {
   // 按 dataset 重新过滤 lastSnap.events：kind="errors" = proxy+upstream（顶部错误数
   // 口径 = rs.errors_proxy + rs.errors_upstream）；day/model 给定时精确匹配。
@@ -2592,7 +2592,8 @@ function showEvtTip(target, x, y) {
         (EVT_KIND_LABELS[e.kind] || e.kind) + " " +
         (rangeRow ? fmtDate(e.ts) + " " + fmtTime(e.ts) : fmtTime(e.ts)) +
         (e.model ? " · " + e.model : "") +
-        (e.status ? " · " + e.status : "")));
+        (e.status ? " · " + e.status : "") +
+        (e.reason ? " · " + e.reason : "")));
     }
     if (evts.length >= 100) {
       tip.appendChild(el("div", "", "共 " + evts.length + " 次，仅保留最近 100 条事件记录"));
@@ -2782,10 +2783,14 @@ function applyRange() {
   var label = RANGE_LABELS[selectedRange] || selectedRange;
   $("daily-title-range").textContent = label;
   $("daily-model-title-range").textContent = label;
+  $("token-title-range").textContent = label;
+  $("tri-state-range").textContent = label;
   if (lastSnap) {
     renderStats(lastSnap);
     renderDaily(lastSnap.daily || {});
     renderDailyByModel(lastSnap.daily_by_model || {});
+    renderTokens(lastSnap);
+    renderTriState(lastSnap);
   }
 }
 function renderSpark(recent) {
@@ -2836,7 +2841,192 @@ function bar(idx, bw, h, H, fill) {
 }
 """
 
-_DASH_JS_V2 = """function poll() {
+_DASH_JS_V2 = """function renderPerf(snap) {
+  var perf = snap.perf || {};
+  var p50 = perf.ttfb_p50_ms_by_model || {};
+  var p90 = perf.ttfb_p90_ms_by_model || {};
+  var body = $("perf-model-body");
+  body.textContent = "";
+  var names = Object.keys(p50).sort(function (a, b) { return p50[a] - p50[b]; });
+  if (names.length === 0) {
+    var tr0 = el("tr");
+    var td0 = el("td", "empty", "暂无速度数据 —— 有请求经过代理后这里会出现 P50/P90");
+    td0.colSpan = 3;
+    tr0.appendChild(td0);
+    body.appendChild(tr0);
+  }
+  for (var i = 0; i < names.length; i++) {
+    var tr = el("tr");
+    tr.appendChild(el("td", "", names[i]));
+    tr.appendChild(el("td", "num", fmtDur(p50[names[i]])));
+    tr.appendChild(el("td", "num", fmtDur(p90[names[i]])));
+    body.appendChild(tr);
+  }
+  renderLatencyDist(perf.phase_p50_ms || {});
+}
+function renderLatencyDist(phases) {
+  var svg = $("latency-dist");
+  while (svg.firstChild) svg.removeChild(svg.firstChild);
+  var defs = [["connect", "连接"], ["headers", "响应头"], ["body", "数据体"]];
+  var cap = 5000;
+  var svgns = "http://www.w3.org/2000/svg";
+  for (var i = 0; i < defs.length; i++) {
+    var name = defs[i][0];
+    var label = defs[i][1];
+    var ms = phases[name];
+    var w = ms === undefined ? 0 : Math.min(ms / cap, 1) * 460;
+    var g = document.createElementNS(svgns, "g");
+    var t = document.createElementNS(svgns, "text");
+    t.setAttribute("x", 0);
+    t.setAttribute("y", 24 + i * 30);
+    t.setAttribute("fill", "var(--dim)");
+    t.setAttribute("font-size", 12);
+    t.textContent = label;
+    var r = document.createElementNS(svgns, "rect");
+    r.setAttribute("x", 90);
+    r.setAttribute("y", 12 + i * 30);
+    r.setAttribute("width", Math.max(2, w).toFixed(1));
+    r.setAttribute("height", 14);
+    r.setAttribute("fill", "var(--amber)");
+    var v = document.createElementNS(svgns, "text");
+    v.setAttribute("x", 96 + Math.max(2, w));
+    v.setAttribute("y", 24 + i * 30);
+    v.setAttribute("fill", "var(--text)");
+    v.setAttribute("font-size", 12);
+    v.textContent = ms === undefined ? "—" : fmtDur(ms);
+    g.appendChild(t);
+    g.appendChild(r);
+    g.appendChild(v);
+    svg.appendChild(g);
+  }
+}
+function renderTokens(snap) {
+  var body = $("token-daily-body");
+  body.textContent = "";
+  var bounds = lastSnap && lastSnap.range_bounds && lastSnap.range_bounds[selectedRange];
+  var dbm = snap.daily_by_model || {};
+  var days = Object.keys(dbm).sort().reverse().filter(function (k) {
+    return !bounds || (bounds[0] <= k && k <= bounds[1]);
+  });
+  var hasData = false;
+  for (var i = 0; i < days.length; i++) {
+    var models = dbm[days[i]];
+    var names = Object.keys(models).sort(function (a, b) {
+      return ((models[b].tokens_prompt || 0) + (models[b].tokens_completion || 0)) -
+             ((models[a].tokens_prompt || 0) + (models[a].tokens_completion || 0));
+    });
+    for (var j = 0; j < names.length; j++) {
+      var ent = models[names[j]];
+      var tp = ent.tokens_prompt || 0;
+      var tc = ent.tokens_completion || 0;
+      if (tp + tc === 0) continue;  // 0-token 行（502/剥行等）不展示
+      hasData = true;
+      var tr = el("tr");
+      tr.appendChild(el("td", "num", days[i]));
+      tr.appendChild(el("td", "", names[j]));
+      tr.appendChild(el("td", "num", String(tp)));
+      tr.appendChild(el("td", "num", String(tc)));
+      body.appendChild(tr);
+    }
+  }
+  if (!hasData) {
+    var tr0 = el("tr");
+    var td0 = el("td", "empty", "暂无 token 用量 —— 上游返回 usage 帧后这里会出现记录");
+    td0.colSpan = 4;
+    tr0.appendChild(td0);
+    body.appendChild(tr0);
+  }
+}
+function renderTriState(snap) {
+  var bar = document.querySelector("#tri-state-card .tri-bar");
+  var legend = $("tri-state-legend");
+  bar.textContent = "";
+  legend.textContent = "";
+  var bounds = lastSnap && lastSnap.range_bounds && lastSnap.range_bounds[selectedRange];
+  var dbm = snap.daily_by_model || {};
+  var days = Object.keys(dbm).filter(function (k) {
+    return !bounds || (bounds[0] <= k && k <= bounds[1]);
+  });
+  var ok = 0, deg = 0, fail = 0;
+  for (var i = 0; i < days.length; i++) {
+    var models = dbm[days[i]];
+    var names = Object.keys(models);
+    for (var j = 0; j < names.length; j++) {
+      var ent = models[names[j]];
+      ok += ent.outcome_ok || 0;
+      deg += ent.outcome_degraded || 0;
+      fail += ent.outcome_failed || 0;
+    }
+  }
+  var total = ok + deg + fail;
+  if (total === 0) {
+    bar.appendChild(el("span", "empty", "暂无 outcome 数据 —— 有请求经过代理后这里会出现三态占比"));
+    return;
+  }
+  var wOk = Math.round(ok / total * 100);
+  var wDeg = Math.round(deg / total * 100);
+  var wFail = 100 - wOk - wDeg;
+  var segs = [["ok", wOk, "var(--ok)"], ["degraded", wDeg, "var(--amber)"], ["failed", wFail, "var(--err)"]];
+  for (var s = 0; s < segs.length; s++) {
+    var seg = el("span", "");
+    seg.style.width = segs[s][1] + "%";
+    seg.style.background = segs[s][2];
+    bar.appendChild(seg);
+  }
+  function pct(n) { return (n / total * 100).toFixed(1) + "%"; }
+  legend.appendChild(el("span", "", "ok " + ok + "（" + pct(ok) + "）"));
+  legend.appendChild(el("span", "", " · degraded " + deg + "（" + pct(deg) + "）"));
+  legend.appendChild(el("span", "", " · failed " + fail + "（" + pct(fail) + "）"));
+}
+function renderHealth(h) {
+  var body = $("upstream-health");
+  var chip = $("health-status");
+  body.textContent = "";
+  if (!h) {
+    var tr0 = el("tr");
+    var td0 = el("td", "empty", "健康数据读取中……（/api/health 未响应）");
+    td0.colSpan = 2;
+    tr0.appendChild(td0);
+    body.appendChild(tr0);
+    chip.textContent = "读取中";
+    return;
+  }
+  var rows = [
+    ["上游主机", h.host || "—"],
+    ["最近探测", h.last_probe_ts ? fmtDate(h.last_probe_ts) + " " + fmtTime(h.last_probe_ts) : "从未探测"],
+    ["探测延迟", h.last_probe_ts ? fmtDur(h.last_probe_latency_ms) : "—"],
+    ["连续失败", String(h.consecutive_failures || 0)],
+    ["主动探测", h.probe_enabled ? "开" : "关"]
+  ];
+  for (var i = 0; i < rows.length; i++) {
+    var tr = el("tr");
+    tr.appendChild(el("td", "num", rows[i][0]));
+    tr.appendChild(el("td", "", rows[i][1]));
+    body.appendChild(tr);
+  }
+  if (!h.last_probe_ts) {
+    chip.textContent = "待首探";
+  } else if (h.last_probe_ok) {
+    chip.textContent = "正常";
+  } else {
+    chip.textContent = "异常";
+  }
+  markEvents(chip, "probe_alert", null, null);
+}
+function pollHealth() {
+  fetch("/api/health")
+    .then(function (resp) {
+      if (!resp.ok) throw new Error("HTTP " + resp.status);
+      return resp.json();
+    })
+    .then(function (data) {
+      renderHealth(data && data.upstream ? data.upstream : null);
+    })
+    .catch(function () {
+      renderHealth(null);  // 健康卡独立降级显示"读取中"，不触发 setConn（连通性以 /api/stats 为准）
+    });
+}
+function poll() {
   var ctrl = new AbortController();
   var timer = setTimeout(function () { ctrl.abort(); }, 4000);
   fetch("/api/stats", { signal: ctrl.signal })
@@ -2853,6 +3043,9 @@ _DASH_JS_V2 = """function poll() {
       renderDaily(snap.daily || {});
       renderDailyByModel(snap.daily_by_model || {});
       renderSpark(snap.recent || []);
+      renderPerf(snap);
+      renderTokens(snap);
+      renderTriState(snap);
       setConn(true);
       hideEvtTip();  // 重渲染后旧 tooltip 指向已换的 DOM，防悬空
     })
@@ -2860,6 +3053,7 @@ _DASH_JS_V2 = """function poll() {
       clearTimeout(timer);
       setConn(false, err && err.name === "AbortError" ? "轮询超时(4s)" : String(err));
     });
+  pollHealth();
 }
 $("upstream-form").addEventListener("submit", function (e) {
   e.preventDefault();

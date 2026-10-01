@@ -2572,6 +2572,22 @@ class DashboardV2SkeletonTest(unittest.TestCase):
         self.assertGreaterEqual(html.count("textContent"), 1,
                                 "textContent 出现次数必须 ≥ innerHTML（此处 innerHTML=0）")
 
+    def test_v2_js_functions_and_wiring(self) -> None:
+        js = self.mod._DASH_JS_V2
+        for fn in ("renderPerf", "renderTokens", "renderHealth", "renderTriState"):
+            self.assertIn("function %s(" % fn, js, "V2 JS 缺函数 %s" % fn)
+        self.assertIn("pollHealth", js)
+        self.assertIn('fetch("/api/health")', js)
+        core = self.mod._DASH_JS_CORE
+        # probe_alert 进标签（EVT_KIND_LABELS）与 tooltip 明细（reason 展示）
+        self.assertIn('probe_alert: "上游探测告警"', core)
+        self.assertIn('(e.reason ? " · " + e.reason : "")', core)
+        # applyRange 复用：token/三态随 4 键时间段切换零请求重渲染
+        self.assertIn("renderTokens(lastSnap)", core)
+        self.assertIn("renderTriState(lastSnap)", core)
+        # 健康卡 chip 挂 probe_alert 事件标记（hover 出 tooltip）
+        self.assertIn('markEvents(chip, "probe_alert", null, null)', js)
+
 
 class AdminIntegrationTest(unittest.TestCase):
     """admin/dashboard 子进程集成测试（真实 socket，端口与持久化均走 seam）。"""
@@ -2733,6 +2749,16 @@ class AdminIntegrationTest(unittest.TestCase):
         self.assertNotIn("slice(0, 14)", html)
         self.assertNotIn("最近 14 天", html)
         self.assertNotIn("与顶部错误数同口径", html)
+        # P5：V2 新卡片容器 + 健康轮询端点经 HTTP 完整送达
+        for cid in ("perf-model-body", "token-daily-body", "upstream-health",
+                    "tri-state-card", "latency-dist"):
+            self.assertIn('id="%s"' % cid, html)
+        self.assertIn('fetch("/api/health")', html)
+        self.assertIn("function renderPerf(", html)
+        self.assertIn("function renderTokens(", html)
+        self.assertIn("function renderHealth(", html)
+        self.assertIn("function renderTriState(", html)
+        self.assertIn("probe_alert", html)
 
     def test_favicon_served(self) -> None:
         status, body, ctype = admin_get(self.proc.admin_port, "/favicon.ico")
