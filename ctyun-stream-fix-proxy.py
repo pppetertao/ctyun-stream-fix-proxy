@@ -2278,11 +2278,14 @@ class AdminHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(200, stats_snapshot())
         elif path == "/api/tpm_stats":
             self._send_json(200, tpm_snapshot())
+        elif path == "/api/tpm_settings":
+            self._send_json(200, tpm_settings_snapshot())
         elif path == "/api/config":
             with _CFG_LOCK:
                 payload = {"upstream_base": UPSTREAM_BASE, "source": _upstream_source,
                            "capture_errors": CAPTURE_ERRORS,
-                           "model_pricing": MODEL_PRICING}
+                           "model_pricing": MODEL_PRICING,
+                           "tpm_model_budgets": dict(TPM_MODEL_BUDGETS)}
             self._send_json(200, payload)
         elif path == "/api/health":
             self._send_json(200, {"upstream": probe_state_snapshot()})
@@ -2381,9 +2384,26 @@ class AdminHandler(http.server.BaseHTTPRequestHandler):
             return
         base = data.get("upstream_base") if isinstance(data, dict) else None
         cap = data.get("capture_errors") if isinstance(data, dict) else None  # 可选键
+        tpm = data.get("tpm_model_budgets") if isinstance(data, dict) else None  # 可选键
         if cap is not None and not isinstance(cap, bool):
             self._send_json(400, {"error": "capture_errors must be a boolean"})
             return
+        if tpm is not None:
+            if not isinstance(tpm, dict):
+                self._send_json(400, {"error": "tpm_model_budgets must be a dict"})
+                return
+            if len(tpm) > 32:
+                self._send_json(400, {"error": "tpm_model_budgets 最多 32 个模型"})
+                return
+            for model, limit in tpm.items():
+                if not isinstance(model, str) or not model or len(model) > 200:
+                    self._send_json(400, {"error": "tpm_model_budgets 键需为非空字符串"
+                                                   "（≤200 字符），非法项：%r" % (model,)})
+                    return
+                if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
+                    self._send_json(400, {"error": "tpm_model_budgets 值需为正整数，"
+                                                   "非法项 %r=%r" % (model, limit)})
+                    return
         # upstream_base 缺失/为 None 时允许单独 POST capture_errors；给出但非法仍 400。
         if base is not None and (not isinstance(base, str) or not valid_upstream_url(base)):
             self._send_json(400, {"error": "upstream_base 需为 "
@@ -2393,9 +2413,12 @@ class AdminHandler(http.server.BaseHTTPRequestHandler):
             set_upstream_base(base)
         if cap is not None:
             set_capture_errors(cap)
+        if tpm is not None:
+            set_tpm_model_budgets(tpm)
         with _CFG_LOCK:
             resp = {"ok": True, "upstream_base": UPSTREAM_BASE, "source": "api",
-                    "capture_errors": CAPTURE_ERRORS}
+                    "capture_errors": CAPTURE_ERRORS,
+                    "tpm_model_budgets": dict(TPM_MODEL_BUDGETS)}
         self._send_json(200, resp)
 
     def _handle_probe_post(self, raw: bytes) -> None:

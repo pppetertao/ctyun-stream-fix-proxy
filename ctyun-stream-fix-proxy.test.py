@@ -5495,6 +5495,181 @@ class TpmPerModelTest(unittest.TestCase):
         self.assertNotIn("tpm-queue", stderr)
 
 
+class TpmModelSelectionTest(unittest.TestCase):
+    """TPM 模型选择 + 设置页后端集成测试（spec Acceptance 直通/启用/清单/持久化/迁移/非法输入）。
+
+    复用 make_scripted_upstream + start_proxy(extra_env, seed_persist) +
+    post_sse_auth + admin_get + admin_post + stderr_text + stop_fake_upstreams。
+    """
+
+    def setUp(self) -> None:
+        self.upstream_port, self.calls = make_scripted_upstream(
+            body_override=SSE_A + SSE_USAGE + SSE_DONE)  # 带 usage 帧 → settle
+        self.proxy_port = free_port()
+
+    def tearDown(self) -> None:
+        if self.proc:
+            self.proc.terminate()
+            self.proc.wait(timeout=5)
+            stderr_text(self.proc)
+            shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_fake_upstreams()
+
+    def test_disabled_model_passthrough(self) -> None:
+        """seed {}（无启用模型）+ CTYUN_TPM_LIMIT=50：est>50 的带 auth 请求 → 200；
+        /api/tpm_stats buckets 空；stderr 无 tpm-queue-full。"""
+        self.proc = start_proxy(self.upstream_port, self.proxy_port,
+                                extra_env={"CTYUN_TPM_LIMIT": "50",
+                                           "CTYUN_TPM_WINDOW_S": "2",
+                                           "CTYUN_TPM_QUEUE_MAX": "2"},
+                                seed_persist={"tpm_model_budgets": {}})
+        big = (b'{"model":"deepseek-v4-pro-0813-oc","stream":true,'
+               b'"messages":[{"role":"user","content":"' + b"y" * 140 + b'"}]}')
+        status, data = post_sse_auth(self.proxy_port, big, "Bearer test-disabled")
+        self.assertEqual(status, 200, "non-enabled model must pass through, got %d" % status)
+        self.assertEqual(data, SSE_A + SSE_USAGE + SSE_DONE)
+        _, body, _ = admin_get(self.proc.admin_port, "/api/tpm_stats")
+        snap = json.loads(body.decode("utf-8"))
+        self.assertEqual(snap["buckets"], [])
+        self.assertNotIn("tpm-queue-full", stderr_text(self.proc))
+
+    def test_enabled_model_429_other_model_200(self) -> None:
+        """seed {"kimi-k3-oc": 1000}：同 key 先发小 kimi 占桶再发 est>1000 kimi → 429
+        model_tpm_limit；同 key 发未启用 deepseek 大请求 → 200。"""
+        self.proc = start_proxy(self.upstream_port, self.proxy_port,
+                                extra_env={"CTYUN_TPM_LIMIT": "110000",
+                                           "CTYUN_TPM_WINDOW_S": "60",
+                                           "CTYUN_TPM_QUEUE_MAX": "2"},
+                                seed_persist={"tpm_model_budgets": {"kimi-k3-oc": 1000}})
+        auth = "Bearer test-enabled-429"
+        small_kimi = (b'{"model":"kimi-k3-oc","stream":true,'
+                      b'"messages":[{"role":"user","content":"hi"}]}')
+        prime_status, _ = post_sse_auth(self.proxy_port, small_kimi, auth)
+        self.assertEqual(prime_status, 200, "priming kimi must be admitted")
+        big_kimi = (b'{"model":"kimi-k3-oc","stream":true,'
+                    b'"messages":[{"role":"user","content":"'
+                    + b"x" * 1000
+                    + b'"}],"max_tokens":3000}')
+        status1, data1 = post_sse_auth(self.proxy_port, big_kimi, auth)
+        self.assertEqual(status1, 429)
+        parsed = json.loads(data1.decode("utf-8"))
+        self.assertEqual(parsed["error"]["code"], "model_tpm_limit")
+        big_ds = (b'{"model":"deepseek-v4-pro-0813-oc","stream":true,'
+                  b'"messages":[{"role":"user","content":"' + b"x" * 1000
+                  + b'"}],"max_tokens":3000}')
+        status2, _ = post_sse_auth(self.proxy_port, big_ds, auth)
+        self.assertEqual(status2, 200, "non-enabled deepseek must pass through")
+
+    def test_model_list_auto_generated(self) -> None:
+        """发过 deepseek 流量（无 auth 也统计）→ /api/tpm_settings models 含该模型，
+        与 TPM_MODEL_BUDGETS 键并集去重、字典序。"""
+        self.proc = start_proxy(self.upstream_port, self.proxy_port,
+                                seed_persist={"tpm_model_budgets": {"kimi-k3-oc": 30000}})
+        post_sse(self.proxy_port)  # 无 auth，model=deepseek-v4-pro-0813-oc
+        _, body, _ = admin_get(self.proc.admin_port, "/api/tpm_settings")
+        snap = json.loads(body.decode("utf-8"))
+        names = [m["name"] for m in snap["models"]]
+        self.assertIn("deepseek-v4-pro-0813-oc", names)
+        self.assertIn("kimi-k3-oc", names)
+        self.assertEqual(names, sorted(names), "model list must be sorted")
+        self.assertEqual(snap["default_limit"], load_proxy_module().TPM_LIMIT)
+        by_name = {m["name"]: m for m in snap["models"]}
+        self.assertEqual(by_name["kimi-k3-oc"]["enabled"], True)
+        self.assertEqual(by_name["deepseek-v4-pro-0813-oc"]["enabled"], False)
+        self.assertIsInstance(by_name["deepseek-v4-pro-0813-oc"]["recommend"]["choices"],
+                              list)
+
+    def test_save_restart_persist_roundtrip(self) -> None:
+        """POST {"tpm_model_budgets": {"glm-5.3-oc": 50000}} → 200 响应含同值；
+        persist 文件含 tpm_model_budgets 键；同 persist 路径重启 → GET /api/config 返回该值。"""
+        self.proc = start_proxy(self.upstream_port, self.proxy_port)
+        status, body = admin_post(
+            self.proc.admin_port, "/api/config",
+            json.dumps({"tpm_model_budgets": {"glm-5.3-oc": 50000}}).encode("utf-8"))
+        self.assertEqual(status, 200)
+        resp = json.loads(body.decode("utf-8"))
+        self.assertEqual(resp["tpm_model_budgets"], {"glm-5.3-oc": 50000})
+        with open(os.path.join(self.proc.persist_dir, "settings.json"),
+                  encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh)["tpm_model_budgets"],
+                             {"glm-5.3-oc": 50000})
+        # 重启（同 persist 路径复用：保存文件内容后二次 start_proxy 以 seed 回灌）
+        with open(os.path.join(self.proc.persist_dir, "settings.json"),
+                  encoding="utf-8") as fh:
+            saved = json.load(fh)
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        self.proc = start_proxy(self.upstream_port, free_port(), seed_persist=saved)
+        _, body2, _ = admin_get(self.proc.admin_port, "/api/config")
+        cfg = json.loads(body2.decode("utf-8"))
+        self.assertEqual(cfg["tpm_model_budgets"], {"glm-5.3-oc": 50000})
+
+    def test_env_migration_path(self) -> None:
+        """seed_persist 无新键 + env CTYUN_TPM_LIMIT_BY_MODEL="kimi-k3-oc:1000"
+        → 启动迁移：GET /api/config tpm_model_budgets == {"kimi-k3-oc": 1000}
+        且 persist 文件已落该键（卡 2 save_stats_counters 带键后可见）。"""
+        self.proc = start_proxy(self.upstream_port, self.proxy_port,
+                                extra_env={"CTYUN_TPM_LIMIT_BY_MODEL": "kimi-k3-oc:1000"},
+                                seed_persist={"upstream_base": "http://127.0.0.1:%d"
+                                              % self.upstream_port})
+        _, body, _ = admin_get(self.proc.admin_port, "/api/config")
+        cfg = json.loads(body.decode("utf-8"))
+        self.assertEqual(cfg["tpm_model_budgets"], {"kimi-k3-oc": 1000})
+        with open(os.path.join(self.proc.persist_dir, "settings.json"),
+                  encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh)["tpm_model_budgets"], {"kimi-k3-oc": 1000})
+        self.assertIn("migrated CTYUN_TPM_LIMIT_BY_MODEL", stderr_text(self.proc))
+
+    def test_post_empty_budgets_clears(self) -> None:
+        """POST {"tpm_model_budgets": {}} → 全部模型直通：先前 429 的 kimi 大请求 → 200。"""
+        self.proc = start_proxy(self.upstream_port, self.proxy_port,
+                                extra_env={"CTYUN_TPM_LIMIT": "50",
+                                           "CTYUN_TPM_WINDOW_S": "60",
+                                           "CTYUN_TPM_QUEUE_MAX": "2"},
+                                seed_persist={"tpm_model_budgets": {"kimi-k3-oc": 50}})
+        auth = "Bearer test-clear"
+        small_kimi = (b'{"model":"kimi-k3-oc","stream":true,'
+                      b'"messages":[{"role":"user","content":"hi"}]}')
+        post_sse_auth(self.proxy_port, small_kimi, auth)
+        big_kimi = (b'{"model":"kimi-k3-oc","stream":true,'
+                    b'"messages":[{"role":"user","content":"' + b"x" * 140 + b'"}]}')
+        status1, _ = post_sse_auth(self.proxy_port, big_kimi, auth)
+        self.assertEqual(status1, 429, "enabled kimi with budget 50 must reject")
+        status, body = admin_post(
+            self.proc.admin_port, "/api/config",
+            json.dumps({"tpm_model_budgets": {}}).encode("utf-8"))
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body.decode("utf-8"))["tpm_model_budgets"], {})
+        status2, _ = post_sse_auth(self.proxy_port, big_kimi, auth)
+        self.assertEqual(status2, 200, "after clear, kimi must pass through")
+
+    def test_post_invalid_budgets_400(self) -> None:
+        """非法输入逐项 400：负值 / 非 dict / 超 32 键。"""
+        self.proc = start_proxy(self.upstream_port, self.proxy_port)
+        status, body = admin_post(
+            self.proc.admin_port, "/api/config",
+            json.dumps({"tpm_model_budgets": {"m": -1}}).encode("utf-8"))
+        self.assertEqual(status, 400)
+        self.assertIn("正整数", json.loads(body.decode("utf-8"))["error"])
+        status2, body2 = admin_post(
+            self.proc.admin_port, "/api/config",
+            json.dumps({"tpm_model_budgets": "not-a-dict"}).encode("utf-8"))
+        self.assertEqual(status2, 400)
+        self.assertIn("must be a dict", json.loads(body2.decode("utf-8"))["error"])
+        too_many = {"m%d" % i: 10 for i in range(33)}
+        status3, body3 = admin_post(
+            self.proc.admin_port, "/api/config",
+            json.dumps({"tpm_model_budgets": too_many}).encode("utf-8"))
+        self.assertEqual(status3, 400)
+        self.assertIn("32", json.loads(body3.decode("utf-8"))["error"])
+        # 非法 POST 不得改变现值（seed 默认 kimi 30000 保持）
+        _, body4, _ = admin_get(self.proc.admin_port, "/api/config")
+        self.assertEqual(json.loads(body4.decode("utf-8"))["tpm_model_budgets"],
+                         {"kimi-k3-oc": 30000})
+
+
 class ClassifyOutcomeTriStateTest(unittest.TestCase):
     """P4：classify_outcome 返回 tri_state 字段；_record_request 三桶归因 + 双形态兼容。"""
 
