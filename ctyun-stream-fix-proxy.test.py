@@ -1345,6 +1345,146 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         self.assertEqual(b["rejected"], 0)
         self.assertEqual(b["timeouts"], 0)
 
+    def test_tpm_body_err_samples_extracts_and_filters(self) -> None:
+        mod = self.mod
+        lines = [
+            "REQ POST /chat/completions -> 200 dur=9.5s result=body-err filtered=0 "
+            "model=kimi-k3-oc retried=0 rid=r-1 host=h ttfb=1.0ms stream=1 "
+            "outcome=body_error qwait=0ms tpm=31038 ts=T",
+            "REQ POST /chat/completions -> 200 dur=9.5s result=body-err filtered=0 "
+            "model=kimi-k3-oc retried=0 rid=r-2 host=h ttfb=1.0ms stream=1 "
+            "outcome=body_error qwait=0ms tpm=33227 ts=T",
+            "REQ POST /chat/completions -> 200 dur=9.5s result=ok filtered=0 "
+            "model=kimi-k3-oc retried=0 rid=r-3 host=h ttfb=1.0ms stream=1 "
+            "outcome=ok qwait=0ms tpm=999 ts=T",                       # result 非 body-err → 跳过
+            "REQ POST /chat/completions -> 200 dur=9.5s result=body-err filtered=0 "
+            "model=deepseek-v4-pro-0813-oc retried=0 rid=r-4 host=h ttfb=1.0ms "
+            "stream=1 outcome=body_error qwait=0ms tpm=777 ts=T",      # 异模型 → 跳过
+            "REQ POST /chat/completions -> 200 dur=9.5s result=body-err filtered=0 "
+            "model=kimi-k3-oc retried=0 rid=r-5 host=h ttfb=1.0ms stream=1 "
+            "outcome=body_error qwait=0ms ts=T",                       # 无 tpm= → 跳过
+            "garbage line without any fields",                         # 无匹配 → 跳过
+            None,                                                      # 非 str → 跳过
+        ]
+        self.assertEqual(mod.tpm_body_err_samples(lines, "kimi-k3-oc"), [31038, 33227])
+        self.assertEqual(mod.tpm_body_err_samples(lines, "deepseek-v4-pro-0813-oc"),
+                         [777])
+        self.assertEqual(mod.tpm_body_err_samples(lines, "glm-5.3-oc"), [])
+        self.assertEqual(mod.tpm_body_err_samples([], "kimi-k3-oc"), [])
+
+    def test_tpm_budget_recommend_with_samples(self) -> None:
+        mod = self.mod
+        lines = [
+            "REQ POST /chat/completions -> 200 dur=9.5s result=body-err filtered=0 "
+            "model=kimi-k3-oc retried=0 rid=r-1 host=h ttfb=1.0ms stream=1 "
+            "outcome=body_error qwait=0ms tpm=31038 ts=T",
+            "REQ POST /chat/completions -> 200 dur=9.5s result=body-err filtered=0 "
+            "model=kimi-k3-oc retried=0 rid=r-2 host=h ttfb=1.0ms stream=1 "
+            "outcome=body_error qwait=0ms tpm=32375 ts=T",
+            "REQ POST /chat/completions -> 200 dur=9.5s result=body-err filtered=0 "
+            "model=kimi-k3-oc retried=0 rid=r-3 host=h ttfb=1.0ms stream=1 "
+            "outcome=body_error qwait=0ms tpm=33227 ts=T",
+        ]
+        rec = mod.tpm_budget_recommend("kimi-k3-oc", lines)
+        # min=31038 → 31038*9//10=27934 → //1000*1000=27000
+        self.assertEqual(rec["recommended"], 27000)
+        self.assertEqual(rec["samples"], 3)
+        # choices: [27000, 27000*3//2//1000*1000=40000, 54000]
+        self.assertEqual([c["value"] for c in rec["choices"]], [27000, 40000, 54000])
+        self.assertEqual(rec["choices"][0]["label"], "推荐")
+        self.assertNotIn("hint", rec)
+
+    def test_tpm_budget_recommend_no_samples(self) -> None:
+        mod = self.mod
+        rec = mod.tpm_budget_recommend("glm-5.3-oc", [])
+        self.assertIsNone(rec["recommended"])
+        self.assertEqual(rec["samples"], 0)
+        self.assertIn("无上游拒绝证据", rec["hint"])
+        self.assertEqual([c["value"] for c in rec["choices"]],
+                         [mod.TPM_LIMIT // 2, mod.TPM_LIMIT, mod.TPM_LIMIT * 2])
+
+    def test_tpm_settings_snapshot_union_and_sort(self) -> None:
+        mod = self.mod
+        self._tpm_cleanup(mod)
+        orig_recent = list(mod.RECENT_REQUESTS)
+        orig_daily = dict(mod.STATS["daily_by_model"])
+        orig_ring = list(mod.LOG_RING)
+        try:
+            mod.RECENT_REQUESTS.clear()
+            mod.STATS["daily_by_model"] = {mod.today_key(): {"deepseek-v4-pro-0813-oc": {}}}
+            mod.RECENT_REQUESTS.append({"model": "glm-5.3-oc"})
+            mod.TPM_MODEL_BUDGETS["kimi-k3-oc"] = 30000
+            snap = mod.tpm_settings_snapshot()
+            names = [m["name"] for m in snap["models"]]
+            self.assertEqual(names, ["deepseek-v4-pro-0813-oc", "glm-5.3-oc",
+                                     "kimi-k3-oc"])
+            by_name = {m["name"]: m for m in snap["models"]}
+            self.assertEqual(by_name["kimi-k3-oc"]["enabled"], True)
+            self.assertEqual(by_name["kimi-k3-oc"]["budget"], 30000)
+            self.assertEqual(by_name["glm-5.3-oc"]["enabled"], False)
+            self.assertIsNone(by_name["glm-5.3-oc"]["budget"])
+            self.assertIsNone(by_name["glm-5.3-oc"]["recommend"]["recommended"])
+            self.assertEqual(snap["default_limit"], mod.TPM_LIMIT)
+        finally:
+            mod.RECENT_REQUESTS.clear()
+            mod.RECENT_REQUESTS.extend(orig_recent)
+            mod.STATS["daily_by_model"] = orig_daily
+            mod.LOG_RING.clear()
+            mod.LOG_RING.extend(orig_ring)
+            self._tpm_cleanup(mod)
+
+    def test_save_and_load_tpm_model_budgets_roundtrip(self) -> None:
+        mod = self.mod
+        path = os.path.join(tempfile.mkdtemp(prefix="ctyun-tpm-rt-"), "s.json")
+        orig = dict(mod.TPM_MODEL_BUDGETS)
+        try:
+            mod.TPM_MODEL_BUDGETS.clear()
+            mod.TPM_MODEL_BUDGETS.update({"kimi-k3-oc": 1000, "glm-5.3-oc": 50000})
+            mod.save_stats_counters(path)
+            loaded = mod.load_tpm_model_budgets(path)
+            self.assertEqual(loaded, {"kimi-k3-oc": 1000, "glm-5.3-oc": 50000})
+        finally:
+            mod.TPM_MODEL_BUDGETS.clear()
+            mod.TPM_MODEL_BUDGETS.update(orig)
+            shutil.rmtree(os.path.dirname(path), ignore_errors=True)
+
+    def test_persist_upstream_carries_tpm_model_budgets(self) -> None:
+        mod = self.mod
+        path = os.path.join(tempfile.mkdtemp(prefix="ctyun-tpm-pu-"), "s.json")
+        orig = dict(mod.TPM_MODEL_BUDGETS)
+        try:
+            mod.TPM_MODEL_BUDGETS.clear()
+            mod.TPM_MODEL_BUDGETS["kimi-k3-oc"] = 1000
+            mod.persist_upstream("https://example.com/v1", path, capture_errors=True,
+                                 tpm_model_budgets=mod.TPM_MODEL_BUDGETS)
+            with open(path, encoding="utf-8") as fh:
+                saved = json.load(fh)
+            self.assertEqual(saved["tpm_model_budgets"], {"kimi-k3-oc": 1000})
+            self.assertEqual(saved["upstream_base"], "https://example.com/v1")
+        finally:
+            mod.TPM_MODEL_BUDGETS.clear()
+            mod.TPM_MODEL_BUDGETS.update(orig)
+            shutil.rmtree(os.path.dirname(path), ignore_errors=True)
+
+    def test_set_tpm_model_budgets_atomic_replace(self) -> None:
+        mod = self.mod
+        tmpdir = tempfile.mkdtemp(prefix="ctyun-tpm-set-")
+        path = os.path.join(tmpdir, "s.json")
+        orig_path = mod.PERSIST_PATH
+        orig = dict(mod.TPM_MODEL_BUDGETS)
+        try:
+            mod.PERSIST_PATH = path
+            mod.TPM_MODEL_BUDGETS.clear()
+            mod.TPM_MODEL_BUDGETS["old-model"] = 500
+            mod.set_tpm_model_budgets({"new-model": 2000})
+            self.assertEqual(mod.TPM_MODEL_BUDGETS, {"new-model": 2000})
+            self.assertEqual(mod.load_tpm_model_budgets(path), {"new-model": 2000})
+        finally:
+            mod.PERSIST_PATH = orig_path
+            mod.TPM_MODEL_BUDGETS.clear()
+            mod.TPM_MODEL_BUDGETS.update(orig)
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
     def test_tpm_429_reply_payload(self) -> None:
         """_reply_tpm_429 方法 payload 与 spec 定死 JSON 一致。"""
         mod = self.mod

@@ -753,6 +753,86 @@ def logs_snapshot(cursor=None, tail=None) -> dict:
             "oldest_seq": oldest_seq, "ring_max": LOG_RING_MAX}
 
 
+def tpm_body_err_samples(lines: list, model: str) -> list:
+    """从 REQ 行列表提取指定模型 body-err 行的 tpm= 值（决策 4 实证样本源）。
+
+    正则锚定字段序（REQ 行 result 在 model 前、tpm 在 model 后，见 _log）：
+    `result=body-err\\b.*\\bmodel=X\\b.*\\btpm=(\\d+)`；不匹配/无 tpm 字段的行跳过。
+    纯函数：无锁无 IO。
+    """
+    pattern = re.compile(r"result=body-err\b.*\bmodel=%s\b.*\btpm=(\d+)" % re.escape(model))
+    out = []
+    for line in lines:
+        if not isinstance(line, str):
+            continue
+        match = pattern.search(line)
+        if match:
+            out.append(int(match.group(1)))
+    return out
+
+
+def tpm_budget_recommend(model: str, lines: list) -> dict:
+    """预算推荐（决策 4）：body-err tpm= 样本 min×0.9 千位向下取整；无样本给 hint。
+
+    有样本：recommended = (min(samples) * 9 // 10) // 1000 * 1000（最小 1000），
+    choices = [recommended, recommended*3//2//1000*1000, recommended*2] 去重保序，
+    标签「推荐/宽松×1.5/宽松×2」。无样本：recommended=None + hint + 默认三档
+    [TPM_LIMIT//2, TPM_LIMIT, TPM_LIMIT*2]。纯函数（TPM_LIMIT 为模块常量只读）。
+    """
+    samples = tpm_body_err_samples(lines, model)
+    if not samples:
+        return {
+            "recommended": None,
+            "samples": 0,
+            "hint": "无上游拒绝证据，建议不限流",
+            "choices": [
+                {"value": TPM_LIMIT // 2, "label": "默认/2"},
+                {"value": TPM_LIMIT, "label": "默认"},
+                {"value": TPM_LIMIT * 2, "label": "默认×2"},
+            ],
+        }
+    base = min(samples)
+    recommended = max(1000, (base * 9 // 10) // 1000 * 1000)
+    values = [recommended, recommended * 3 // 2 // 1000 * 1000, recommended * 2]
+    labels = ["推荐", "宽松×1.5", "宽松×2"]
+    choices = []
+    seen = set()
+    for value, label in zip(values, labels):
+        if value in seen:
+            continue
+        seen.add(value)
+        choices.append({"value": value, "label": label})
+    return {"recommended": recommended, "samples": len(samples), "choices": choices}
+
+
+def tpm_settings_snapshot() -> dict:
+    """TPM 设置快照（GET /api/tpm_settings 用，决策 3/5）。
+
+    模型清单三源并集去重、字典序：RECENT_REQUESTS 模型名 ∪
+    STATS["daily_by_model"][今日] 键 ∪ TPM_MODEL_BUDGETS 键。
+    每模型 {name, enabled, budget, recommend}；budget 仅启用模型有值。
+    锁纪律：LOG_LOCK / STATS_LOCK / _CFG_LOCK 各短持一次取副本，不嵌套、不做 IO。
+    """
+    with LOG_LOCK:
+        lines = [entry["line"] for entry in LOG_RING]
+    with STATS_LOCK:
+        names = set(r.get("model") for r in RECENT_REQUESTS)
+        day = STATS["daily_by_model"].get(today_key(), {})
+        names.update(k for k in day.keys())
+    with _CFG_LOCK:
+        budgets = dict(TPM_MODEL_BUDGETS)
+    names.update(budgets.keys())
+    models = []
+    for name in sorted(n for n in names if n):
+        models.append({
+            "name": name,
+            "enabled": name in budgets,
+            "budget": budgets.get(name),
+            "recommend": tpm_budget_recommend(name, lines),
+        })
+    return {"models": models, "default_limit": TPM_LIMIT}
+
+
 class _EmptyStream(Exception):
     """priming EOF 仍无 content/[DONE]：携带 filtered 计数与已滤毒缓冲行。"""
     def __init__(self, filtered: int, lines: list, reason: str = "eof-priming"):
@@ -849,13 +929,21 @@ def resolve_upstream_base(env_base: str, persist_path: str) -> tuple:
     return DEFAULT_UPSTREAM_BASE, "default"
 
 
-def persist_upstream(base: str, path: str, capture_errors: bool = False) -> None:
+def persist_upstream(base: str, path: str, capture_errors: bool = False,
+                     tpm_model_budgets: dict = None) -> None:
+    """持久化上游端点 + capture_errors + tpm_model_budgets（窄出口原子替换）。
+
+    注意：本函数不持 _CFG_LOCK——调用方（set_upstream_base / set_capture_errors /
+    set_tpm_model_budgets）在各自的 _CFG_LOCK 区内调用，由调用方保证 TPM_MODEL_BUDGETS
+    读一致性。避免嵌套获取非重入锁的死锁（决策：_CFG_LOCK 是 threading.Lock）。
+    """
     directory = os.path.dirname(path)
     if directory:
         os.makedirs(directory, exist_ok=True)
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump({"upstream_base": base, "capture_errors": capture_errors},
+        json.dump({"upstream_base": base, "capture_errors": capture_errors,
+                   "tpm_model_budgets": tpm_model_budgets or {}},
                   fh, ensure_ascii=False)
     os.replace(tmp, path)  # 同目录原子替换，读侧不会见到半截文件
 
@@ -1002,6 +1090,7 @@ def save_stats_counters(path: str) -> None:
         base = UPSTREAM_BASE
         capture_enabled = CAPTURE_ERRORS
         probe_enabled = PROBE_ENABLED
+        budgets = dict(TPM_MODEL_BUDGETS)
     directory = os.path.dirname(path)
     if directory:
         os.makedirs(directory, exist_ok=True)
@@ -1011,6 +1100,7 @@ def save_stats_counters(path: str) -> None:
                    "capture_errors": capture_enabled,
                    "probe_enabled": probe_enabled,
                    "model_pricing": MODEL_PRICING,
+                   "tpm_model_budgets": budgets,
                    "stats": dict(counters, daily=daily, daily_by_model=daily_by_model,
                                  events=events)},
                   fh, ensure_ascii=False)
@@ -1364,7 +1454,8 @@ def set_upstream_base(base: str) -> None:
     with _CFG_LOCK:
         UPSTREAM_BASE = base
         _upstream_source = "api"
-        persist_upstream(base, PERSIST_PATH, capture_errors=CAPTURE_ERRORS)
+        persist_upstream(base, PERSIST_PATH, capture_errors=CAPTURE_ERRORS,
+                         tpm_model_budgets=TPM_MODEL_BUDGETS)
     # save_stats_counters 内部也要拿 _CFG_LOCK：必须在锁外调用，否则同线程
     # 非重入死锁（admin 线程挂死且 SIGTERM 退出时同样卡锁）。
     save_stats_counters(PERSIST_PATH)
@@ -1374,8 +1465,19 @@ def set_capture_errors(enabled: bool) -> None:
     global CAPTURE_ERRORS
     with _CFG_LOCK:
         CAPTURE_ERRORS = enabled
-        persist_upstream(UPSTREAM_BASE, PERSIST_PATH, capture_errors=enabled)
+        persist_upstream(UPSTREAM_BASE, PERSIST_PATH, capture_errors=enabled,
+                         tpm_model_budgets=TPM_MODEL_BUDGETS)
     # save_stats_counters 内部也要拿 _CFG_LOCK：必须在锁外调用（同 :449-451 死锁注释）
+    save_stats_counters(PERSIST_PATH)
+
+
+def set_tpm_model_budgets(budgets: dict) -> None:
+    global TPM_MODEL_BUDGETS
+    with _CFG_LOCK:
+        TPM_MODEL_BUDGETS = dict(budgets)
+        persist_upstream(UPSTREAM_BASE, PERSIST_PATH, capture_errors=CAPTURE_ERRORS,
+                         tpm_model_budgets=TPM_MODEL_BUDGETS)
+    # save_stats_counters 内部也要拿 _CFG_LOCK：必须在锁外调用（同 :1335-1337 死锁注释）
     save_stats_counters(PERSIST_PATH)
 
 
