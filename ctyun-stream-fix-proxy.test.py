@@ -1177,6 +1177,7 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         """窗口滚空（used<=0、无 waiter）的桶若曾有 rejected/timeouts，快照必须保留。"""
         mod = self.mod
         self._tpm_cleanup(mod)
+        mod.TPM_MODEL_BUDGETS["m:rej"] = mod.TPM_LIMIT
         # 制造 rejected：先占满预算，再硬拒一笔超大
         mod.tpm_admit("key:rej", mod.TPM_LIMIT, "m:rej")
         status, _ = mod.tpm_admit("key:rej", mod.TPM_LIMIT + 1, "m:rej")
