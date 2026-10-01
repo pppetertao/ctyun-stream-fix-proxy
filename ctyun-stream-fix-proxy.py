@@ -319,35 +319,45 @@ def sse_line_body_error(line: bytes) -> bool:
     return body_has_error(data)
 
 
-_Outcome = collections.namedtuple("_Outcome", "category log_result counts_error capture")
+_Outcome = collections.namedtuple("_Outcome", "category log_result counts_error capture tri_state")
 
 
 def classify_outcome(status=None, synth_502=False, client_abort=False,
                      eof_without_done=False, poison_filtered=0,
                      body_error=False) -> _Outcome:
-    """错误分类网关：输入场景标志 → 返回 (category, log_result, counts_error, capture)。
+    """错误分类网关：输入场景标志 → 返回 (category, log_result, counts_error, capture, tri_state)。
 
     判定优先级 client_abort > synth_502 > body_error > eof_without_done > status 阈值；
     status=None 且无 flags → ValueError。
+    v2 P4：tri_state 由 category 经 _outcome_tri_state 推导（"ok"|"degraded"|"failed"），
+    供 daily outcome_* 三桶归因；纯函数 _outcome_tri_state 保留（字符串回退路径 + P3 测试锚）。
     """
     if client_abort:
-        return _Outcome(CLASS_CLIENT_ABORT, "aborted", False, False)
+        return _Outcome(CLASS_CLIENT_ABORT, "aborted", False, False,
+                        _outcome_tri_state(CLASS_CLIENT_ABORT))
     if synth_502:
-        return _Outcome(CLASS_UPSTREAM_FAULT, "error", True, True)
+        return _Outcome(CLASS_UPSTREAM_FAULT, "error", True, True,
+                        _outcome_tri_state(CLASS_UPSTREAM_FAULT))
     if body_error:
-        return _Outcome(CLASS_BODY_ERROR, "body-err", True, True)
+        return _Outcome(CLASS_BODY_ERROR, "body-err", True, True,
+                        _outcome_tri_state(CLASS_BODY_ERROR))
     if eof_without_done:
-        return _Outcome(CLASS_UPSTREAM_FAULT, "eof-without-done", False, True)
+        return _Outcome(CLASS_UPSTREAM_FAULT, "eof-without-done", False, True,
+                        _outcome_tri_state(CLASS_UPSTREAM_FAULT))
     if status is None:
         raise ValueError("classify_outcome: status required when no flag is set")
     if status < 400:
         if poison_filtered > 0:
-            return _Outcome(CLASS_POISON_FIXED, "ok", False, True)
-        return _Outcome(CLASS_OK, "ok", False, False)
+            return _Outcome(CLASS_POISON_FIXED, "ok", False, True,
+                            _outcome_tri_state(CLASS_POISON_FIXED))
+        return _Outcome(CLASS_OK, "ok", False, False,
+                        _outcome_tri_state(CLASS_OK))
     if 400 <= status < 500:
-        return _Outcome(CLASS_REQUEST_FAULT, "upstream-err", False, True)
+        return _Outcome(CLASS_REQUEST_FAULT, "upstream-err", False, True,
+                        _outcome_tri_state(CLASS_REQUEST_FAULT))
     # status >= 500
-    return _Outcome(CLASS_UPSTREAM_FAULT, "upstream-err", False, True)
+    return _Outcome(CLASS_UPSTREAM_FAULT, "upstream-err", False, True,
+                    _outcome_tri_state(CLASS_UPSTREAM_FAULT))
 
 
 def _outcome_tri_state(outcome) -> str:
@@ -1136,6 +1146,18 @@ def _record_request(method: str, path: str, status: int, dur_ms: float,
                     tokens_prompt: int = 0, tokens_completion: int = 0,
                     phase_ms: dict = None) -> None:
     global _stats_dirty
+    # v2 P4：outcome 兼容两形态——_Outcome namedtuple（落桶用 tri_state 字段）或
+    # category 字符串（旧调用点/测试，回退 _outcome_tri_state 纯函数）。
+    # RECENT_REQUESTS 恒存 category 字符串（JSON 可序列化 + 展示口径不变）。
+    tri_state = None
+    outcome_category = None
+    if outcome is not None:
+        if hasattr(outcome, "tri_state"):
+            tri_state = outcome.tri_state
+            outcome_category = outcome.category
+        else:
+            tri_state = _outcome_tri_state(outcome)
+            outcome_category = outcome
     with STATS_LOCK:
         if error:
             STATS["errors_total"] += 1
@@ -1167,8 +1189,8 @@ def _record_request(method: str, path: str, status: int, dur_ms: float,
                 if ttfb_ms is not None:
                     entry_dm["ttfb_sum_ms"] += round(ttfb_ms)
                     entry_dm["ttfb_count"] += 1
-                if outcome is not None:
-                    entry_dm["outcome_" + _outcome_tri_state(outcome)] += 1
+                if tri_state is not None:
+                    entry_dm["outcome_" + tri_state] += 1
         bucket = STATS["daily"].setdefault(
             today_key(), dict.fromkeys(_DAILY_FIELDS, 0))
         bucket["requests"] += 1
@@ -1189,8 +1211,8 @@ def _record_request(method: str, path: str, status: int, dur_ms: float,
         if ttfb_ms is not None:
             bucket["ttfb_sum_ms"] += round(ttfb_ms)
             bucket["ttfb_count"] += 1
-        if outcome is not None:
-            bucket["outcome_" + _outcome_tri_state(outcome)] += 1
+        if tri_state is not None:
+            bucket["outcome_" + tri_state] += 1
         if error or status >= 500:
             # 分类优先级与计数一致（error 分支胜过 status>=500）：error=True → proxy，
             # 其余 status>=500 → upstream；499 中断两边都不入流（同计数口径）。
@@ -1202,7 +1224,7 @@ def _record_request(method: str, path: str, status: int, dur_ms: float,
                                 "rid": rid, "upstream_host": upstream_host,
                                 "ttfb_ms": ttfb_ms, "stream": stream,
                                 "tokens": tokens, "bytes_out": bytes_out,
-                                "chunks": chunks, "outcome": outcome})
+                                "chunks": chunks, "outcome": outcome_category})
         # v2 P2：histogram 桶更新与 60s rates 窗口滚动（每请求一次，均在本锁内；R1/R4）
         if ttfb_ms is not None and model:
             ttfb_hist = STATS["ttfb_hist"]
@@ -1405,7 +1427,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             _record_request(self.command, self.path, 499,
                             (time.time() - started) * 1000, 0, model=None,
                             rid=self._req_id, upstream_host=self._upstream_host,
-                            outcome=outcome.category)
+                            outcome=outcome)
         finally:
             with STATS_LOCK:
                 STATS["active"] -= 1
@@ -1494,7 +1516,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                             (time.time() - started) * 1000, 0,
                             model=model, error=outcome.counts_error,
                             rid=self._req_id, upstream_host=self._upstream_host,
-                            outcome=outcome.category)
+                            outcome=outcome)
             record_error_event(ERR_KIND_SYNTH_502, model=model, path=self.path,
                                exc=exc, body=body,
                                retried=header_retried, retry_reason=header_retry_reason)
@@ -1541,7 +1563,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                                     (time.time() - started) * 1000, 0, model=model,
                                     error=outcome.counts_error,
                                     rid=self._req_id, upstream_host=self._upstream_host,
-                                    outcome=outcome.category)
+                                    outcome=outcome)
                     record_error_event(ERR_KIND_SYNTH_502, model=model, path=self.path,
                                        exc=retry_exc, body=body,
                                        retried=1, retry_reason=retry_reason)
@@ -1603,7 +1625,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                             (time.time() - started) * 1000, filtered, model=model,
                             error=outcome.counts_error,
                             rid=self._req_id, upstream_host=self._upstream_host,
-                            ttfb_ms=ttfb_ms, stream=1, outcome=outcome.category,
+                            ttfb_ms=ttfb_ms, stream=1, outcome=outcome,
                             tokens=p3_tokens[2] if p3_tokens else None,
                             bytes_out=self._relay_bytes, chunks=self._relay_chunks,
                             tokens_prompt=p3_tokens[0] if p3_tokens else 0,
@@ -1648,7 +1670,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                             (time.time() - started) * 1000, 0, model=model,
                             error=outcome.counts_error,
                             rid=self._req_id, upstream_host=self._upstream_host,
-                            ttfb_ms=ttfb_ms, stream=0, outcome=outcome.category,
+                            ttfb_ms=ttfb_ms, stream=0, outcome=outcome,
                             tokens=p3_buf_tokens[2] if p3_buf_tokens else None,
                             bytes_out=self._relay_bytes, chunks=self._relay_chunks,
                             tokens_prompt=p3_buf_tokens[0] if p3_buf_tokens else 0,

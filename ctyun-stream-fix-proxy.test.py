@@ -5142,6 +5142,76 @@ class TpmPerModelTest(unittest.TestCase):
         self.assertNotIn("tpm-queue", stderr)
 
 
+class ClassifyOutcomeTriStateTest(unittest.TestCase):
+    """P4：classify_outcome 返回 tri_state 字段；_record_request 三桶归因 + 双形态兼容。"""
+
+    def test_classify_outcome_tri_state_matrix(self) -> None:
+        mod = load_proxy_module()
+        f = mod.classify_outcome
+        self.assertEqual(f(status=200).tri_state, "ok")
+        self.assertEqual(f(status=200, poison_filtered=1).tri_state, "degraded")
+        self.assertEqual(f(client_abort=True).tri_state, "degraded")
+        self.assertEqual(f(synth_502=True).tri_state, "failed")
+        self.assertEqual(f(body_error=True).tri_state, "failed")
+        self.assertEqual(f(eof_without_done=True).tri_state, "failed")
+        self.assertEqual(f(status=404).tri_state, "failed")
+        self.assertEqual(f(status=500).tri_state, "failed")
+
+    def test_tri_state_consistent_with_pure_function(self) -> None:
+        mod = load_proxy_module()
+        for outcome in (mod.classify_outcome(status=200),
+                        mod.classify_outcome(status=200, poison_filtered=1),
+                        mod.classify_outcome(client_abort=True),
+                        mod.classify_outcome(synth_502=True),
+                        mod.classify_outcome(body_error=True),
+                        mod.classify_outcome(status=404),
+                        mod.classify_outcome(status=500)):
+            self.assertEqual(outcome.tri_state,
+                             mod._outcome_tri_state(outcome.category))
+
+    def test_tpm_limited_maps_to_failed(self) -> None:
+        mod = load_proxy_module()
+        # classify_outcome 不产 CLASS_TPM_LIMITED（429 路径不经网关），但映射必须
+        # 覆盖该 category（防未来走此网关时误归 ok/degraded）
+        self.assertEqual(mod._outcome_tri_state(mod.CLASS_TPM_LIMITED), "failed")
+
+    def test_record_request_lands_tri_state_buckets_from_namedtuple(self) -> None:
+        mod = load_proxy_module()
+        orig = mod.STATS["daily_by_model"]
+        try:
+            mod.STATS["daily_by_model"] = {}
+            mod._record_request("POST", "/p4", 200, 1.0, 0, model="m-p4",
+                                outcome=mod.classify_outcome(status=200))
+            mod._record_request("POST", "/p4", 502, 1.0, 0, model="m-p4",
+                                outcome=mod.classify_outcome(synth_502=True))
+            mod._record_request("POST", "/p4", 200, 1.0, 1, model="m-p4",
+                                outcome=mod.classify_outcome(status=200,
+                                                             poison_filtered=1))
+            entry = mod.STATS["daily_by_model"][mod.today_key()]["m-p4"]
+            self.assertEqual(entry["outcome_ok"], 1)
+            self.assertEqual(entry["outcome_degraded"], 1)
+            self.assertEqual(entry["outcome_failed"], 1)
+            # RECENT_REQUESTS 恒存 category 字符串（JSON 可序列化 + 展示口径不变）
+            self.assertEqual(mod.RECENT_REQUESTS[-1]["outcome"],
+                             mod.CLASS_POISON_FIXED)
+        finally:
+            mod.STATS["daily_by_model"] = orig
+
+    def test_record_request_string_outcome_back_compat(self) -> None:
+        """旧调用形态（category 字符串，P3 测试与既有路径用）仍正确落桶。"""
+        mod = load_proxy_module()
+        orig = mod.STATS["daily_by_model"]
+        try:
+            mod.STATS["daily_by_model"] = {}
+            mod._record_request("POST", "/p4s", 200, 1.0, 0, model="m-p4s",
+                                outcome=mod.CLASS_OK)
+            entry = mod.STATS["daily_by_model"][mod.today_key()]["m-p4s"]
+            self.assertEqual(entry["outcome_ok"], 1)
+            self.assertEqual(mod.RECENT_REQUESTS[-1]["outcome"], mod.CLASS_OK)
+        finally:
+            mod.STATS["daily_by_model"] = orig
+
+
 if __name__ == "__main__":
     import atexit
     atexit.register(kill_registered)
