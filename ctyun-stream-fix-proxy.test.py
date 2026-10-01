@@ -979,8 +979,8 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         self.assertEqual(mod.TPM_QUEUE_TIMEOUT_S, 120)
         self.assertEqual(mod.TPM_TOKEN_RATIO, 0.25)
         self.assertEqual(mod.TPM_KEY_CAP, 64)
-        self.assertEqual(mod._TPM_LIMIT_BY_MODEL_BUILTIN, {"kimi-k3-oc": 30000})
         self.assertIsInstance(mod.TPM_LIMIT_BY_MODEL, dict)
+        self.assertEqual(mod.TPM_MODEL_BUDGETS, {})
         self.assertEqual(mod.CLASS_TPM_LIMITED, "tpm_limited")
         self.assertEqual(mod.ERR_KIND_TPM_QUEUE_FULL, "tpm_queue_full")
         self.assertEqual(mod.ERR_KIND_TPM_QUEUE_TIMEOUT, "tpm_queue_timeout")
@@ -1042,31 +1042,30 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         self.assertEqual(self.mod._parse_tpm_limit_by_model(""), {})
         self.assertEqual(self.mod._parse_tpm_limit_by_model("   "), {})
 
-    def test_tpm_limit_for_fallback_and_env_override(self) -> None:
+    def test_tpm_limit_for_two_level_fallback(self) -> None:
+        """两级回退：TPM_MODEL_BUDGETS → 全局 TPM_LIMIT（env 表不参与运行时）。"""
         mod = self.mod
-        orig = mod.TPM_LIMIT_BY_MODEL
+        self._tpm_cleanup(mod)
         try:
-            # ① env 表空 → kimi 命中内置默认，其余回全局 TPM_LIMIT
-            mod.TPM_LIMIT_BY_MODEL = {}
-            self.assertEqual(mod.tpm_limit_for("kimi-k3-oc"), 30000)
-            self.assertEqual(mod.tpm_limit_for("glm-5.3-oc"), mod.TPM_LIMIT)
+            mod.TPM_MODEL_BUDGETS.clear()
+            self.assertEqual(mod.tpm_limit_for("kimi-k3-oc"), mod.TPM_LIMIT)
             self.assertEqual(mod.tpm_limit_for(None), mod.TPM_LIMIT)
             self.assertEqual(mod.tpm_limit_for(""), mod.TPM_LIMIT)
             self.assertEqual(mod.tpm_limit_for("deepseek-v4-pro-0813-oc"),
                              mod.TPM_LIMIT)
-            # ② env 表覆盖内置默认
-            mod.TPM_LIMIT_BY_MODEL = {"kimi-k3-oc": 1000, "glm-5.3-oc": 110000}
+            mod.TPM_MODEL_BUDGETS.update({"kimi-k3-oc": 1000, "glm-5.3-oc": 110000})
             self.assertEqual(mod.tpm_limit_for("kimi-k3-oc"), 1000)
             self.assertEqual(mod.tpm_limit_for("glm-5.3-oc"), 110000)
             self.assertEqual(mod.tpm_limit_for("other"), mod.TPM_LIMIT)
         finally:
-            mod.TPM_LIMIT_BY_MODEL = orig
+            self._tpm_cleanup(mod)
 
     def _tpm_cleanup(self, mod):
         mod.TPM_BUCKETS.clear()
         mod.TPM_WAITERS.clear()
         mod._tpm_rejected.clear()
         mod._tpm_timeouts.clear()
+        mod.TPM_MODEL_BUDGETS.clear()
 
     def test_tpm_key_id(self) -> None:
         f = self.mod.tpm_key_id
@@ -1112,9 +1111,37 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         self.assertEqual(len(bucket), 1)
         self.assertEqual(bucket.used, 500)
 
+    def test_tpm_admit_non_enabled_model_bypasses(self) -> None:
+        """opt-in：未启用模型直通——不建桶、不入队、不计 rejected。"""
+        mod = self.mod
+        self._tpm_cleanup(mod)
+        status, qwait = mod.tpm_admit("key:bypass", 10 ** 9, "m:disabled")
+        self.assertEqual(status, "ok")
+        self.assertEqual(qwait, 0)
+        self.assertEqual(len(mod.TPM_BUCKETS), 0)
+        self.assertEqual(len(mod.TPM_WAITERS), 0)
+        self.assertEqual(len(mod._tpm_rejected), 0)
+        # model=None 恒直通（None not in {} → True）
+        status2, qwait2 = mod.tpm_admit("key:bypass2", 10 ** 9, None)
+        self.assertEqual((status2, qwait2), ("ok", 0))
+        self.assertEqual(len(mod.TPM_BUCKETS), 0)
+
+    def test_tpm_admit_enabled_model_goes_budget_path(self) -> None:
+        """启用模型照旧走预算判定：est 超预算忙时 429 语义（"full"）保持。"""
+        mod = self.mod
+        self._tpm_cleanup(mod)
+        mod.TPM_MODEL_BUDGETS["m:enabled"] = 100
+        status, qwait = mod.tpm_admit("key:en", 100, "m:enabled")
+        self.assertEqual((status, qwait), ("ok", 0))
+        self.assertEqual(mod.TPM_BUCKETS[("key:en", "m:enabled")].used, 100)
+        status2, qwait2 = mod.tpm_admit("key:en", 101, "m:enabled")
+        self.assertEqual((status2, qwait2), ("full", 0))
+        self.assertEqual(mod._tpm_rejected.get(("key:en", "m:enabled")), 1)
+
     def test_tpm_admit_ok_immediate(self) -> None:
         mod = self.mod
         self._tpm_cleanup(mod)
+        mod.TPM_MODEL_BUDGETS["m:imm"] = mod.TPM_LIMIT
         status, qwait = mod.tpm_admit("key:imm", 100, "m:imm")
         self.assertEqual(status, "ok")
         self.assertEqual(qwait, 0)
@@ -1125,6 +1152,7 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         """est > budget：窗口空闲放行（决策 3）、忙时硬拒并计 rejected（决策 4）。"""
         mod = self.mod
         self._tpm_cleanup(mod)
+        mod.TPM_MODEL_BUDGETS["m:big"] = mod.TPM_LIMIT
         # ① 空闲：used=0 且无同桶 waiter → 放行（budget 来自 tpm_limit_for）
         status, qwait = mod.tpm_admit("key:big", mod.TPM_LIMIT + 1, "m:big")
         self.assertEqual(status, "ok", "idle window must release oversized request")
@@ -1168,6 +1196,7 @@ class ProxyDashboardUnitTest(unittest.TestCase):
     def test_tpm_admit_queue_full(self) -> None:
         mod = self.mod
         self._tpm_cleanup(mod)
+        mod.TPM_MODEL_BUDGETS["m:qfull"] = mod.TPM_LIMIT
         mod.TPM_QUEUE_MAX = 2
         try:
             mod.tpm_admit("key:qfull", mod.TPM_LIMIT, "m:qfull")  # 占满预算
@@ -1187,6 +1216,7 @@ class ProxyDashboardUnitTest(unittest.TestCase):
     def test_tpm_settle_corrects_usage(self) -> None:
         mod = self.mod
         self._tpm_cleanup(mod)
+        mod.TPM_MODEL_BUDGETS["m:settle"] = mod.TPM_LIMIT
         mod.tpm_admit("key:settle", 500, "m:settle")
         # 实际 200 → 退款 300
         mod.tpm_settle("key:settle", 500, 200, "m:settle")
@@ -1224,6 +1254,7 @@ class ProxyDashboardUnitTest(unittest.TestCase):
     def test_tpm_settle_notifies_waiters(self) -> None:
         mod = self.mod
         self._tpm_cleanup(mod)
+        mod.TPM_MODEL_BUDGETS["m:wake"] = mod.TPM_LIMIT
         mod.TPM_QUEUE_TIMEOUT_S = 5.0
         results = {}
         # 占满预算
@@ -1245,6 +1276,7 @@ class ProxyDashboardUnitTest(unittest.TestCase):
     def test_tpm_admit_queue_timeout(self) -> None:
         mod = self.mod
         self._tpm_cleanup(mod)
+        mod.TPM_MODEL_BUDGETS["m:to"] = mod.TPM_LIMIT
         mod.TPM_QUEUE_TIMEOUT_S = 0.3
         try:
             mod.tpm_admit("key:to", mod.TPM_LIMIT, "m:to")  # 占满
@@ -1290,12 +1322,15 @@ class ProxyDashboardUnitTest(unittest.TestCase):
     def test_tpm_snapshot_shape_and_masking(self) -> None:
         mod = self.mod
         self._tpm_cleanup(mod)
+        mod.TPM_MODEL_BUDGETS["m:snap"] = mod.TPM_LIMIT
         mod.tpm_admit(mod.tpm_key_id("Bearer key:snap"), 100, "m:snap")
         snap = mod.tpm_snapshot()
         self.assertEqual(snap["config"]["limit"], mod.TPM_LIMIT)
         self.assertEqual(snap["config"]["window_s"], mod.TPM_WINDOW_S)
         self.assertEqual(snap["config"]["queue_max"], mod.TPM_QUEUE_MAX)
-        self.assertEqual(snap["config"]["limit_by_model"], mod.TPM_LIMIT_BY_MODEL)
+        self.assertEqual(snap["config"]["model_budgets"],
+                         {"m:snap": mod.TPM_LIMIT})
+        self.assertEqual(snap["config"]["enabled_models"], ["m:snap"])
         self.assertEqual(snap["queue_total"], 0)
         self.assertEqual(len(snap["buckets"]), 1)
         b = snap["buckets"][0]
@@ -1324,6 +1359,39 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         self.assertTrue(hasattr(mod.ProxyHandler, "_reply_tpm_429"),
                         "_reply_tpm_429 method must exist on ProxyHandler")
         self.assertTrue(callable(mod.ProxyHandler._reply_tpm_429))
+
+    def test_load_tpm_model_budgets_tolerance(self) -> None:
+        mod = self.mod
+        path = os.path.join(tempfile.mkdtemp(prefix="ctyun-tpm-load-"), "s.json")
+        # 缺文件 → {}
+        self.assertEqual(mod.load_tpm_model_budgets(path), {})
+        # 顶层非 dict / 无键 / 键非 dict → {}
+        for bad in ("[]", "{}", '{"tpm_model_budgets": []}',
+                    '{"tpm_model_budgets": "x"}'):
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(bad)
+            self.assertEqual(mod.load_tpm_model_budgets(path), {})
+        # 逐键容错：非法项跳过，合法项保留
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"tpm_model_budgets": {
+                "ok-a": 1000,
+                "": 5,                       # 空名 → 跳过
+                "ok-b": 50000,
+                "bad-neg": -1,               # 非正 → 跳过
+                "bad-zero": 0,               # 非正 → 跳过
+                "bad-str": "100",            # 非 int → 跳过
+                "bad-bool": True,            # bool → 跳过
+                "x" * 201: 5,                # 超 200 字符 → 跳过
+                "ok-c": 2.0,                 # float → 跳过（非 int）
+            }}, fh, ensure_ascii=False)
+        self.assertEqual(mod.load_tpm_model_budgets(path),
+                         {"ok-a": 1000, "ok-b": 50000})
+        # 超 32 键：只保留前 32 个合法键
+        big = {"tpm_model_budgets": {"m%d" % i: 10 for i in range(40)}}
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(big, fh)
+        self.assertEqual(len(mod.load_tpm_model_budgets(path)), 32)
+        shutil.rmtree(os.path.dirname(path), ignore_errors=True)
 
     def test_stats_persist_roundtrip_and_defaults(self) -> None:
         mod = self.mod
@@ -4616,7 +4684,8 @@ class TpmAdmitHookTest(unittest.TestCase):
             body_override=SSE_A + SSE_B + SSE_DONE)
         self.proxy_port = free_port()
         self.proc = start_proxy(self.upstream_port, self.proxy_port,
-                                extra_env={"CTYUN_TPM_LIMIT": "50"})
+                                extra_env={"CTYUN_TPM_LIMIT": "50"},
+                                seed_persist={"tpm_model_budgets": {"x": 50}})
 
     def tearDown(self) -> None:
         if self.proc:
@@ -4663,7 +4732,8 @@ class TpmRateLimitTest(unittest.TestCase):
                                 extra_env={"CTYUN_TPM_LIMIT": "110",
                                            "CTYUN_TPM_WINDOW_S": "2",
                                            "CTYUN_TPM_QUEUE_TIMEOUT_S": "5",
-                                           "CTYUN_TPM_QUEUE_MAX": "2"})
+                                           "CTYUN_TPM_QUEUE_MAX": "2"},
+                                seed_persist={"tpm_model_budgets": {"m": 110}})
 
     def tearDown(self) -> None:
         if self.proc:
@@ -4717,7 +4787,8 @@ class TpmRateLimitTest(unittest.TestCase):
                                 extra_env={"CTYUN_TPM_LIMIT": "30",
                                            "CTYUN_TPM_WINDOW_S": "60",
                                            "CTYUN_TPM_QUEUE_TIMEOUT_S": "2",
-                                           "CTYUN_TPM_QUEUE_MAX": "2"})
+                                           "CTYUN_TPM_QUEUE_MAX": "2"},
+                                seed_persist={"tpm_model_budgets": {"m": 30}})
         mid_body = (b'{"model":"m","stream":true,"messages":[{"role":"user","content":"'
                     + b"x" * 20 + b'"}]}')   # 89B → est = int(89*ratio) = 22 ≤ 30
         small_body = b'{"model":"m","stream":true,"messages":[]}'   # est = 10
@@ -4790,7 +4861,8 @@ class TpmRateLimitTest(unittest.TestCase):
                                 extra_env={"CTYUN_TPM_LIMIT": "200",
                                            "CTYUN_TPM_WINDOW_S": "10",
                                            "CTYUN_TPM_QUEUE_TIMEOUT_S": "5",
-                                           "CTYUN_TPM_QUEUE_MAX": "2"})
+                                           "CTYUN_TPM_QUEUE_MAX": "2"},
+                                seed_persist={"tpm_model_budgets": {"m": 200}})
         big_body = (b'{"model":"m","stream":true,"messages":[{"role":"user","content":"'
                     + b"x" * 280 + b'"}]}')   # est = 87，settle → 2（释放 85）
         small_body = b'{"model":"m","stream":true,"messages":[]}'   # est = 10
@@ -4860,7 +4932,8 @@ class TpmRateLimitTest(unittest.TestCase):
         snap = json.loads(body.decode("utf-8"))
         self.assertEqual(snap["config"],
                          {"limit": 110, "window_s": 2, "queue_max": 2,
-                          "limit_by_model": {}},
+                          "model_budgets": {"m": 110},
+                          "enabled_models": ["m"]},
                          "config must reflect env seams, got %r" % snap["config"])
         self.assertEqual(snap["queue_total"], 0)
         self.assertEqual(len(snap["buckets"]), 1)
@@ -4898,7 +4971,8 @@ class TpmRateLimitTest(unittest.TestCase):
                                            "CTYUN_TPM_WINDOW_S": "60",
                                            "CTYUN_TPM_QUEUE_TIMEOUT_S": "5",
                                            "CTYUN_TPM_QUEUE_MAX": "2",
-                                           "CTYUN_HEADER_TIMEOUT": "1"})
+                                           "CTYUN_HEADER_TIMEOUT": "1"},
+                                seed_persist={"tpm_model_budgets": {"m": 200}})
         small_body = b'{"model":"m","stream":true,"messages":[]}'   # 41B → est = 10
         auth = "Bearer test-key-retry"
         status, data = post_sse_auth(self.proxy_port, small_body, auth)
@@ -5112,11 +5186,10 @@ class TpmPerModelTest(unittest.TestCase):
         self.proc = start_proxy(self.upstream_port, self.proxy_port,
                                 extra_env={
                                     "CTYUN_TPM_LIMIT": "110000",
-                                    "CTYUN_TPM_LIMIT_BY_MODEL":
-                                        "kimi-k3-oc:1000",
                                     "CTYUN_TPM_WINDOW_S": "5",
                                     "CTYUN_TPM_QUEUE_MAX": "2",
-                                })
+                                },
+                                seed_persist={"tpm_model_budgets": {"kimi-k3-oc": 1000}})
         # kimi budget 1000：需 est > kimi budget 才见拒绝；用 max_tokens 拉高 est。
         big_kimi = (b'{"model":"kimi-k3-oc","stream":true,'
                     b'"messages":[{"role":"user","content":"'
@@ -5155,8 +5228,9 @@ class TpmPerModelTest(unittest.TestCase):
                                     "CTYUN_TPM_LIMIT": "50",
                                     "CTYUN_TPM_WINDOW_S": "60",
                                     "CTYUN_TPM_QUEUE_MAX": "2",
-                                })
-        # len ~209B → est = int(209*0.25) = 52 > 50
+                                },
+                                seed_persist={"tpm_model_budgets": {"y": 50}})
+        # len 209B → est = int(209*0.25) = 52 > 50
         big = (b'{"model":"y","stream":true,"messages":[{"role":"user","content":"'
                + b"y" * 140 + b'"}]}')
         auth = "Bearer test-oversized"
@@ -5180,7 +5254,8 @@ class TpmPerModelTest(unittest.TestCase):
                                     "CTYUN_TPM_LIMIT": "50",
                                     "CTYUN_TPM_WINDOW_S": "60",
                                     "CTYUN_TPM_QUEUE_MAX": "2",
-                                })
+                                },
+                                seed_persist={"tpm_model_budgets": {"z": 50}})
         auth = "Bearer test-busy"
         # small: ~45B → est ≈ 11 ≤ 50
         small = b'{"model":"z","stream":true,"messages":[]}'
@@ -5201,7 +5276,8 @@ class TpmPerModelTest(unittest.TestCase):
                                     "CTYUN_TPM_LIMIT": "50",
                                     "CTYUN_TPM_WINDOW_S": "60",
                                     "CTYUN_TPM_QUEUE_MAX": "2",
-                                })
+                                },
+                                seed_persist={"tpm_model_budgets": {"w": 50}})
         auth = "Bearer test-reject-count"
         big = (b'{"model":"w","stream":true,"messages":[{"role":"user","content":"'
                + b"y" * 140 + b'"}]}')   # est 52 > 50
@@ -5225,28 +5301,32 @@ class TpmPerModelTest(unittest.TestCase):
                                 % b["rejected"])
 
     def test_tpm_stats_shape_with_limit_by_model(self) -> None:
-        """/api/tpm_stats config 含 limit_by_model dict（默认空 {}），bucket 含 model 字段。"""
+        """/api/tpm_stats config 含 model_budgets/enabled_models；bucket 含 model 字段。
+        第二阶段：persist 无 tpm_model_budgets + env CTYUN_TPM_LIMIT_BY_MODEL 非空
+        → 启动迁移 seed（决策 2），config.model_budgets 反映 env 表且 stderr 含迁移行。"""
         self.proc = start_proxy(self.upstream_port, self.proxy_port,
                                 extra_env={
                                     "CTYUN_TPM_LIMIT": "110",
                                     "CTYUN_TPM_WINDOW_S": "2",
                                     "CTYUN_TPM_QUEUE_MAX": "2",
-                                })
+                                },
+                                seed_persist={"tpm_model_budgets": {"v": 110}})
         auth = "Bearer test-shape"
         small = b'{"model":"v","stream":true,"messages":[]}'   # est = 10
         post_sse_auth(self.proxy_port, small, auth)
-        _, body, ctype = admin_get(self.proc.admin_port, "/api/tpm_stats")
-        self.assertTrue(ctype and ctype.startswith("application/json"))
+        _, body, _ = admin_get(self.proc.admin_port, "/api/tpm_stats")
         snap = json.loads(body.decode("utf-8"))
-        self.assertEqual(snap["config"]["limit_by_model"], {},
-                         "limit_by_model must default to empty dict")
+        self.assertEqual(snap["config"]["model_budgets"], {"v": 110},
+                         "model_budgets must reflect enabled model budgets")
+        self.assertEqual(snap["config"]["enabled_models"], ["v"])
+        self.assertEqual(snap["queue_total"], 0)
         self.assertEqual(len(snap["buckets"]), 1)
         b = snap["buckets"][0]
         self.assertEqual(b["model"], "v",
                          "bucket must carry model field (not None/null)")
         self.assertFalse(b["model"] is None,
                          "model field must be the string value, not null")
-        # limit_by_model 含 env 设置时（决策 6 "原样"）
+        # 第二阶段：env 迁移 seed（persist 无 tpm_model_budgets 键）
         stop_proxy(self.proc)
         self.proc = start_proxy(self.upstream_port, free_port(),
                                 extra_env={
@@ -5256,12 +5336,12 @@ class TpmPerModelTest(unittest.TestCase):
                                     "CTYUN_TPM_LIMIT_BY_MODEL":
                                         "glm-5.3-oc:110000",
                                 })
-        post_sse_auth(self.proc.proxy_port, small, auth)
         _, body2, _ = admin_get(self.proc.admin_port, "/api/tpm_stats")
         snap2 = json.loads(body2.decode("utf-8"))
-        self.assertEqual(snap2["config"]["limit_by_model"],
+        self.assertEqual(snap2["config"]["model_budgets"],
                          {"glm-5.3-oc": 110000},
-                         "limit_by_model must reflect env seam dict as-is")
+                         "env seam must migrate-seed tpm_model_budgets")
+        self.assertIn("migrated CTYUN_TPM_LIMIT_BY_MODEL", stderr_text(self.proc))
 
     def test_no_auth_bypasses_tpm(self) -> None:
         """无 Authorization 头请求直通不限流，stderr 无任何 TPM 字段（向后兼容 spec）。"""

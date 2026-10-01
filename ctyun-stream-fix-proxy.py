@@ -69,8 +69,8 @@ def _parse_tpm_limit_by_model(env_str: str) -> dict:
     """解析 CTYUN_TPM_LIMIT_BY_MODEL（"model:limit,model:limit"）→ {model: limit}。
 
     fail-open：逐项 split(":")，非两项 / limit 非 int / limit 负值 → 跳过该项并
-    stderr 一行；空串 / 全畸形 → {}。内置默认（kimi-k3-oc:30000）不并入本表，
-    由 tpm_limit_for 兜底——保证快照 config.limit_by_model 原样展示 env 表。
+    stderr 一行；空串 / 全畸形 → {}。本表仅供 main() 一次性迁移 seed
+    （tpm_model_budgets 持久化缺失且 env 非空时），运行时限流不消费它。
     """
     result = {}
     if not env_str or not env_str.strip():
@@ -105,11 +105,13 @@ TPM_QUEUE_TIMEOUT_S = float(os.environ.get("CTYUN_TPM_QUEUE_TIMEOUT_S", "120"))
 TPM_TOKEN_RATIO = float(os.environ.get("CTYUN_TPM_TOKEN_RATIO", "0.25"))
 TPM_KEY_CAP = int(os.environ.get("CTYUN_TPM_KEY_CAP", "64"))
 
-# per-model 预算（决策 2）：env seam "model:limit,model:limit"（逗号分隔）；
-# 解析 fail-open 见 _parse_tpm_limit_by_model；内置默认不并入本表以保快照原样展示。
+# per-model 预算 env seam（决策 2）：仅作一次性迁移 seed 用（main() 启动时解析并落盘
+# tpm_model_budgets）；运行时限流预算唯一权威 = TPM_MODEL_BUDGETS。
 TPM_LIMIT_BY_MODEL: dict = _parse_tpm_limit_by_model(
     os.environ.get("CTYUN_TPM_LIMIT_BY_MODEL", ""))
-_TPM_LIMIT_BY_MODEL_BUILTIN: dict = {"kimi-k3-oc": 30000}  # 实证 31k 触顶留余量；env 表优先覆盖
+# 启用模型集合（决策 2）：{model: int budget}，_CFG_LOCK 护写（读侧无锁靠引用赋值原子）。
+# 仅集合内模型走 tpm_admit 预算判定（opt-in）；main() 启动由持久化 / env 迁移 / 默认 seed 回填。
+TPM_MODEL_BUDGETS: dict = {}
 
 PRIMED_TAIL_CAP = 262144  # finish hold 尾段缓冲上限（超限 fail-open 防内存膨胀）
 
@@ -453,14 +455,13 @@ def estimate_request_tokens(body):
 
 
 def tpm_limit_for(model) -> int:
-    """per-model 预算查询：env 表 → 内置默认表 → 全局 TPM_LIMIT。
+    """per-model 预算查询（两级回退）：TPM_MODEL_BUDGETS → 全局 TPM_LIMIT。
 
-    model 为 None / 空字符串 / 查不到 → 回退 TPM_LIMIT（全局默认）。"""
+    仅启用模型（TPM_MODEL_BUDGETS 键内）会消费本函数——tpm_admit 已按 opt-in
+    短路，未启用模型不走到 budget 判定；model 为 None / 空字符串 / 查不到 →
+    回退 TPM_LIMIT（全局默认）。"""
     if model:
-        limit = TPM_LIMIT_BY_MODEL.get(model)
-        if limit is not None:
-            return limit
-        limit = _TPM_LIMIT_BY_MODEL_BUILTIN.get(model)
+        limit = TPM_MODEL_BUDGETS.get(model)
         if limit is not None:
             return limit
     return TPM_LIMIT
@@ -518,7 +519,8 @@ def tpm_admit(key_id: str, est: int, model):
     status: "ok"（准入）/ "full"（队列满或 est 超预算且窗口非空闲，立即 429）/
             "timeout"（排队超时，429）。
     规则：
-    - budget = tpm_limit_for(model)（per-model 表 → 内置默认 → TPM_LIMIT）。
+    - 未启用模型（不在 TPM_MODEL_BUDGETS）→ 直接直通 ("ok", 0)，不建桶/不排队/不 429。
+    - budget = tpm_limit_for(model)（TPM_MODEL_BUDGETS → TPM_LIMIT）。
     - est > budget → 空闲放行判定：prune 后 bucket.used <= 0 且无同桶 waiter →
       放行（超大请求占满窗口，后续排队至窗口滚过属预期）；否则 ("full", 0)
       并计 rejected（先 touch 建桶，拒绝计数可见）。
@@ -530,6 +532,10 @@ def tpm_admit(key_id: str, est: int, model):
     - deadline 到仍未准入 → ("timeout", 0) 并自队列移除。
     排队期间不持有任何上游连接（hook 点在 _open_upstream 之前）。
     """
+    # opt-in 短路（决策 1）：未启用模型直通——不建桶、不排队、不 429、不 touch rejected。
+    # model 为 None 时 `None not in {...}` 恒真 → 直通（无 key 请求由上游调用点过滤，天然符合）。
+    if model not in TPM_MODEL_BUDGETS:
+        return ("ok", 0)
     budget = tpm_limit_for(model)
     started = time.time()
     with TPM_LOCK:
@@ -588,6 +594,8 @@ def tpm_settle(key_id: str, est: int, actual: int, model) -> None:
     prune 后追加校正条目 (now, delta)，delta = actual - est（可为负 = 退款）；
     used 存原始值 used + delta，与追加条目自此保持一致（可为负 = 窗口欠账，
     随条目过期 prune 自愈）。settle 后 notify_all 唤醒排队 waiter 重试准入。
+    未启用模型桶不存在 → 现有 `bucket is None` no-op 分支命中，直通模型天然免疫；
+    模型从启用→取消遗留的桶继续校正并 notify，在途 waiter 走完当次判定（决策 6）。
     """
     now = time.time()
     with TPM_LOCK:
@@ -605,7 +613,7 @@ def tpm_settle(key_id: str, est: int, actual: int, model) -> None:
 def tpm_snapshot() -> dict:
     """TPM 状态快照（/api/tpm_stats 端点用）。
 
-    返回 {"config": {"limit", "window_s", "queue_max", "limit_by_model"},
+    返回 {"config": {"limit", "window_s", "queue_max", "model_budgets", "enabled_models"},
           "queue_total", "buckets": [...]}；
     bucket 条目 {"key"（sha256: 前缀 + 前 12 位 hex）, "model", "used",
                  "remaining", "queued", "rejected", "timeouts"}——key 脱敏，
@@ -638,7 +646,8 @@ def tpm_snapshot() -> dict:
                 "limit": TPM_LIMIT,
                 "window_s": TPM_WINDOW_S,
                 "queue_max": TPM_QUEUE_MAX,
-                "limit_by_model": TPM_LIMIT_BY_MODEL,
+                "model_budgets": dict(TPM_MODEL_BUDGETS),
+                "enabled_models": sorted(TPM_MODEL_BUDGETS.keys()),
             },
             "queue_total": len(TPM_WAITERS),
             "buckets": buckets,
@@ -1035,6 +1044,28 @@ def load_capture_errors(path: str) -> bool:
     data = _load_persist_file(path)
     val = data.get("capture_errors") if isinstance(data, dict) else None
     return val if isinstance(val, bool) else False
+
+
+def load_tpm_model_budgets(path: str) -> dict:
+    """从持久化文件读 tpm_model_budgets；缺/损坏/非 dict → {}。
+
+    逐键校验（容错同 load_daily_by_model_buckets 风格）：model 名非空 str
+    且 ≤200 字符、limit 为 int 且 >0、键数 ≤32；非法项跳过不报错。
+    """
+    data = _load_persist_file(path)
+    val = data.get("tpm_model_budgets") if isinstance(data, dict) else None
+    if not isinstance(val, dict):
+        return {}
+    out = {}
+    for model, limit in val.items():
+        if len(out) >= 32:
+            break
+        if not isinstance(model, str) or not model or len(model) > 200:
+            continue
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
+            continue
+        out[model] = limit
+    return out
 
 
 def load_model_pricing(path: str) -> dict:
@@ -3128,7 +3159,7 @@ FAVICON_ICO = base64.b64decode(_FAVICON_B64)
 
 def main() -> None:
     global UPSTREAM_BASE, _upstream_source, _stats_dirty, CAPTURE_ERRORS, MODEL_PRICING
-    global PROBE_ENABLED
+    global PROBE_ENABLED, TPM_MODEL_BUDGETS
     UPSTREAM_BASE, _upstream_source = resolve_upstream_base(
         os.environ.get("CTYUN_UPSTREAM_BASE"), PERSIST_PATH)
     # v2 P4：probe 开关解析（env > persist > 默认 True），_probe_loop 启动前定值
@@ -3139,6 +3170,22 @@ def main() -> None:
     daily_by_model = load_daily_by_model_buckets(PERSIST_PATH)  # 按天×模型矩阵跨重启续算
     events = load_stats_events(PERSIST_PATH)      # 错误/重试事件流跨重启续算
     CAPTURE_ERRORS = load_capture_errors(PERSIST_PATH)  # 启动时回填开关
+    # 迁移 seed（决策 2）：持久化 tpm_model_budgets 为运行时唯一权威；
+    # 键**缺失**（不是空 dict——用户显式保存 {} = 全部直通，必须尊重）且
+    # env CTYUN_TPM_LIMIT_BY_MODEL 非空 → env 解析 seed 一次并立即落盘；
+    # 两者皆无 → 默认 {"kimi-k3-oc": 30000}（生产实证线，31k 触顶留余量）。
+    persist_data = _load_persist_file(PERSIST_PATH)
+    if "tpm_model_budgets" in persist_data:
+        TPM_MODEL_BUDGETS = load_tpm_model_budgets(PERSIST_PATH)
+    else:
+        env_budgets = TPM_LIMIT_BY_MODEL
+        if env_budgets:
+            TPM_MODEL_BUDGETS = dict(env_budgets)
+            _safe_log_stderr("ctyun-stream-fix-proxy: migrated CTYUN_TPM_LIMIT_BY_MODEL"
+                             " to tpm_model_budgets: %r" % (TPM_MODEL_BUDGETS,))
+            save_stats_counters(PERSIST_PATH)
+        else:
+            TPM_MODEL_BUDGETS = {"kimi-k3-oc": 30000}
     # v2 P3：model_pricing 装载（env seam 优先，否则持久化文件；解析失败回落 {}）
     pricing_env = os.environ.get("CTYUN_MODEL_PRICING", "")
     if pricing_env:
