@@ -990,6 +990,7 @@ def save_stats_counters(path: str) -> None:
     with _CFG_LOCK:
         base = UPSTREAM_BASE
         capture_enabled = CAPTURE_ERRORS
+        probe_enabled = PROBE_ENABLED
     directory = os.path.dirname(path)
     if directory:
         os.makedirs(directory, exist_ok=True)
@@ -997,6 +998,7 @@ def save_stats_counters(path: str) -> None:
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump({"upstream_base": base,
                    "capture_errors": capture_enabled,
+                   "probe_enabled": probe_enabled,
                    "model_pricing": MODEL_PRICING,
                    "stats": dict(counters, daily=daily, daily_by_model=daily_by_model,
                                  events=events)},
@@ -1039,6 +1041,38 @@ def load_model_pricing(path: str) -> dict:
     data = _load_persist_file(path)
     val = data.get("model_pricing") if isinstance(data, dict) else None
     return val if isinstance(val, dict) else {}
+
+
+def resolve_probe_enabled(env_val: str, persisted: bool) -> bool:
+    """probe_enabled 解析：env > persist > 默认（True）。
+
+    env_val（CTYUN_PROBE_ENABLED）："1"/"true"/"yes"/"on" → True；
+    "0"/"false"/"no"/"off" → False；其余（含空串/垃圾值）→ 落 persisted 值。
+    """
+    if env_val:
+        normalized = env_val.strip().lower()
+        if normalized in ("1", "true", "yes", "on"):
+            return True
+        if normalized in ("0", "false", "no", "off"):
+            return False
+    return persisted
+
+
+def load_probe_enabled(path: str) -> bool:
+    """从持久化文件顶层读 probe_enabled；缺/损坏/非 bool → True（默认开）。"""
+    data = _load_persist_file(path)
+    val = data.get("probe_enabled") if isinstance(data, dict) else None
+    return val if isinstance(val, bool) else True
+
+
+def set_probe_enabled(enabled: bool) -> None:
+    """POST /api/probe 落库：切 PROBE_ENABLED + 立即全量落盘（跨重启保留）。"""
+    global PROBE_ENABLED
+    with _CFG_LOCK:
+        PROBE_ENABLED = enabled
+    # save_stats_counters 内部也要拿 _CFG_LOCK：必须在锁外调用（同 set_capture_errors
+    # 死锁注释——非重入锁，嵌套即同线程死锁）
+    save_stats_counters(PERSIST_PATH)
 
 
 _DAILY_FIELDS = ("requests", "filtered", "errors_proxy", "errors_upstream",
@@ -2113,6 +2147,8 @@ class AdminHandler(http.server.BaseHTTPRequestHandler):
                            "capture_errors": CAPTURE_ERRORS,
                            "model_pricing": MODEL_PRICING}
             self._send_json(200, payload)
+        elif path == "/api/health":
+            self._send_json(200, {"upstream": probe_state_snapshot()})
         elif path == "/api/errors":
             id_str = urllib.parse.parse_qs(
                 urllib.parse.urlsplit(self.path).query).get("id", [None])[0]
@@ -2188,6 +2224,9 @@ class AdminHandler(http.server.BaseHTTPRequestHandler):
             return
         raw = self.rfile.read(length) if length > 0 else b""
         path = urllib.parse.urlsplit(self.path).path
+        if path == "/api/probe":
+            self._handle_probe_post(raw)
+            return
         if path != "/api/config":
             self._send(404, "text/plain; charset=utf-8", b"not found")
             return
@@ -2221,6 +2260,27 @@ class AdminHandler(http.server.BaseHTTPRequestHandler):
             resp = {"ok": True, "upstream_base": UPSTREAM_BASE, "source": "api",
                     "capture_errors": CAPTURE_ERRORS}
         self._send_json(200, resp)
+
+    def _handle_probe_post(self, raw: bytes) -> None:
+        """POST /api/probe：切 probe 开关 {"enabled": bool}（鉴权同 /api/config）。"""
+        if not write_allowed(self.client_address[0],
+                             self.headers.get("X-Admin-Token") or "",
+                             os.environ.get("CTYUN_ADMIN_TOKEN", "")):
+            self._send_json(403, {"error": "非本机切换 probe 开关需要 X-Admin-Token 头"
+                                           "（值 = 服务器环境变量 CTYUN_ADMIN_TOKEN）"})
+            return
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            self._send_json(400, {"error": "请求体不是合法 JSON——"
+                                           "请发 {\"enabled\": true|false}"})
+            return
+        enabled = data.get("enabled") if isinstance(data, dict) else None
+        if not isinstance(enabled, bool):
+            self._send_json(400, {"error": "enabled 必须为布尔值"})
+            return
+        set_probe_enabled(enabled)
+        self._send_json(200, {"ok": True, "probe_enabled": enabled})
 
     def _send(self, status: int, content_type: str, body: bytes) -> None:
         self.send_response(status)
@@ -2814,8 +2874,12 @@ FAVICON_ICO = base64.b64decode(_FAVICON_B64)
 
 def main() -> None:
     global UPSTREAM_BASE, _upstream_source, _stats_dirty, CAPTURE_ERRORS, MODEL_PRICING
+    global PROBE_ENABLED
     UPSTREAM_BASE, _upstream_source = resolve_upstream_base(
         os.environ.get("CTYUN_UPSTREAM_BASE"), PERSIST_PATH)
+    # v2 P4：probe 开关解析（env > persist > 默认 True），_probe_loop 启动前定值
+    PROBE_ENABLED = resolve_probe_enabled(
+        os.environ.get("CTYUN_PROBE_ENABLED", ""), load_probe_enabled(PERSIST_PATH))
     counters = load_stats_counters(PERSIST_PATH)  # 累计计数跨重启续算
     daily = load_daily_buckets(PERSIST_PATH)      # 按天分桶跨重启续算
     daily_by_model = load_daily_by_model_buckets(PERSIST_PATH)  # 按天×模型矩阵跨重启续算

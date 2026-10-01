@@ -5431,6 +5431,181 @@ class ProbeEventsCompatTest(unittest.TestCase):
                          "旧版本必须丢弃 probe_alert 且不崩（graceful degrade）")
 
 
+class ProbeHealthApiTest(unittest.TestCase):
+    """P4：GET /api/health 形状与真实值（probe 运转后回读）。"""
+
+    def setUp(self) -> None:
+        self.upstream_port, self.head_calls = make_probe_upstream()
+        self.proxy_port = free_port()
+        self.proc = start_proxy(self.upstream_port, self.proxy_port,
+                                extra_env={"CTYUN_PROBE_INTERVAL_S": "0.5"})
+
+    def tearDown(self) -> None:
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_fake_upstreams()
+
+    def test_health_reports_probe_state(self) -> None:
+        ProbeLoopTest._wait_head_calls(self.head_calls, 2)
+        deadline = time.time() + 5
+        snap = None
+        while time.time() < deadline:
+            status, body, _ = admin_get(self.proc.admin_port, "/api/health")
+            snap = json.loads(body.decode("utf-8"))
+            if snap["upstream"]["last_probe_ok"]:
+                break
+            time.sleep(0.1)
+        self.assertEqual(status, 200)
+        self.assertIsNotNone(snap)
+        upstream = snap["upstream"]
+        self.assertEqual(set(upstream),
+                         {"host", "last_probe_ts", "last_probe_ok",
+                          "last_probe_latency_ms", "consecutive_failures",
+                          "probe_enabled"})
+        self.assertEqual(upstream["host"], "127.0.0.1:%d" % self.upstream_port)
+        self.assertTrue(upstream["last_probe_ok"])
+        self.assertGreater(upstream["last_probe_ts"], 0)
+        self.assertIsInstance(upstream["last_probe_latency_ms"], float)
+        self.assertEqual(upstream["consecutive_failures"], 0)
+        self.assertTrue(upstream["probe_enabled"])
+
+
+class ProbeToggleTest(unittest.TestCase):
+    """P4：POST /api/probe 切 on/off（运行时生效、持久化、输入校验、启动空转）。"""
+
+    def setUp(self) -> None:
+        self.upstream_port, self.head_calls = make_probe_upstream()
+        self.proxy_port = free_port()
+        self.proc = start_proxy(self.upstream_port, self.proxy_port,
+                                extra_env={"CTYUN_PROBE_INTERVAL_S": "0.5"})
+
+    def tearDown(self) -> None:
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_fake_upstreams()
+
+    def test_probe_toggle_off_stops_head_requests(self) -> None:
+        ProbeLoopTest._wait_head_calls(self.head_calls, 2)  # 确认运行中
+        status, body = admin_post(self.proc.admin_port, "/api/probe",
+                                  b'{"enabled": false}')
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body.decode("utf-8")),
+                         {"ok": True, "probe_enabled": False})
+        _, body, _ = admin_get(self.proc.admin_port, "/api/health")
+        self.assertFalse(json.loads(body.decode("utf-8"))["upstream"]["probe_enabled"])
+        time.sleep(1.5)  # >2 个间隔：空转不得再发 HEAD
+        count_off = len(self.head_calls)
+        time.sleep(1.5)
+        self.assertEqual(len(self.head_calls), count_off,
+                         "probe off 后不得再发 HEAD（空转零网络 IO）")
+        with open(os.path.join(self.proc.persist_dir, "settings.json"),
+                  encoding="utf-8") as fh:
+            self.assertFalse(json.load(fh)["probe_enabled"],
+                             "persist 顶层 probe_enabled 必须落 false")
+
+    def test_probe_toggle_back_on_resumes(self) -> None:
+        ProbeLoopTest._wait_head_calls(self.head_calls, 2)
+        admin_post(self.proc.admin_port, "/api/probe", b'{"enabled": false}')
+        time.sleep(1.0)
+        stopped = len(self.head_calls)
+        status, _ = admin_post(self.proc.admin_port, "/api/probe", b'{"enabled": true}')
+        self.assertEqual(status, 200)
+        ProbeLoopTest._wait_head_calls(self.head_calls, stopped + 2)
+        _, body, _ = admin_get(self.proc.admin_port, "/api/health")
+        self.assertTrue(json.loads(body.decode("utf-8"))["upstream"]["probe_enabled"])
+
+    def test_probe_post_rejects_bad_input(self) -> None:
+        status, _ = admin_post(self.proc.admin_port, "/api/probe", b"not json")
+        self.assertEqual(status, 400)
+        status, _ = admin_post(self.proc.admin_port, "/api/probe", b'{"enabled": "yes"}')
+        self.assertEqual(status, 400)
+        status, _ = admin_post(self.proc.admin_port, "/api/probe", b'{"enabled": 1}')
+        self.assertEqual(status, 400)
+        status, _ = admin_post(self.proc.admin_port, "/api/probe", b'{"nope": true}')
+        self.assertEqual(status, 400)
+
+    def test_seed_persist_probe_disabled_starts_idle(self) -> None:
+        """seed_persist probe_enabled=false → 启动即空转（零 HEAD，health 零值）。"""
+        up_port, up_head_calls = make_probe_upstream()
+        proc = start_proxy(up_port, free_port(),
+                           extra_env={"CTYUN_PROBE_INTERVAL_S": "0.5"},
+                           seed_persist={"upstream_base":
+                                         "http://127.0.0.1:%d" % up_port,
+                                         "probe_enabled": False})
+        try:
+            time.sleep(1.5)  # >2 个间隔
+            self.assertEqual(len(up_head_calls), 0,
+                             "probe_enabled=false 启动后不得发 HEAD（空转不触网）")
+            _, body, _ = admin_get(proc.admin_port, "/api/health")
+            upstream = json.loads(body.decode("utf-8"))["upstream"]
+            self.assertFalse(upstream["probe_enabled"])
+            self.assertEqual(upstream["last_probe_ts"], 0)
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+            stderr_text(proc)
+            shutil.rmtree(proc.persist_dir, ignore_errors=True)
+            stop_fake_upstreams()
+
+    def test_env_probe_disabled_overrides_persist_enabled(self) -> None:
+        """CTYUN_PROBE_ENABLED=0 优先于 persist true（env > persist > 默认）。"""
+        up_port, up_head_calls = make_probe_upstream()
+        proc = start_proxy(up_port, free_port(),
+                           extra_env={"CTYUN_PROBE_INTERVAL_S": "0.5",
+                                      "CTYUN_PROBE_ENABLED": "0"},
+                           seed_persist={"upstream_base":
+                                         "http://127.0.0.1:%d" % up_port,
+                                         "probe_enabled": True})
+        try:
+            time.sleep(1.5)
+            self.assertEqual(len(up_head_calls), 0)
+            _, body, _ = admin_get(proc.admin_port, "/api/health")
+            self.assertFalse(json.loads(body.decode("utf-8"))["upstream"]["probe_enabled"])
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+            stderr_text(proc)
+            shutil.rmtree(proc.persist_dir, ignore_errors=True)
+            stop_fake_upstreams()
+
+
+class ProbeEnabledResolutionTest(unittest.TestCase):
+    """P4 卡 3 白盒：probe 开关解析/env seam/persist 读取（纯函数）。"""
+
+    def test_resolve_probe_enabled_matrix(self) -> None:
+        mod = load_proxy_module()
+        f = mod.resolve_probe_enabled
+        self.assertTrue(f("1", False))
+        self.assertTrue(f("true", False))
+        self.assertTrue(f(" YES ", False))
+        self.assertTrue(f("on", False))
+        self.assertFalse(f("0", True))
+        self.assertFalse(f("false", True))
+        self.assertFalse(f("OFF", True))
+        self.assertFalse(f("no", True))
+        self.assertTrue(f("", True))        # env 缺省 → persist
+        self.assertFalse(f("", False))      # env 缺省 → persist
+        self.assertTrue(f("banana", True))  # env 非法 → persist（不回默认）
+        self.assertFalse(f("banana", False))
+
+    def test_load_probe_enabled_defaults(self) -> None:
+        mod = load_proxy_module()
+        tmp = tempfile.mkdtemp(prefix="ctyun-proxy-p4en-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        path = os.path.join(tmp, "settings.json")
+        self.assertTrue(mod.load_probe_enabled(path))  # 缺文件 → 默认开
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"probe_enabled": False}, fh)
+        self.assertFalse(mod.load_probe_enabled(path))
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"probe_enabled": "yes"}, fh)  # 非 bool → 默认开
+        self.assertTrue(mod.load_probe_enabled(path))
+
+
 if __name__ == "__main__":
     import atexit
     atexit.register(kill_registered)
