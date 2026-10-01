@@ -2912,6 +2912,34 @@ _DASH_SECTIONS_TABLES = """  <section class="card">
          role="img" aria-label="ok / degraded / failed 占比条"></div>
     <div id="tri-state-legend" style="color:var(--dim);font-size:12px;margin-top:8px"></div>
   </section>
+  <!-- v3 T5：0-token 流聚合（被 stall/错误打断的流是健康信号，单独聚合不隐藏） -->
+  <section class="card" id="zero-token-card">
+    <div class="card-title">0-token 请求 · 所选时段（<span id="zt-range">近7天</span>）</div>
+    <div class="stats-row">
+      <div class="card stat"><div class="num amber" id="zt-count">--</div><div class="label">0-token 请求数</div></div>
+      <div class="card stat"><div class="num" id="zt-ratio">--</div><div class="label">占请求数比例</div></div>
+    </div>
+    <p class="dimmed">HTTP 完成但没有 usage token 的请求——多为被 stall/错误打断的流或空响应，持续偏高说明上游不稳。</p>
+  </section>
+  <!-- v3 T1：per-key token 用量（对齐 TPM 限流的 key 脱敏口径） -->
+  <section class="card">
+    <div class="card-title">Token 用量按 API Key · <span id="bykey-title-day">--</span>（sha256 前 12 位，跨重启保留）</div>
+    <div class="table-wrap">
+    <table>
+      <thead><tr><th>Key</th><th>请求</th><th>prompt</th><th>completion</th><th>cache</th><th>出流量</th><th>流式</th></tr></thead>
+      <tbody id="bykey-body"><tr><td class="empty" colspan="7">读取中……</td></tr></tbody>
+    </table>
+    </div>
+  </section>
+  <!-- v3 T7：月末配额投影（纯前端按 prompt+completion 口径估算） -->
+  <section class="card" id="quota-card">
+    <div class="card-title">月末 Token 投影（prompt+completion 口径）</div>
+    <div class="stats-row">
+      <div class="card stat"><div class="num" id="q-mtd">--</div><div class="label">本月至今</div></div>
+      <div class="card stat"><div class="num" id="q-days">--</div><div class="label">已过天数/全月</div></div>
+      <div class="card stat"><div class="num" id="q-proj">--</div><div class="label">按当前速率预估全月</div></div>
+    </div>
+  </section>
   </div>
   <!-- pane overview 闭（开自 _DASH_SECTIONS_STATIC，跨段闭合勿误切配对） -->
   <!-- pane requests 开 -->
@@ -2961,8 +2989,8 @@ _DASH_SECTIONS_V2 = """  <!-- pane perf 开 -->
     <div class="card-title">Token 用量按天 × 模型（<span id="token-title-range">近7天</span>，跨重启保留（每 60s 落盘））</div>
     <div class="table-wrap">
     <table>
-      <thead><tr><th>日期</th><th>模型</th><th>prompt tokens</th><th>completion tokens</th></tr></thead>
-      <tbody id="token-daily-body"><tr><td class="empty" colspan="4">读取中……</td></tr></tbody>
+      <thead><tr><th>日期</th><th>模型</th><th>prompt tokens</th><th>completion tokens</th><th>cache tokens</th><th>reasoning tokens</th></tr></thead>
+      <tbody id="token-daily-body"><tr><td class="empty" colspan="6">读取中……</td></tr></tbody>
     </table>
     </div>
   </section>
@@ -3268,6 +3296,8 @@ function applyRange() {
     renderDailyByModel(lastSnap.daily_by_model || {});
     renderTokens(lastSnap);
     renderTriState(lastSnap);
+    renderZeroToken(lastSnap);
+    renderQuota(lastSnap);
   }
 }
 function renderSpark(recent) {
@@ -3468,20 +3498,24 @@ function renderTokens(snap) {
       var ent = models[names[j]];
       var tp = ent.tokens_prompt || 0;
       var tc = ent.tokens_completion || 0;
-      if (tp + tc === 0) continue;  // 0-token 行（502/剥行等）不展示
+      var cr = ent.tokens_cache_read || 0;
+      var rn = ent.tokens_reasoning || 0;
+      if (tp + tc + cr + rn === 0) continue;  // 全零行（502/剥行等）不展示
       hasData = true;
       var tr = el("tr");
       tr.appendChild(el("td", "num", days[i]));
       tr.appendChild(el("td", "", names[j]));
       tr.appendChild(el("td", "num", String(tp)));
       tr.appendChild(el("td", "num", String(tc)));
+      tr.appendChild(el("td", "num", String(cr)));
+      tr.appendChild(el("td", "num", String(rn)));
       body.appendChild(tr);
     }
   }
   if (!hasData) {
     var tr0 = el("tr");
     var td0 = el("td", "empty", "暂无 token 用量 —— 上游返回 usage 帧后这里会出现记录");
-    td0.colSpan = 4;
+    td0.colSpan = 6;
     tr0.appendChild(td0);
     body.appendChild(tr0);
   }
@@ -3597,6 +3631,9 @@ function poll() {
       renderPerf(snap);
       renderTokens(snap);
       renderTriState(snap);
+      renderByKey(snap);
+      renderZeroToken(snap);
+      renderQuota(snap);
       setConn(true);
       hideEvtTip();  // 重渲染后旧 tooltip 指向已换的 DOM，防悬空
     })
@@ -3744,6 +3781,75 @@ $("tpm-save").addEventListener("click", function () {
     msg.textContent = "保存失败：" + String(err) + " —— 确认能访问管理接口 /api/config。";
   });
 });
+// ---- v3 卡 7：T1 per-key 表 / T5 0-token 聚合 / T7 月末投影 ----
+function renderByKey(snap) {
+  var body = $("bykey-body");
+  body.textContent = "";
+  var dbk = snap.daily_by_key || {};
+  var days = Object.keys(dbk).sort();
+  if (days.length === 0) {
+    var tr0 = el("tr");
+    var td0 = el("td", "empty",
+      "暂无 per-key 数据 —— 带 Authorization 的请求经代理后这里会出现按 key 用量");
+    td0.colSpan = 7;
+    tr0.appendChild(td0);
+    body.appendChild(tr0);
+    $("bykey-title-day").textContent = "--";
+    return;
+  }
+  var day = days[days.length - 1];
+  $("bykey-title-day").textContent = day;
+  var keys = dbk[day];
+  var names = Object.keys(keys).sort(function (a, b) {
+    return ((keys[b].tokens_prompt || 0) + (keys[b].tokens_completion || 0)) -
+           ((keys[a].tokens_prompt || 0) + (keys[a].tokens_completion || 0));
+  });
+  for (var i = 0; i < names.length; i++) {
+    var k = keys[names[i]];
+    var tr = el("tr");
+    tr.appendChild(el("td", "", names[i]));
+    tr.appendChild(el("td", "num", String(k.requests || 0)));
+    tr.appendChild(el("td", "num", String(k.tokens_prompt || 0)));
+    tr.appendChild(el("td", "num", String(k.tokens_completion || 0)));
+    tr.appendChild(el("td", "num", String(k.tokens_cache_read || 0)));
+    tr.appendChild(el("td", "num", String(k.bytes_out || 0)));
+    tr.appendChild(el("td", "num", String(k.stream_requests || 0)));
+    body.appendChild(tr);
+  }
+}
+function renderZeroToken(snap) {
+  var bounds = lastSnap && lastSnap.range_bounds && lastSnap.range_bounds[selectedRange];
+  var daily = snap.daily || {};
+  var zt = 0, req = 0;
+  var days = Object.keys(daily);
+  for (var i = 0; i < days.length; i++) {
+    if (bounds && !(bounds[0] <= days[i] && days[i] <= bounds[1])) continue;
+    zt += daily[days[i]].requests_zero_token || 0;
+    req += daily[days[i]].requests || 0;
+  }
+  $("zt-range").textContent = RANGE_LABELS[selectedRange] || selectedRange;
+  $("zt-count").textContent = String(zt);
+  $("zt-ratio").textContent = req > 0 ? (zt / req * 100).toFixed(1) + "%" : "—";
+}
+function renderQuota(snap) {
+  var daily = snap.daily || {};
+  var now = new Date();
+  function pad(n) { return (n < 10 ? "0" : "") + n; }
+  var prefix = now.getFullYear() + "-" + pad(now.getMonth() + 1) + "-";
+  var mtd = 0, daysSeen = 0;
+  var days = Object.keys(daily);
+  for (var i = 0; i < days.length; i++) {
+    if (days[i].indexOf(prefix) !== 0) continue;
+    mtd += (daily[days[i]].tokens_prompt || 0) +
+           (daily[days[i]].tokens_completion || 0);
+    daysSeen += 1;
+  }
+  var daysInMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
+  $("q-mtd").textContent = String(mtd);
+  $("q-days").textContent = daysSeen + "/" + daysInMonth;
+  $("q-proj").textContent = daysSeen > 0
+    ? String(Math.round(mtd / daysSeen * daysInMonth)) : "—";
+}
 loadTpmSettings();
 """
 
