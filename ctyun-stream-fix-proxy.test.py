@@ -583,7 +583,7 @@ class ProxyLifecycleTestCase(unittest.TestCase):
             sse_direct = post_sse(upstream_port)
         finally:
             proc.terminate()
-            proc.wait(timeout=5)
+            proc.wait(timeout=10)
             stderr = stderr_text(proc)
             shutil.rmtree(proc.persist_dir, ignore_errors=True)
             stop_fake_upstreams()
@@ -708,9 +708,7 @@ class ListenHostEnvTest(unittest.TestCase):
                 with socket.create_connection((lan_ip, proxy_port), timeout=5):
                     pass
         finally:
-            proc.terminate()
-            proc.wait(timeout=5)
-            shutil.rmtree(proc.persist_dir, ignore_errors=True)
+            stop_proxy(proc)
             stop_fake_upstreams()
 
 
@@ -2669,10 +2667,7 @@ class AdminIntegrationTest(unittest.TestCase):
         self.proc = start_proxy(self.upstream_port, self.proxy_port)
 
     def tearDown(self) -> None:
-        self.proc.terminate()
-        self.proc.wait(timeout=5)
-        stderr_text(self.proc)
-        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_proxy(self.proc)
         stop_fake_upstreams()
 
     def test_dashboard_and_stats_served(self) -> None:
@@ -2863,9 +2858,7 @@ class AdminIntegrationTest(unittest.TestCase):
             self.assertGreaterEqual(dm_entry[key], 0)
 
     def test_stats_counters_resume_from_persist(self) -> None:
-        self.proc.terminate()
-        self.proc.wait(timeout=5)
-        stderr_text(self.proc)
+        stop_proxy(self.proc)  # 含旧实例 persist_dir 清理（防重赋泄漏）
         self.proc = start_proxy(
             self.upstream_port, free_port(),
             seed_persist={"upstream_base": "http://127.0.0.1:%d" % self.upstream_port,
@@ -2884,7 +2877,7 @@ class AdminIntegrationTest(unittest.TestCase):
     def test_sigterm_persists_counters(self) -> None:
         post_sse(self.proxy_port)
         self.proc.terminate()  # SIGTERM → handler 落盘
-        self.proc.wait(timeout=5)
+        self.proc.wait(timeout=10)
         with open(os.path.join(self.proc.persist_dir, "settings.json"),
                   encoding="utf-8") as fh:
             data = json.load(fh)
@@ -2894,7 +2887,7 @@ class AdminIntegrationTest(unittest.TestCase):
     def test_req_log_line_has_ts_and_model(self) -> None:
         post_sse(self.proxy_port)
         self.proc.terminate()
-        self.proc.wait(timeout=5)
+        self.proc.wait(timeout=10)
         stderr = stderr_text(self.proc)
         m = re.search(r"^REQ POST /v1/chat/completions -> \d+ dur=\d+\.\ds "
                       r"result=\S+ filtered=\d+ "
@@ -2922,7 +2915,7 @@ class AdminIntegrationTest(unittest.TestCase):
         conn.close()
         self.assertEqual(status, 502, "上游不可达必须由代理合成 502")
         proc.terminate()
-        proc.wait(timeout=5)
+        proc.wait(timeout=10)
         stderr = stderr_text(proc)
         m = re.search(r"^REQ POST /v1/chat/completions -> 502 dur=\d+\.\ds "
                       r"result=error .*? exc=(\S+)\s+rid=", stderr, re.M)
@@ -2933,7 +2926,7 @@ class AdminIntegrationTest(unittest.TestCase):
     def test_client_abort_is_quiet_and_not_error(self) -> None:
         upstream_port = make_fake_upstream(False, big=True)
         self.proc.terminate()
-        self.proc.wait(timeout=5)
+        self.proc.wait(timeout=10)
         stderr_text(self.proc)
         self.proc = start_proxy(upstream_port, free_port(),
                                 extra_env={"CTYUN_SEND_TIMEOUT": "1"})
@@ -2958,7 +2951,7 @@ class AdminIntegrationTest(unittest.TestCase):
         self.assertEqual(snap["errors_total"], 0,
                          "client abort must not count into errors_total")
         self.proc.terminate()
-        self.proc.wait(timeout=5)
+        self.proc.wait(timeout=10)
         stderr = stderr_text(self.proc)
         self.assertIn("result=aborted", stderr)
         self.assertIn("model=-", stderr)  # 499 abort 不传 model → 占位符 -
@@ -2966,10 +2959,7 @@ class AdminIntegrationTest(unittest.TestCase):
                          "client abort must not produce handle_error traceback")
 
     def test_config_post_localhost_allowed_even_with_token_env(self) -> None:
-        self.proc.terminate()
-        self.proc.wait(timeout=5)
-        stderr_text(self.proc)
-        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_proxy(self.proc)
         stop_fake_upstreams()
         upstream_port = make_fake_upstream(False)
         self.proc = start_proxy(self.upstream_port, free_port(),
@@ -2988,7 +2978,7 @@ class AdminIntegrationTest(unittest.TestCase):
         self.assertIn(today, snap["daily"])
         self.assertGreaterEqual(snap["daily"][today]["requests"], 1)
         self.proc.terminate()
-        self.proc.wait(timeout=5)
+        self.proc.wait(timeout=10)
         stderr_text(self.proc)
         with open(os.path.join(self.proc.persist_dir, "settings.json"),
                   encoding="utf-8") as fh:
@@ -2997,10 +2987,7 @@ class AdminIntegrationTest(unittest.TestCase):
                                 "daily buckets must persist on SIGTERM")
 
     def test_upstream_500_counts_into_daily_errors_upstream(self) -> None:
-        self.proc.terminate()
-        self.proc.wait(timeout=5)
-        stderr_text(self.proc)
-        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_proxy(self.proc)
         stop_fake_upstreams()
         bad_port = make_fake_upstream(False, fail_500=True)
         self.proc = start_proxy(bad_port, free_port())
@@ -3018,7 +3005,7 @@ class AdminIntegrationTest(unittest.TestCase):
         self.assertEqual(snap["errors_total"], 0,
                          "upstream 5xx passthrough must not touch errors_total")
         self.proc.terminate()
-        self.proc.wait(timeout=5)
+        self.proc.wait(timeout=10)
         stderr_text(self.proc)
         with open(os.path.join(self.proc.persist_dir, "settings.json"),
                   encoding="utf-8") as fh:
@@ -3026,11 +3013,7 @@ class AdminIntegrationTest(unittest.TestCase):
         self.assertGreaterEqual(saved[today]["errors_upstream"], 1)
 
     def test_daily_buckets_resume_from_persist(self) -> None:
-        self.proc.terminate()
-        # 系统忙时 SIGTERM 落盘 + server_close 偶发超过 5s（实测两连挂、复刻秒退），
-        # 放宽到 10s 只吸收慢、不掩盖死锁
-        self.proc.wait(timeout=10)
-        stderr_text(self.proc)
+        stop_proxy(self.proc)  # 默认 timeout=10 吸收 SIGTERM 慢落盘；含旧 dir 清理
         self.proc = start_proxy(
             self.upstream_port, free_port(),
             seed_persist={"upstream_base": "http://127.0.0.1:%d" % self.upstream_port,
@@ -3046,7 +3029,7 @@ class AdminIntegrationTest(unittest.TestCase):
 
     def test_events_resume_from_persist(self) -> None:
         self.proc.terminate()
-        self.proc.wait(timeout=5)
+        self.proc.wait(timeout=10)
         stderr_text(self.proc)
         seeded = [{"ts": 1757654300.5, "kind": "proxy", "model": None, "status": 502},
                   {"ts": 1757654301.5, "kind": "retry", "model": "m-a", "status": None}]
@@ -3062,7 +3045,7 @@ class AdminIntegrationTest(unittest.TestCase):
     def test_empty_stream_retried_and_second_attempt_relayed(self) -> None:
         upstream_port, calls = make_scripted_upstream()
         self.proc.terminate()
-        self.proc.wait(timeout=5)
+        self.proc.wait(timeout=10)
         stderr_text(self.proc)
         self.proc = start_proxy(upstream_port, free_port())
         data = post_sse(self.proc.proxy_port)
@@ -3071,7 +3054,7 @@ class AdminIntegrationTest(unittest.TestCase):
         self.assertEqual(data, SSE_A + SSE_B + SSE_DONE,
                          "attempt-2 must relay byte-exact stream, got %r" % data)
         self.proc.terminate()
-        self.proc.wait(timeout=5)
+        self.proc.wait(timeout=10)
         stderr = stderr_text(self.proc)
         self.assertIn("retried=1", stderr,
                       "REQ line must carry retried=1, stderr:\n" + stderr)
@@ -3080,7 +3063,7 @@ class AdminIntegrationTest(unittest.TestCase):
         upstream_port, calls = make_scripted_upstream(
             body_override=SSE_REASONING + SSE_A + SSE_DONE)
         self.proc.terminate()
-        self.proc.wait(timeout=5)
+        self.proc.wait(timeout=10)
         stderr_text(self.proc)
         self.proc = start_proxy(upstream_port, free_port())
         data = post_sse(self.proc.proxy_port)
@@ -3093,7 +3076,7 @@ class AdminIntegrationTest(unittest.TestCase):
         upstream_port, calls = make_scripted_upstream(
             body_override=SSE_REASONING + SSE_DONE)
         self.proc.terminate()
-        self.proc.wait(timeout=5)
+        self.proc.wait(timeout=10)
         stderr_text(self.proc)
         self.proc = start_proxy(upstream_port, free_port())
         data = post_sse(self.proc.proxy_port)
@@ -3104,7 +3087,7 @@ class AdminIntegrationTest(unittest.TestCase):
     def test_double_empty_stream_falls_back_after_two_calls(self) -> None:
         upstream_port, calls = make_scripted_upstream(empty_stream=True)
         self.proc.terminate()
-        self.proc.wait(timeout=5)
+        self.proc.wait(timeout=10)
         stderr_text(self.proc)
         self.proc = start_proxy(upstream_port, free_port())
         data = post_sse(self.proc.proxy_port)
@@ -3117,7 +3100,7 @@ class AdminIntegrationTest(unittest.TestCase):
     def test_zero_record_empty_200_retried(self) -> None:
         upstream_port, calls = make_scripted_upstream(empty_stream=True, blank_stream=True)
         self.proc.terminate()
-        self.proc.wait(timeout=5)
+        self.proc.wait(timeout=10)
         stderr_text(self.proc)
         self.proc = start_proxy(upstream_port, free_port())
         data = post_sse(self.proc.proxy_port)
@@ -3127,7 +3110,7 @@ class AdminIntegrationTest(unittest.TestCase):
     def test_ctyun_empty_retry_zero_disables(self) -> None:
         upstream_port, calls = make_scripted_upstream(empty_stream=True)
         self.proc.terminate()
-        self.proc.wait(timeout=5)
+        self.proc.wait(timeout=10)
         stderr_text(self.proc)
         self.proc = start_proxy(upstream_port, free_port(),
                                 extra_env={"CTYUN_EMPTY_RETRY": "0"})
@@ -3139,13 +3122,13 @@ class AdminIntegrationTest(unittest.TestCase):
     def test_empty_retry_counter_persists_and_resumes(self) -> None:
         upstream_port, calls = make_scripted_upstream()
         self.proc.terminate()
-        self.proc.wait(timeout=5)
+        self.proc.wait(timeout=10)
         stderr_text(self.proc)
         self.proc = start_proxy(upstream_port, free_port())
         post_sse(self.proc.proxy_port)
         self.assertEqual(len(calls), 2)
         self.proc.terminate()  # SIGTERM → handler 落盘
-        self.proc.wait(timeout=5)
+        self.proc.wait(timeout=10)
         with open(os.path.join(self.proc.persist_dir, "settings.json"),
                   encoding="utf-8") as fh:
             saved = json.load(fh)
@@ -3170,7 +3153,7 @@ class AdminIntegrationTest(unittest.TestCase):
         # spec 用例 ①：有 content 无 [DONE] 即 EOF（上游截断签名，R31 现场复刻）
         upstream_port, calls = make_scripted_upstream(body_override=SSE_A + SSE_B)
         self.proc.terminate()
-        self.proc.wait(timeout=5)
+        self.proc.wait(timeout=10)
         stderr_text(self.proc)
         self.proc = start_proxy(upstream_port, free_port())
         data = post_sse(self.proc.proxy_port)
@@ -3189,7 +3172,7 @@ class AdminIntegrationTest(unittest.TestCase):
             snap["daily_by_model"][today]["deepseek-v4-pro-0813-oc"]["eof_without_done"], 1,
             "eof-without-done must count into daily_by_model")
         self.proc.terminate()  # SIGTERM → handler 落盘
-        self.proc.wait(timeout=5)
+        self.proc.wait(timeout=10)
         stderr = stderr_text(self.proc)
         self.assertIn("result=eof-without-done", stderr,
                       "REQ line must carry result=eof-without-done, stderr:\n" + stderr)
@@ -3217,7 +3200,7 @@ class AdminIntegrationTest(unittest.TestCase):
         self.assertEqual(json.loads(body.decode("utf-8"))["eof_without_done_total"], 0,
                          "normal done-terminated stream must not trip eof counter")
         self.proc.terminate()
-        self.proc.wait(timeout=5)
+        self.proc.wait(timeout=10)
         stderr = stderr_text(self.proc)
         self.assertIn("result=ok", stderr,
                       "normal stream must stay result=ok, stderr:\n" + stderr)
@@ -3232,7 +3215,7 @@ class AdminIntegrationTest(unittest.TestCase):
         self.assertEqual(json.loads(body.decode("utf-8"))["eof_without_done_total"], 0,
                          "reasoning+[DONE] stream must not trip eof counter")
         self.proc.terminate()
-        self.proc.wait(timeout=5)
+        self.proc.wait(timeout=10)
         stderr = stderr_text(self.proc)
         self.assertIn("result=ok", stderr,
                       "reasoning+[DONE] stream must stay result=ok, stderr:\n" + stderr)
@@ -3242,7 +3225,7 @@ class AdminIntegrationTest(unittest.TestCase):
         # spec 用例 ③：双空流 fallback（priming 路径 EOF 不加标记，避免与 retries 双计数）
         upstream_port, calls = make_scripted_upstream(empty_stream=True)
         self.proc.terminate()
-        self.proc.wait(timeout=5)
+        self.proc.wait(timeout=10)
         stderr_text(self.proc)
         self.proc = start_proxy(upstream_port, free_port())
         data = post_sse(self.proc.proxy_port)
@@ -3252,7 +3235,7 @@ class AdminIntegrationTest(unittest.TestCase):
         self.assertEqual(json.loads(body.decode("utf-8"))["eof_without_done_total"], 0,
                          "priming-stage EOF must not trip eof counter")
         self.proc.terminate()
-        self.proc.wait(timeout=5)
+        self.proc.wait(timeout=10)
         stderr = stderr_text(self.proc)
         self.assertNotIn("eof-without-done", stderr,
                          "priming-stage EOF (empty stream fallback) must not be marked "
@@ -3263,7 +3246,7 @@ class AdminIntegrationTest(unittest.TestCase):
         upstream_port, calls = make_scripted_upstream(
             body_override=SSE_REASONING + SSE_FINISH + SSE_USAGE + SSE_DONE)
         self.proc.terminate()
-        self.proc.wait(timeout=5)
+        self.proc.wait(timeout=10)
         stderr_text(self.proc)
         self.proc = start_proxy(upstream_port, free_port())
         data = post_sse(self.proc.proxy_port)
@@ -3272,7 +3255,7 @@ class AdminIntegrationTest(unittest.TestCase):
         self.assertEqual(data, SSE_REASONING + SSE_FINISH + SSE_USAGE + SSE_DONE,
                          "legal zero-content stream must relay byte-exact, got %r" % data)
         self.proc.terminate()
-        self.proc.wait(timeout=5)
+        self.proc.wait(timeout=10)
         stderr = stderr_text(self.proc)
         self.assertIn("result=ok", stderr,
                       "legal stream must stay result=ok, stderr:\n" + stderr)
@@ -3283,7 +3266,7 @@ class AdminIntegrationTest(unittest.TestCase):
         upstream_port, calls = make_scripted_upstream(
             fault_finish_first=True, body_override=SSE_A + SSE_B + SSE_DONE)
         self.proc.terminate()
-        self.proc.wait(timeout=5)
+        self.proc.wait(timeout=10)
         stderr_text(self.proc)
         self.proc = start_proxy(upstream_port, free_port())
         data = post_sse(self.proc.proxy_port)
@@ -3292,7 +3275,7 @@ class AdminIntegrationTest(unittest.TestCase):
         self.assertEqual(data, SSE_A + SSE_B + SSE_DONE,
                          "attempt-2 must relay byte-exact stream, got %r" % data)
         self.proc.terminate()
-        self.proc.wait(timeout=5)
+        self.proc.wait(timeout=10)
         stderr = stderr_text(self.proc)
         self.assertIn("retried=1", stderr,
                       "REQ line must carry retried=1, stderr:\n" + stderr)
@@ -3303,7 +3286,7 @@ class AdminIntegrationTest(unittest.TestCase):
         """双 finish 故障：fault_finish_stream 每呼回故障尾段 → calls==2 fallback。"""
         upstream_port, calls = make_scripted_upstream(fault_finish_stream=True)
         self.proc.terminate()
-        self.proc.wait(timeout=5)
+        self.proc.wait(timeout=10)
         stderr_text(self.proc)
         self.proc = start_proxy(upstream_port, free_port())
         data = post_sse(self.proc.proxy_port)
@@ -3318,7 +3301,7 @@ class AdminIntegrationTest(unittest.TestCase):
         upstream_port, calls = make_scripted_upstream(
             fault_finish_first=True, body_override=SSE_A + SSE_B + SSE_DONE)
         self.proc.terminate()
-        self.proc.wait(timeout=5)
+        self.proc.wait(timeout=10)
         stderr_text(self.proc)
         self.proc = start_proxy(upstream_port, free_port())
         post_sse(self.proc.proxy_port)
@@ -3333,7 +3316,7 @@ class AdminIntegrationTest(unittest.TestCase):
         self.assertGreaterEqual(
             snap["daily_by_model"][today]["deepseek-v4-pro-0813-oc"]["retries"], 1)
         self.proc.terminate()  # SIGTERM → handler 落盘
-        self.proc.wait(timeout=5)
+        self.proc.wait(timeout=10)
         with open(os.path.join(self.proc.persist_dir, "settings.json"),
                   encoding="utf-8") as fh:
             saved = json.load(fh)["stats"]
@@ -3359,7 +3342,7 @@ class AdminIntegrationTest(unittest.TestCase):
         upstream_port, calls = make_scripted_upstream(
             body_override=SSE_REASONING + SSE_FINISH + SSE_A + SSE_DONE)
         self.proc.terminate()
-        self.proc.wait(timeout=5)
+        self.proc.wait(timeout=10)
         stderr_text(self.proc)
         self.proc = start_proxy(upstream_port, free_port())
         data = post_sse(self.proc.proxy_port)
@@ -3372,7 +3355,7 @@ class AdminIntegrationTest(unittest.TestCase):
         """CTYUN_EMPTY_RETRY=0：finish 故障不重试，原样下发。"""
         upstream_port, calls = make_scripted_upstream(fault_finish_first=True)
         self.proc.terminate()
-        self.proc.wait(timeout=5)
+        self.proc.wait(timeout=10)
         stderr_text(self.proc)
         self.proc = start_proxy(upstream_port, free_port(),
                                 extra_env={"CTYUN_EMPTY_RETRY": "0"})
@@ -3389,7 +3372,7 @@ class AdminIntegrationTest(unittest.TestCase):
         body = SSE_REASONING + SSE_FINISH + big_noise + SSE_DONE
         upstream_port, calls = make_scripted_upstream(body_override=body)
         self.proc.terminate()
-        self.proc.wait(timeout=5)
+        self.proc.wait(timeout=10)
         stderr_text(self.proc)
         self.proc = start_proxy(upstream_port, free_port())
         data = post_sse(self.proc.proxy_port)
@@ -3403,7 +3386,7 @@ class AdminIntegrationTest(unittest.TestCase):
         """端到端：assistant content:null 经代理后上游收到 content:"" 归一体；
         无 null 的请求上游收到字节级一致 body。"""
         self.proc.terminate()
-        self.proc.wait(timeout=5)
+        self.proc.wait(timeout=10)
         stderr_text(self.proc)
         upstream_port, bodies = make_body_recording_upstream()
         self.proc = start_proxy(upstream_port, free_port())
@@ -3479,10 +3462,7 @@ class AdminIntegrationTest(unittest.TestCase):
 
     def test_errors_endpoint_kind_upstream_5xx(self) -> None:
         """上游 500 + capture_errors on → /api/errors kind=upstream_5xx 且 ?id= 含 response。"""
-        self.proc.terminate()
-        self.proc.wait(timeout=5)
-        stderr_text(self.proc)
-        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_proxy(self.proc)
         stop_fake_upstreams()
         bad_port = make_fake_upstream(False, fail_500=True)
         self.proc = start_proxy(bad_port, free_port())
@@ -3515,10 +3495,7 @@ class AdminIntegrationTest(unittest.TestCase):
     def test_errors_detail_by_id_and_bad_params(self) -> None:
         """?id= 详情（含 body/response/exc）；404/400 分支。"""
         dead_port = free_port()
-        self.proc.terminate()
-        self.proc.wait(timeout=5)
-        stderr_text(self.proc)
-        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_proxy(self.proc)
         stop_fake_upstreams()
         self.proc = start_proxy(dead_port, free_port(),
                                 extra_env={"CTYUN_ADMIN_TOKEN": "sekret"})
@@ -3560,10 +3537,7 @@ class AdminIntegrationTest(unittest.TestCase):
 
     def test_errors_poison_hit(self) -> None:
         """poison=True 上游 + capture_errors on → kind=poison_hit。"""
-        self.proc.terminate()
-        self.proc.wait(timeout=5)
-        stderr_text(self.proc)
-        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_proxy(self.proc)
         stop_fake_upstreams()
         poison_port = make_fake_upstream(True)
         self.proc = start_proxy(poison_port, free_port())
@@ -3585,10 +3559,7 @@ class AdminIntegrationTest(unittest.TestCase):
         # eof_without_done 的真实签名是"有 content 无 [DONE] 即 EOF"（与既有
         # test_eof_without_done_marked_counted_and_persisted 同场景），故本测试用
         # body_override=SSE_A+SSE_B 复刻。五种 kind 的集成覆盖不受影响。
-        self.proc.terminate()
-        self.proc.wait(timeout=5)
-        stderr_text(self.proc)
-        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_proxy(self.proc)
         stop_fake_upstreams()
         upstream_port, calls = make_scripted_upstream(body_override=SSE_A + SSE_B)
         self.proc = start_proxy(upstream_port, free_port())
@@ -3604,10 +3575,7 @@ class AdminIntegrationTest(unittest.TestCase):
 
     def test_errors_empty_retry(self) -> None:
         """空流重试 + capture_errors on → kind=empty_retry。"""
-        self.proc.terminate()
-        self.proc.wait(timeout=5)
-        stderr_text(self.proc)
-        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_proxy(self.proc)
         stop_fake_upstreams()
         upstream_port, calls = make_scripted_upstream()
         self.proc = start_proxy(upstream_port, free_port())
@@ -3628,7 +3596,7 @@ class AdminIntegrationTest(unittest.TestCase):
             json.dumps({"upstream_base": "http://127.0.0.1:%d" % self.upstream_port,
                         "capture_errors": True}).encode("utf-8"))
         self.proc.terminate()
-        self.proc.wait(timeout=5)
+        self.proc.wait(timeout=10)
         stderr_text(self.proc)
         # 重启并 seed 持久化文件
         persist_path = os.path.join(self.proc.persist_dir, "settings.json")
@@ -3705,10 +3673,7 @@ class AdminIntegrationTest(unittest.TestCase):
         self.assertEqual(after, before,
                          "normal SSE must not increment errors_total")
         # 502 合成错误应 +1
-        self.proc.terminate()
-        self.proc.wait(timeout=5)
-        stderr_text(self.proc)
-        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_proxy(self.proc)
         stop_fake_upstreams()
         dead_port = free_port()
         self.proc = start_proxy(dead_port, free_port())
@@ -3726,7 +3691,7 @@ class AdminIntegrationTest(unittest.TestCase):
         """stall_calls=(1,) → 首呼 stall 触发 header-timeout 重试 → 次呼正常 → calls==2 + SSE 完整。"""
         upstream_port, calls = make_stall_upstream(stall_calls=(1,))
         self.proc.terminate()
-        self.proc.wait(timeout=5)
+        self.proc.wait(timeout=10)
         stderr_text(self.proc)
         self.proc = start_proxy(upstream_port, free_port(),
                                 extra_env={"CTYUN_HEADER_TIMEOUT": "1"})
@@ -3737,7 +3702,7 @@ class AdminIntegrationTest(unittest.TestCase):
                          "attempt-2 must relay byte-exact stream, got %r" % data)
         # header_timeout 留痕事件
         self.proc.terminate()
-        self.proc.wait(timeout=5)
+        self.proc.wait(timeout=10)
         stderr = stderr_text(self.proc)
         self.assertIn("retried=1", stderr,
                       "REQ line must carry retried=1, stderr:\n" + stderr)
@@ -3755,7 +3720,7 @@ class AdminIntegrationTest(unittest.TestCase):
         """sleep_stall_calls=(1,) → 首呼持连静默到 socket.timeout 触发 header-timeout 重试 → 次呼正常 → calls==2 + SSE 完整。"""
         upstream_port, calls = make_sleep_stall_upstream(sleep_stall_calls=(1,))
         self.proc.terminate()
-        self.proc.wait(timeout=5)
+        self.proc.wait(timeout=10)
         stderr_text(self.proc)
         self.proc = start_proxy(upstream_port, free_port(),
                                 extra_env={"CTYUN_HEADER_TIMEOUT": "1"})
@@ -3766,7 +3731,7 @@ class AdminIntegrationTest(unittest.TestCase):
                          "attempt-2 must relay byte-exact stream, got %r" % data)
         # REQ 日志含 retried=1 + retry_reason=header-timeout
         self.proc.terminate()
-        self.proc.wait(timeout=5)
+        self.proc.wait(timeout=10)
         stderr = stderr_text(self.proc)
         self.assertIn("retried=1", stderr,
                       "REQ line must carry retried=1, stderr:\n" + stderr)
@@ -3783,7 +3748,7 @@ class AdminIntegrationTest(unittest.TestCase):
         """stall_all → 首呼+重试均超时 → 502 + calls==2 + synth_502 留痕含 retried=1。"""
         upstream_port, calls = make_stall_upstream(stall_all=True)
         self.proc.terminate()
-        self.proc.wait(timeout=5)
+        self.proc.wait(timeout=10)
         stderr_text(self.proc)
         self.proc = start_proxy(upstream_port, free_port(),
                                 extra_env={"CTYUN_HEADER_TIMEOUT": "1"})
@@ -3799,7 +3764,7 @@ class AdminIntegrationTest(unittest.TestCase):
         self.assertEqual(len(calls), 2,
                          "stall_all must trigger exactly one retry then fail, calls=%d" % len(calls))
         self.proc.terminate()
-        self.proc.wait(timeout=5)
+        self.proc.wait(timeout=10)
         stderr = stderr_text(self.proc)
         self.assertIn("retried=1", stderr,
                       "502 REQ line must carry retried=1, stderr:\n" + stderr)
@@ -3810,7 +3775,7 @@ class AdminIntegrationTest(unittest.TestCase):
         """CTYUN_HEADER_RETRY=0 + stall_all → 502 + calls==1（不重试）。"""
         upstream_port, calls = make_stall_upstream(stall_all=True)
         self.proc.terminate()
-        self.proc.wait(timeout=5)
+        self.proc.wait(timeout=10)
         stderr_text(self.proc)
         self.proc = start_proxy(upstream_port, free_port(),
                                 extra_env={"CTYUN_HEADER_TIMEOUT": "1",
@@ -3831,7 +3796,7 @@ class AdminIntegrationTest(unittest.TestCase):
         """rst_calls=(1,) → 首呼 RST 触发 conn-reset 重试 → 次呼正常 → calls==2 + SSE 完整。"""
         upstream_port, calls = make_rst_upstream(rst_calls=(1,))
         self.proc.terminate()
-        self.proc.wait(timeout=5)
+        self.proc.wait(timeout=10)
         stderr_text(self.proc)
         self.proc = start_proxy(upstream_port, free_port(),
                                 extra_env={"CTYUN_HEADER_TIMEOUT": "1"})
@@ -3841,7 +3806,7 @@ class AdminIntegrationTest(unittest.TestCase):
         self.assertEqual(data, SSE_A + SSE_B + SSE_DONE,
                          "attempt-2 must relay byte-exact stream, got %r" % data)
         self.proc.terminate()
-        self.proc.wait(timeout=5)
+        self.proc.wait(timeout=10)
         stderr = stderr_text(self.proc)
         self.assertIn("retried=1", stderr,
                       "REQ line must carry retried=1, stderr:\n" + stderr)
@@ -3857,7 +3822,7 @@ class AdminIntegrationTest(unittest.TestCase):
         """rst_all → 首呼+重试均 RST → 502 + calls==2 + synth_502 留痕含 retried=1 / conn-reset。"""
         upstream_port, calls = make_rst_upstream(rst_all=True)
         self.proc.terminate()
-        self.proc.wait(timeout=5)
+        self.proc.wait(timeout=10)
         stderr_text(self.proc)
         self.proc = start_proxy(upstream_port, free_port(),
                                 extra_env={"CTYUN_HEADER_TIMEOUT": "1"})
@@ -3873,7 +3838,7 @@ class AdminIntegrationTest(unittest.TestCase):
         self.assertEqual(len(calls), 2,
                          "rst_all must trigger exactly one retry then fail, calls=%d" % len(calls))
         self.proc.terminate()
-        self.proc.wait(timeout=5)
+        self.proc.wait(timeout=10)
         stderr = stderr_text(self.proc)
         self.assertIn("retried=1", stderr,
                       "502 REQ line must carry retried=1, stderr:\n" + stderr)
@@ -3924,7 +3889,7 @@ class AdminIntegrationTest(unittest.TestCase):
         upstream_port = server.server_address[1]
 
         self.proc.terminate()
-        self.proc.wait(timeout=5)
+        self.proc.wait(timeout=10)
         stderr_text(self.proc)
         self.proc = start_proxy(upstream_port, free_port(),
                                 extra_env={"CTYUN_HEADER_TIMEOUT": "1"})
@@ -3935,7 +3900,7 @@ class AdminIntegrationTest(unittest.TestCase):
                          "drip stream must relay completely despite chunks spaced > HEADER_TIMEOUT_S, "
                          "proving body-phase timeout remains UPSTREAM_TIMEOUT. Got: %r" % data)
         self.proc.terminate()
-        self.proc.wait(timeout=5)
+        self.proc.wait(timeout=10)
         stderr = stderr_text(self.proc)
         self.assertIn("result=ok", stderr,
                       "drip stream must stay result=ok, stderr:\n" + stderr)
@@ -3948,7 +3913,7 @@ class AdminIntegrationTest(unittest.TestCase):
         upstream_port, calls = make_stall_upstream(
             stall_calls=(1,), empty_stream_calls=(2,))
         self.proc.terminate()
-        self.proc.wait(timeout=5)
+        self.proc.wait(timeout=10)
         stderr_text(self.proc)
         self.proc = start_proxy(upstream_port, free_port(),
                                 extra_env={"CTYUN_HEADER_TIMEOUT": "1"})
@@ -3961,7 +3926,7 @@ class AdminIntegrationTest(unittest.TestCase):
         self.assertEqual(data, SSE_A + SSE_B + SSE_DONE,
                          "attempt-3 must relay byte-exact stream, got %r" % data)
         self.proc.terminate()
-        self.proc.wait(timeout=5)
+        self.proc.wait(timeout=10)
         stderr = stderr_text(self.proc)
         self.assertIn("retried=2", stderr,
                       "compound scenario must carry retried=2, stderr:\n" + stderr)
@@ -4007,18 +3972,12 @@ class BodyErrorTest(unittest.TestCase):
 
     def tearDown(self) -> None:
         if self.proc:
-            self.proc.terminate()
-            self.proc.wait(timeout=5)
-            stderr_text(self.proc)
-            shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+            stop_proxy(self.proc)
             stop_fake_upstreams()
 
     def test_sse_body_error_classified_and_logged(self) -> None:
         """SSE error 帧 -> stderr REQ 行 result=body-err + /api/stats errors_total +1。"""
-        self.proc.terminate()
-        self.proc.wait(timeout=5)
-        stderr_text(self.proc)
-        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_proxy(self.proc)
         stop_fake_upstreams()
         body = SSE_A + SSE_ERROR_FRAME + SSE_DONE
         upstream_port, calls = make_scripted_upstream(body_override=body)
@@ -4035,17 +3994,14 @@ class BodyErrorTest(unittest.TestCase):
         self.assertGreaterEqual(snap["daily"][today]["errors_proxy"], 1,
                                 "daily errors_proxy must increment for body error")
         self.proc.terminate()
-        self.proc.wait(timeout=5)
+        self.proc.wait(timeout=10)
         stderr = stderr_text(self.proc)
         self.assertIn("result=body-err", stderr,
                       "REQ line must carry result=body-err, stderr:\n" + stderr)
 
     def test_body_error_no_retry(self) -> None:
         """SSE error 帧流不触发空流重试（calls==1）。"""
-        self.proc.terminate()
-        self.proc.wait(timeout=5)
-        stderr_text(self.proc)
-        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_proxy(self.proc)
         stop_fake_upstreams()
         body = SSE_ERROR_FRAME + SSE_DONE
         upstream_port, calls = make_scripted_upstream(body_override=body)
@@ -4056,17 +4012,14 @@ class BodyErrorTest(unittest.TestCase):
         self.assertEqual(data, body,
                          "error-only stream must relay as-is, got %r" % data[:200])
         self.proc.terminate()
-        self.proc.wait(timeout=5)
+        self.proc.wait(timeout=10)
         stderr = stderr_text(self.proc)
         self.assertIn("result=body-err", stderr,
                       "error-only stream must carry result=body-err, stderr:\n" + stderr)
 
     def test_buffered_body_error(self) -> None:
         """非流式 200 + JSON error body -> result=body-err，errors_total +1。"""
-        self.proc.terminate()
-        self.proc.wait(timeout=5)
-        stderr_text(self.proc)
-        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_proxy(self.proc)
         stop_fake_upstreams()
         upstream_port = make_fake_upstream(False, fail_200_error=True)
         self.proc = start_proxy(upstream_port, free_port())
@@ -4087,17 +4040,14 @@ class BodyErrorTest(unittest.TestCase):
         self.assertGreaterEqual(snap["daily"][today]["errors_proxy"], 1,
                                 "non-SSE body error must increment daily errors_proxy")
         self.proc.terminate()
-        self.proc.wait(timeout=5)
+        self.proc.wait(timeout=10)
         stderr = stderr_text(self.proc)
         self.assertIn("result=body-err", stderr,
                       "non-SSE error must log result=body-err, stderr:\n" + stderr)
 
     def test_sse_body_error_recorded(self) -> None:
         """capture_errors on + SSE error 帧 -> /api/errors kind=body_error，detail 含 response。"""
-        self.proc.terminate()
-        self.proc.wait(timeout=5)
-        stderr_text(self.proc)
-        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_proxy(self.proc)
         stop_fake_upstreams()
         body = SSE_A + SSE_ERROR_FRAME + SSE_DONE
         upstream_port, calls = make_scripted_upstream(body_override=body)
@@ -4127,10 +4077,7 @@ class BodyErrorTest(unittest.TestCase):
 
     def test_sse_content_mentioning_error_not_flagged(self) -> None:
         """content 文本含 'error' 字样 -> result=ok，零误判。"""
-        self.proc.terminate()
-        self.proc.wait(timeout=5)
-        stderr_text(self.proc)
-        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_proxy(self.proc)
         stop_fake_upstreams()
         body = (SSE_A +
                 b'data: {"choices":[{"delta":{"content":"error occurred"}}]}\n\n' +
@@ -4145,7 +4092,7 @@ class BodyErrorTest(unittest.TestCase):
         self.assertEqual(snap["errors_total"], 0,
                          "false positive must not increment errors_total")
         self.proc.terminate()
-        self.proc.wait(timeout=5)
+        self.proc.wait(timeout=10)
         stderr = stderr_text(self.proc)
         self.assertIn("result=ok", stderr,
                       "content with 'error' text must stay result=ok, stderr:\n" + stderr)
@@ -4254,10 +4201,7 @@ class TokenRelayTest(unittest.TestCase):
         self.proc = start_proxy(upstream_port, self.proxy_port)
 
     def tearDown(self) -> None:
-        self.proc.terminate()
-        self.proc.wait(timeout=5)
-        stderr_text(self.proc)
-        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_proxy(self.proc)
         stop_fake_upstreams()
 
     def test_sse_usage_frame_lands_in_daily_by_model(self) -> None:
@@ -4299,10 +4243,7 @@ class ModelPricingSeamTest(unittest.TestCase):
         self.proc = start_proxy(self.upstream_port, self.proxy_port)
 
     def tearDown(self) -> None:
-        self.proc.terminate()
-        self.proc.wait(timeout=5)
-        stderr_text(self.proc)
-        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_proxy(self.proc)
         stop_fake_upstreams()
 
     def test_default_off_persists_empty_schema(self) -> None:
@@ -4313,7 +4254,7 @@ class ModelPricingSeamTest(unittest.TestCase):
                          "model_pricing must default to {} (cost UI off)")
         post_sse(self.proxy_port)   # 触发一次 dirty 落盘
         self.proc.terminate()
-        self.proc.wait(timeout=5)
+        self.proc.wait(timeout=10)
         stderr_text(self.proc)
         with open(os.path.join(self.proc.persist_dir, "settings.json"),
                   encoding="utf-8") as fh:
@@ -4323,10 +4264,7 @@ class ModelPricingSeamTest(unittest.TestCase):
 
     def test_env_seam_overrides_persist(self) -> None:
         """CTYUN_MODEL_PRICING env JSON → /api/config 回显该 dict（默认 off 被覆盖）。"""
-        self.proc.terminate()
-        self.proc.wait(timeout=5)
-        stderr_text(self.proc)
-        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_proxy(self.proc)
         pricing = {"deepseek-v4": {"prompt": 0.1, "completion": 0.2}}
         self.proc = start_proxy(
             self.upstream_port, free_port(),
@@ -4338,10 +4276,7 @@ class ModelPricingSeamTest(unittest.TestCase):
 
     def test_bad_env_json_falls_back_empty(self) -> None:
         """非法 JSON env → {} 不崩。"""
-        self.proc.terminate()
-        self.proc.wait(timeout=5)
-        stderr_text(self.proc)
-        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_proxy(self.proc)
         self.proc = start_proxy(self.upstream_port, free_port(),
                                 extra_env={"CTYUN_MODEL_PRICING": "{not-json"})
         _, body, _ = admin_get(self.proc.admin_port, "/api/config")
@@ -4350,10 +4285,7 @@ class ModelPricingSeamTest(unittest.TestCase):
 
     def test_persist_resume_roundtrip(self) -> None:
         """persist 文件已有 model_pricing（无 env）→ 重启后 /api/config 回读同值。"""
-        self.proc.terminate()
-        self.proc.wait(timeout=5)
-        stderr_text(self.proc)
-        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_proxy(self.proc)
         pricing = {"m-x": {"prompt": 1.5, "completion": 2.5}}
         self.proc = start_proxy(
             self.upstream_port, free_port(),
@@ -4377,10 +4309,7 @@ class TokenPersistTest(unittest.TestCase):
         self.proc = start_proxy(self.upstream_port, self.proxy_port)
 
     def tearDown(self) -> None:
-        self.proc.terminate()
-        self.proc.wait(timeout=5)
-        stderr_text(self.proc)
-        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_proxy(self.proc)
         stop_fake_upstreams()
 
     def test_token_persist_survives_sigterm_restart(self) -> None:
@@ -4401,7 +4330,7 @@ class TokenPersistTest(unittest.TestCase):
 
         # SIGTERM 落盘
         self.proc.terminate()
-        self.proc.wait(timeout=5)
+        self.proc.wait(timeout=10)
         stderr_text(self.proc)
         persist_file = os.path.join(self.proc.persist_dir, "settings.json")
         with open(persist_file, encoding="utf-8") as fh:
@@ -4538,10 +4467,7 @@ class RequestIdTest(unittest.TestCase):
         self.proc = start_proxy(self.upstream_port, self.proxy_port)
 
     def tearDown(self) -> None:
-        self.proc.terminate()
-        self.proc.wait(timeout=5)
-        stderr_text(self.proc)
-        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_proxy(self.proc)
         stop_fake_upstreams()
 
     def test_recent_entry_carries_rid_host_ttfb_stream_outcome(self) -> None:
@@ -4574,7 +4500,7 @@ class RequestIdTest(unittest.TestCase):
         """REQ 行含 rid=r-N / host= / ttfb=<num>ms / stream=1 / outcome=ok。"""
         post_sse(self.proxy_port)
         self.proc.terminate()
-        self.proc.wait(timeout=5)
+        self.proc.wait(timeout=10)
         stderr = stderr_text(self.proc)
         m = re.search(
             r"rid=(r-\d+) host=127\.0\.0\.1:%d "
@@ -4588,7 +4514,7 @@ class RequestIdTest(unittest.TestCase):
         """SSE 响应头 X-Request-Id 与 REQ 行 rid 一致。"""
         _, x_request_id = post_sse_with_headers(self.proxy_port)
         self.proc.terminate()
-        self.proc.wait(timeout=5)
+        self.proc.wait(timeout=10)
         stderr = stderr_text(self.proc)
         m = re.search(r"rid=(r-\d+) host=", stderr)
         self.assertIsNotNone(m, "REQ 行必须含 rid=，stderr:\n" + stderr)
@@ -4605,9 +4531,7 @@ class RequestIdTest(unittest.TestCase):
     def test_502_response_carries_x_request_id(self) -> None:
         """代理合成 502 响应也带 X-Request-Id。"""
         dead_port = free_port()  # 死端口：连接即 ECONNREFUSED → 合成 502
-        self.proc.terminate()
-        self.proc.wait(timeout=5)
-        stderr_text(self.proc)
+        stop_proxy(self.proc)  # 含旧实例 persist_dir 清理（followups 登记的泄漏点）
         self.proc = start_proxy(dead_port, free_port())
         conn = http.client.HTTPConnection("127.0.0.1",
                                           self.proc.proxy_port, timeout=30)
@@ -4628,10 +4552,7 @@ class RequestIdTest(unittest.TestCase):
     def test_upstream_x_request_id_stripped_for_sse(self) -> None:
         """上游自带 X-Request-Id 时 SSE 路径剥除，客户端只收代理 rid 单值。"""
         upstream_port = make_fake_upstream(False, x_request_id="upstream-rid")
-        self.proc.terminate()
-        self.proc.wait(timeout=5)
-        stderr_text(self.proc)
-        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_proxy(self.proc)
         self.proc = start_proxy(upstream_port, free_port())
         conn = http.client.HTTPConnection("127.0.0.1", self.proc.proxy_port, timeout=30)
         conn.request("POST", "/v1/chat/completions",
@@ -4647,10 +4568,7 @@ class RequestIdTest(unittest.TestCase):
     def test_upstream_x_request_id_stripped_for_plain(self) -> None:
         """上游自带 X-Request-Id 时非流式（/plain → _relay_buffered）路径剥除。"""
         upstream_port = make_fake_upstream(False, x_request_id="upstream-rid")
-        self.proc.terminate()
-        self.proc.wait(timeout=5)
-        stderr_text(self.proc)
-        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_proxy(self.proc)
         self.proc = start_proxy(upstream_port, free_port())
         conn = http.client.HTTPConnection("127.0.0.1", self.proc.proxy_port, timeout=30)
         conn.request("GET", "/plain")
@@ -4673,10 +4591,7 @@ class TpmAdmitHookTest(unittest.TestCase):
 
     def tearDown(self) -> None:
         if self.proc:
-            self.proc.terminate()
-            self.proc.wait(timeout=5)
-            stderr_text(self.proc)
-            shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+            stop_proxy(self.proc)
         stop_fake_upstreams()
 
     def test_oversized_idle_release_then_busy_429(self) -> None:
@@ -4723,10 +4638,7 @@ class TpmRateLimitTest(unittest.TestCase):
 
     def tearDown(self) -> None:
         if self.proc:
-            self.proc.terminate()
-            self.proc.wait(timeout=5)
-            stderr_text(self.proc)
-            shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+            stop_proxy(self.proc)
         stop_fake_upstreams()
 
     def test_queue_exhaustion_and_window_roll(self) -> None:
@@ -4767,10 +4679,7 @@ class TpmRateLimitTest(unittest.TestCase):
         """排队超时：预算不释放 → 第二请求 ~2s（seam 值）后收 429，
         body 字节等于定死 JSON，REQ 行 result=tpm-queue-timeout，且不触上游。"""
         # 重建代理：小预算 + 短超时 + 长窗口（超时必然先于窗口滚过触发）
-        self.proc.terminate()
-        self.proc.wait(timeout=5)
-        stderr_text(self.proc)
-        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_proxy(self.proc)
         stop_fake_upstreams()
         upstream_port, calls = make_scripted_upstream(
             body_override=SSE_A + SSE_B + SSE_DONE)
@@ -4843,10 +4752,7 @@ class TpmRateLimitTest(unittest.TestCase):
         """usage 回填：fake upstream 回 SSE_USAGE（total_tokens=2）→ settle 校正预算，
         后续请求不等窗口滚过即放行；tpm_stats bucket used == 4（2+2）。"""
         # 重建代理：上游回带 usage 帧的流（每次 POST 都含 SSE_USAGE）
-        self.proc.terminate()
-        self.proc.wait(timeout=5)
-        stderr_text(self.proc)
-        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_proxy(self.proc)
         stop_fake_upstreams()
         upstream_port, calls = make_scripted_upstream(
             body_override=SSE_USAGE + SSE_A + SSE_B + SSE_DONE)
@@ -4954,10 +4860,7 @@ class TpmRateLimitTest(unittest.TestCase):
         SSE 无 usage 帧 → 不 settle，bucket used 应恰为单次 est（非 2×est）。
         """
         # 重建代理：指向 stall 上游（窗口 60s 防 2s seam 下 est 条目滚出窗口）
-        self.proc.terminate()
-        self.proc.wait(timeout=5)
-        stderr_text(self.proc)
-        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_proxy(self.proc)
         stop_fake_upstreams()
         upstream_port, calls = make_stall_upstream(stall_calls=(1,))
         self.proxy_port = free_port()
@@ -5074,10 +4977,7 @@ class TtfbStreamTest(unittest.TestCase):
         self.proc = start_proxy(self.upstream_port, self.proxy_port)
 
     def tearDown(self) -> None:
-        self.proc.terminate()
-        self.proc.wait(timeout=5)
-        stderr_text(self.proc)
-        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_proxy(self.proc)
         stop_fake_upstreams()
 
     def test_ttfb_ms_in_range_and_perf_populated(self) -> None:
@@ -5120,7 +5020,7 @@ class TtfbStreamTest(unittest.TestCase):
     def test_stall_detected_via_env_seam(self) -> None:
         """上游中途 sleep 1s（> 0.5s 阈值）→ stalls_total ≥ 1。"""
         self.proc.terminate()
-        self.proc.wait(timeout=5)
+        self.proc.wait(timeout=10)
         stderr_text(self.proc)
         stop_fake_upstreams()
         self.upstream_port = make_fake_upstream(False, stall_mid_stream_s=1.0)
@@ -5152,10 +5052,7 @@ class StallTailGapTest(unittest.TestCase):
             self.assertEqual(perf["stalls_total"], 0,
                              "EOF 尾间隙不是相邻 record 间隔，不得计 stall；perf=%r" % perf)
         finally:
-            proc.terminate()
-            proc.wait(timeout=5)
-            stderr_text(proc)
-            shutil.rmtree(proc.persist_dir, ignore_errors=True)
+            stop_proxy(proc)
             stop_fake_upstreams()
 
 
@@ -5175,10 +5072,7 @@ class TpmPerModelTest(unittest.TestCase):
 
     def tearDown(self) -> None:
         if self.proc:
-            self.proc.terminate()
-            self.proc.wait(timeout=5)
-            stderr_text(self.proc)
-            shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+            stop_proxy(self.proc)
         stop_fake_upstreams()
 
     def test_kimi_independent_budget(self) -> None:
@@ -5324,10 +5218,7 @@ class TpmPerModelTest(unittest.TestCase):
         self.assertFalse(b["model"] is None,
                          "model field must be the string value, not null")
         # limit_by_model 含 env 设置时（决策 6 "原样"）
-        self.proc.terminate()
-        self.proc.wait(timeout=5)
-        stderr_text(self.proc)
-        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_proxy(self.proc)
         self.proc = start_proxy(self.upstream_port, free_port(),
                                 extra_env={
                                     "CTYUN_TPM_LIMIT": "110",
@@ -5447,10 +5338,7 @@ class ProbeLoopTest(unittest.TestCase):
 
     @staticmethod
     def _teardown_proc(proc) -> None:
-        proc.terminate()
-        proc.wait(timeout=5)
-        stderr_text(proc)
-        shutil.rmtree(proc.persist_dir, ignore_errors=True)
+        stop_proxy(proc)
         stop_fake_upstreams()
 
     def test_probe_sends_head_and_success_has_no_alert(self) -> None:
@@ -5524,10 +5412,7 @@ class ProbeNoSideEffectTest(unittest.TestCase):
             self.assertEqual(snap["requests_total"], 1)
             self.assertEqual(len(snap["recent"]), 1)
         finally:
-            proc.terminate()
-            proc.wait(timeout=5)
-            stderr_text(proc)
-            shutil.rmtree(proc.persist_dir, ignore_errors=True)
+            stop_proxy(proc)
             stop_fake_upstreams()
 
 
@@ -5620,10 +5505,7 @@ class ProbeHealthApiTest(unittest.TestCase):
                                 extra_env={"CTYUN_PROBE_INTERVAL_S": "0.5"})
 
     def tearDown(self) -> None:
-        self.proc.terminate()
-        self.proc.wait(timeout=5)
-        stderr_text(self.proc)
-        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_proxy(self.proc)
         stop_fake_upstreams()
 
     def test_health_reports_probe_state(self) -> None:
@@ -5661,10 +5543,7 @@ class ProbeToggleTest(unittest.TestCase):
                                 extra_env={"CTYUN_PROBE_INTERVAL_S": "0.5"})
 
     def tearDown(self) -> None:
-        self.proc.terminate()
-        self.proc.wait(timeout=5)
-        stderr_text(self.proc)
-        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_proxy(self.proc)
         stop_fake_upstreams()
 
     def test_probe_toggle_off_stops_head_requests(self) -> None:
@@ -5724,10 +5603,7 @@ class ProbeToggleTest(unittest.TestCase):
             self.assertFalse(upstream["probe_enabled"])
             self.assertEqual(upstream["last_probe_ts"], 0)
         finally:
-            proc.terminate()
-            proc.wait(timeout=5)
-            stderr_text(proc)
-            shutil.rmtree(proc.persist_dir, ignore_errors=True)
+            stop_proxy(proc)
             stop_fake_upstreams()
 
     def test_env_probe_disabled_overrides_persist_enabled(self) -> None:
@@ -5745,10 +5621,7 @@ class ProbeToggleTest(unittest.TestCase):
             _, body, _ = admin_get(proc.admin_port, "/api/health")
             self.assertFalse(json.loads(body.decode("utf-8"))["upstream"]["probe_enabled"])
         finally:
-            proc.terminate()
-            proc.wait(timeout=5)
-            stderr_text(proc)
-            shutil.rmtree(proc.persist_dir, ignore_errors=True)
+            stop_proxy(proc)
             stop_fake_upstreams()
 
 
