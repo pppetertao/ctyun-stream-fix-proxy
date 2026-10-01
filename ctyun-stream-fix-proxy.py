@@ -2994,6 +2994,112 @@ _DASH_SECTIONS_V2 = """  <!-- pane perf 开 -->
     </table>
     </div>
   </section>
+  <!-- v3 卡 8：perf tab 十项扩展（分组：延迟 / 错误与限流 / 流量与 token / 健康） -->
+  <section class="card">
+    <div class="card-title">按模型 TTFB 分布 · 9 桶（进程内累计）</div>
+    <div class="table-wrap">
+    <table>
+      <thead><tr><th>模型</th><th>&lt;100</th><th>&lt;250</th><th>&lt;500</th><th>&lt;1s</th><th>&lt;2s</th><th>&lt;5s</th><th>&lt;10s</th><th>&lt;30s</th><th>≥30s</th></tr></thead>
+      <tbody id="ttfb-hist-body"><tr><td class="empty" colspan="10">读取中……</td></tr></tbody>
+    </table>
+    </div>
+  </section>
+  <section class="card">
+    <div class="card-title">三阶段延迟 · 按模型 P50/P90（进程内累计）</div>
+    <div class="table-wrap">
+    <table>
+      <thead><tr><th>模型</th><th>连接 P50</th><th>连接 P90</th><th>响应头 P50</th><th>响应头 P90</th><th>数据体 P50</th><th>数据体 P90</th></tr></thead>
+      <tbody id="phase-model-body"><tr><td class="empty" colspan="7">读取中……</td></tr></tbody>
+    </table>
+    </div>
+  </section>
+  <section class="card">
+    <div class="card-title">慢请求 Top 10 · 按耗时（最近 100 条内）</div>
+    <div class="table-wrap">
+    <table>
+      <thead><tr><th>时间</th><th>模型</th><th>路径</th><th>状态</th><th>耗时</th><th>TTFB</th><th>rid</th></tr></thead>
+      <tbody id="slow-body"><tr><td class="empty" colspan="7">读取中……</td></tr></tbody>
+    </table>
+    </div>
+  </section>
+  <section class="card">
+    <div class="card-title">按模型稳定性 · 今日错误/重试率（跨重启保留）</div>
+    <div class="table-wrap">
+    <table>
+      <thead><tr><th>模型</th><th>请求</th><th>代理错误</th><th>上游5xx</th><th>重试</th><th>空流</th><th>头重试</th></tr></thead>
+      <tbody id="stability-body"><tr><td class="empty" colspan="7">读取中……</td></tr></tbody>
+    </table>
+    </div>
+  </section>
+  <section class="card">
+    <div class="card-title">TPM 限流观测 · 60s 窗口（per key × 模型）<span class="chip" id="tpm-queue-chip">--</span></div>
+    <div class="table-wrap">
+    <table>
+      <thead><tr><th>Key</th><th>模型</th><th>已用</th><th>剩余</th><th>排队</th><th>拒绝</th><th>超时</th></tr></thead>
+      <tbody id="tpm-obs-body"><tr><td class="empty" colspan="7">读取中……</td></tr></tbody>
+    </table>
+    </div>
+  </section>
+  <section class="card">
+    <div class="card-title">错误事件流 · 最近 50 条<span class="chip" id="err-capture-chip">--</span></div>
+    <div class="table-wrap">
+    <table>
+      <thead><tr><th>时间</th><th>类别</th><th>模型</th><th>路径</th><th>上游状态</th><th>重试</th></tr></thead>
+      <tbody id="err-events-body"><tr><td class="empty" colspan="6">读取中……</td></tr></tbody>
+    </table>
+    </div>
+  </section>
+  <section class="card">
+    <div class="card-title">实时流量画像 · 60s 窗口</div>
+    <div class="stats-row">
+      <div class="card stat"><div class="num" id="tp-bytes">--</div><div class="label">出流量/s</div></div>
+      <div class="card stat"><div class="num" id="tp-chunks">--</div><div class="label">chunks/s</div></div>
+      <div class="card stat"><div class="num" id="tp-tokens">--</div><div class="label">tokens/s</div></div>
+      <div class="card stat"><div class="num" id="tp-stream">--</div><div class="label">流式占比·累计</div></div>
+      <div class="card stat"><div class="num amber" id="tp-stalls">--</div><div class="label">SSE 停顿累计</div></div>
+    </div>
+    <div class="table-wrap">
+    <table>
+      <thead><tr><th>模型</th><th>请求·今日</th><th>流式·今日</th><th>流式占比</th><th>出流量·今日</th></tr></thead>
+      <tbody id="traffic-model-body"><tr><td class="empty" colspan="5">读取中……</td></tr></tbody>
+    </table>
+    </div>
+  </section>
+  <section class="card">
+    <div class="card-title">SSE 停顿（&gt;5s 无数据）按模型 · 进程内累计</div>
+    <div class="table-wrap">
+    <table>
+      <thead><tr><th>模型</th><th>停顿次数</th></tr></thead>
+      <tbody id="stalls-body"><tr><td class="empty" colspan="2">读取中……</td></tr></tbody>
+    </table>
+    </div>
+  </section>
+  <section class="card">
+    <div class="card-title">TPM 排队等待 · 按模型 P50/P90（最近 500 次）</div>
+    <div class="table-wrap">
+    <table>
+      <thead><tr><th>模型</th><th>排队 P50</th><th>排队 P90</th></tr></thead>
+      <tbody id="qwait-body"><tr><td class="empty" colspan="3">读取中……</td></tr></tbody>
+    </table>
+    </div>
+  </section>
+  <section class="card">
+    <div class="card-title">TPM 估算偏差 actual/est · 按模型 P50/P90（最近 500 次，&lt;1=预估偏高）</div>
+    <div class="table-wrap">
+    <table>
+      <thead><tr><th>模型</th><th>偏差 P50</th><th>偏差 P90</th></tr></thead>
+      <tbody id="settle-body"><tr><td class="empty" colspan="3">读取中……</td></tr></tbody>
+    </table>
+    </div>
+  </section>
+  <section class="card">
+    <div class="card-title">小时级 Token 曲线 · 最近 48h（进程内，重启清零）</div>
+    <svg id="hourly-svg" viewBox="0 0 600 96" preserveAspectRatio="none" role="img" aria-label="小时级 token 柱状图"></svg>
+  </section>
+  <section class="card">
+    <div class="card-title">上游探测延迟趋势 · 最近 7 天（30s 采样，抽稀 ≤200 点）</div>
+    <svg id="probe-trend" viewBox="0 0 600 120" preserveAspectRatio="none" role="img" aria-label="探测延迟折线图"></svg>
+  </section>
   </div>
   <!-- pane perf 闭 -->
 """
@@ -3634,6 +3740,7 @@ function poll() {
       renderByKey(snap);
       renderZeroToken(snap);
       renderQuota(snap);
+      renderPerfV3(snap);
       setConn(true);
       hideEvtTip();  // 重渲染后旧 tooltip 指向已换的 DOM，防悬空
     })
@@ -3850,7 +3957,436 @@ function renderQuota(snap) {
   $("q-proj").textContent = daysSeen > 0
     ? String(Math.round(mtd / daysSeen * daysInMonth)) : "—";
 }
+// ---- v3 卡 8：perf tab 十项（P1/P6/P9/P2/P5/P7/P8/T4/T6 snap 驱动；P3/P4/P10 fetch 驱动） ----
+var SVGNS = "http://www.w3.org/2000/svg";
+function svgEl(tag) { return document.createElementNS(SVGNS, tag); }
+function fmtBytes(n) {
+  if (n >= 1048576) return (n / 1048576).toFixed(1) + "MB";
+  if (n >= 1024) return (n / 1024).toFixed(1) + "KB";
+  return String(Math.round(n)) + "B";
+}
+function fmtHour(ts) {
+  var d = new Date(ts * 1000);
+  function pad(n) { return (n < 10 ? "0" : "") + n; }
+  return pad(d.getMonth() + 1) + "-" + pad(d.getDate()) + " " + pad(d.getHours()) + "时";
+}
+function renderTtfbHist(perf) {
+  var body = $("ttfb-hist-body");
+  body.textContent = "";
+  var hist = perf.ttfb_hist_by_model || {};
+  var names = Object.keys(hist).sort();
+  if (names.length === 0) {
+    var tr0 = el("tr");
+    var td0 = el("td", "empty", "暂无 TTFB 数据 —— 有请求经过代理后这里会出现 9 桶分布");
+    td0.colSpan = 10;
+    tr0.appendChild(td0);
+    body.appendChild(tr0);
+    return;
+  }
+  for (var i = 0; i < names.length; i++) {
+    var tr = el("tr");
+    tr.appendChild(el("td", "", names[i]));
+    var buckets = hist[names[i]] || [];
+    for (var b = 0; b < 9; b++) {
+      tr.appendChild(el("td", "num", String(buckets[b] || 0)));
+    }
+    body.appendChild(tr);
+  }
+}
+function renderPhaseByModel(perf) {
+  var body = $("phase-model-body");
+  body.textContent = "";
+  var p50 = perf.phase_p50_ms_by_model || {};
+  var p90 = perf.phase_p90_ms_by_model || {};
+  var names = Object.keys(p50).sort();
+  if (names.length === 0) {
+    var tr0 = el("tr");
+    var td0 = el("td", "empty", "暂无分阶段数据 —— 有请求经过代理后这里会出现按模型三阶段分位");
+    td0.colSpan = 7;
+    tr0.appendChild(td0);
+    body.appendChild(tr0);
+    return;
+  }
+  for (var i = 0; i < names.length; i++) {
+    var m = names[i];
+    var tr = el("tr");
+    tr.appendChild(el("td", "", m));
+    var defs = [["connect", p50[m].connect, p90[m] && p90[m].connect],
+                ["headers", p50[m].headers, p90[m] && p90[m].headers],
+                ["body", p50[m].body, p90[m] && p90[m].body]];
+    for (var j = 0; j < defs.length; j++) {
+      tr.appendChild(el("td", "num", fmtDur(defs[j][1])));
+      tr.appendChild(el("td", "num", fmtDur(defs[j][2])));
+    }
+    body.appendChild(tr);
+  }
+}
+function renderSlowTop(snap) {
+  var body = $("slow-body");
+  body.textContent = "";
+  var recent = (snap.recent || []).slice();
+  recent.sort(function (a, b) { return (b.dur_ms || 0) - (a.dur_ms || 0); });
+  var top = recent.slice(0, 10);
+  if (top.length === 0) {
+    var tr0 = el("tr");
+    var td0 = el("td", "empty", "暂无请求记录");
+    td0.colSpan = 7;
+    tr0.appendChild(td0);
+    body.appendChild(tr0);
+    return;
+  }
+  for (var i = 0; i < top.length; i++) {
+    var r = top[i];
+    var tr = el("tr");
+    tr.appendChild(el("td", "num", fmtTime(r.ts)));
+    tr.appendChild(el("td", "", r.model || "—"));
+    tr.appendChild(el("td", "", r.path || "—"));
+    tr.appendChild(el("td", "num", String(r.status)));
+    tr.appendChild(el("td", "num", fmtDur(r.dur_ms || 0)));
+    tr.appendChild(el("td", "num", r.ttfb_ms != null ? fmtDur(r.ttfb_ms) : "—"));
+    tr.appendChild(el("td", "", r.rid || "—"));
+    body.appendChild(tr);
+  }
+}
+function renderStability(snap) {
+  var body = $("stability-body");
+  body.textContent = "";
+  var dbm = snap.daily_by_model || {};
+  var days = Object.keys(dbm).sort();
+  if (days.length === 0) {
+    var tr0 = el("tr");
+    var td0 = el("td", "empty", "暂无按模型数据");
+    td0.colSpan = 7;
+    tr0.appendChild(td0);
+    body.appendChild(tr0);
+    return;
+  }
+  var models = dbm[days[days.length - 1]];
+  var names = Object.keys(models).sort();
+  for (var i = 0; i < names.length; i++) {
+    var m = models[names[i]];
+    var req = m.requests || 0;
+    function pct(n) {
+      return req > 0 ? String(n) + "（" + (n / req * 100).toFixed(1) + "%）" : String(n);
+    }
+    var tr = el("tr");
+    tr.appendChild(el("td", "", names[i]));
+    tr.appendChild(el("td", "num", String(req)));
+    tr.appendChild(el("td", "num", pct(m.errors_proxy || 0)));
+    tr.appendChild(el("td", "num", pct(m.errors_upstream || 0)));
+    tr.appendChild(el("td", "num", pct(m.retries || 0)));
+    tr.appendChild(el("td", "num", pct(m.eof_without_done || 0)));
+    tr.appendChild(el("td", "num", pct(m.header_retries || 0)));
+    body.appendChild(tr);
+  }
+}
+function renderTraffic(perf, snap) {
+  $("tp-bytes").textContent = perf.bytes_per_s != null ? fmtBytes(perf.bytes_per_s) + "/s" : "--";
+  $("tp-chunks").textContent = perf.chunks_per_s != null ? String(Math.round(perf.chunks_per_s)) : "--";
+  $("tp-tokens").textContent = perf.tokens_per_s != null ? String(Math.round(perf.tokens_per_s)) : "--";
+  $("tp-stream").textContent = perf.stream_share != null
+    ? (perf.stream_share * 100).toFixed(1) + "%" : "--";
+  $("tp-stalls").textContent = String(perf.stalls_total != null ? perf.stalls_total : "--");
+  var body = $("traffic-model-body");
+  body.textContent = "";
+  var dbm = snap.daily_by_model || {};
+  var days = Object.keys(dbm).sort();
+  if (days.length === 0) {
+    var tr0 = el("tr");
+    var td0 = el("td", "empty", "暂无按模型流量数据");
+    td0.colSpan = 5;
+    tr0.appendChild(td0);
+    body.appendChild(tr0);
+    return;
+  }
+  var models = dbm[days[days.length - 1]];
+  var names = Object.keys(models).sort();
+  for (var i = 0; i < names.length; i++) {
+    var m = models[names[i]];
+    var req = m.requests || 0;
+    var st = m.stream_requests || 0;
+    var tr = el("tr");
+    tr.appendChild(el("td", "", names[i]));
+    tr.appendChild(el("td", "num", String(req)));
+    tr.appendChild(el("td", "num", String(st)));
+    tr.appendChild(el("td", "num", req > 0 ? (st / req * 100).toFixed(1) + "%" : "—"));
+    tr.appendChild(el("td", "num", fmtBytes(m.bytes_out || 0)));
+    body.appendChild(tr);
+  }
+}
+function renderStalls(perf) {
+  var body = $("stalls-body");
+  body.textContent = "";
+  var sm = perf.stalls_by_model || {};
+  var names = Object.keys(sm).sort();
+  if (names.length === 0) {
+    var tr0 = el("tr");
+    var td0 = el("td", "empty", "暂无停顿记录 —— 流式响应超过 5s 无新数据时计入");
+    td0.colSpan = 2;
+    tr0.appendChild(td0);
+    body.appendChild(tr0);
+    return;
+  }
+  for (var i = 0; i < names.length; i++) {
+    var tr = el("tr");
+    tr.appendChild(el("td", "", names[i]));
+    tr.appendChild(el("td", "num", String(sm[names[i]] || 0)));
+    body.appendChild(tr);
+  }
+}
+function renderQwait(perf) {
+  var body = $("qwait-body");
+  body.textContent = "";
+  var p50 = perf.qwait_p50_ms_by_model || {};
+  var p90 = perf.qwait_p90_ms_by_model || {};
+  var names = Object.keys(p50).sort();
+  if (names.length === 0) {
+    var tr0 = el("tr");
+    var td0 = el("td", "empty", "暂无排队数据 —— TPM 限流排队发生在这里可见");
+    td0.colSpan = 3;
+    tr0.appendChild(td0);
+    body.appendChild(tr0);
+    return;
+  }
+  for (var i = 0; i < names.length; i++) {
+    var tr = el("tr");
+    tr.appendChild(el("td", "", names[i]));
+    tr.appendChild(el("td", "num", fmtDur(p50[names[i]] || 0)));
+    tr.appendChild(el("td", "num", fmtDur(p90[names[i]] || 0)));
+    body.appendChild(tr);
+  }
+}
+function renderSettle(perf) {
+  var body = $("settle-body");
+  body.textContent = "";
+  var p50 = perf.tpm_settle_ratio_p50_by_model || {};
+  var p90 = perf.tpm_settle_ratio_p90_by_model || {};
+  var names = Object.keys(p50).sort();
+  if (names.length === 0) {
+    var tr0 = el("tr");
+    var td0 = el("td", "empty", "暂无结算样本 —— 比率持续 <1 说明准入估算偏保守，可下调比例系数");
+    td0.colSpan = 3;
+    tr0.appendChild(td0);
+    body.appendChild(tr0);
+    return;
+  }
+  for (var i = 0; i < names.length; i++) {
+    var tr = el("tr");
+    tr.appendChild(el("td", "", names[i]));
+    tr.appendChild(el("td", "num", (p50[names[i]] || 0).toFixed(2)));
+    tr.appendChild(el("td", "num", (p90[names[i]] || 0).toFixed(2)));
+    body.appendChild(tr);
+  }
+}
+function renderHourly(snap) {
+  var svg = $("hourly-svg");
+  while (svg.firstChild) svg.removeChild(svg.firstChild);
+  var data = snap.hourly_tokens || [];
+  var W = 600, H = 96;
+  if (data.length === 0) {
+    var t0 = svgEl("text");
+    t0.setAttribute("x", 0);
+    t0.setAttribute("y", 14);
+    t0.setAttribute("font-size", 12);
+    t0.style.fill = "var(--dim)";
+    t0.textContent = "暂无小时数据 —— 有请求后按小时聚合出现";
+    svg.appendChild(t0);
+    return;
+  }
+  var max = 1;
+  for (var i = 0; i < data.length; i++) {
+    max = Math.max(max, (data[i].tokens_prompt || 0) + (data[i].tokens_completion || 0));
+  }
+  var bw = W / data.length;
+  for (var j = 0; j < data.length; j++) {
+    var v = (data[j].tokens_prompt || 0) + (data[j].tokens_completion || 0);
+    if (v <= 0) continue;
+    var h = Math.max(2, v / max * (H - 16));
+    var r = svgEl("rect");
+    r.setAttribute("x", (j * bw + 0.5).toFixed(1));
+    r.setAttribute("y", (H - h).toFixed(1));
+    r.setAttribute("width", Math.max(1, bw - 1).toFixed(1));
+    r.setAttribute("height", h.toFixed(1));
+    r.style.fill = "var(--amber)";
+    svg.appendChild(r);
+  }
+  var tl = svgEl("text");
+  tl.setAttribute("x", 0);
+  tl.setAttribute("y", 10);
+  tl.setAttribute("font-size", 11);
+  tl.style.fill = "var(--dim)";
+  tl.textContent = fmtHour(data[0].hour_start_ts);
+  var tr2 = svgEl("text");
+  tr2.setAttribute("x", W);
+  tr2.setAttribute("y", 10);
+  tr2.setAttribute("text-anchor", "end");
+  tr2.setAttribute("font-size", 11);
+  tr2.style.fill = "var(--dim)";
+  tr2.textContent = fmtHour(data[data.length - 1].hour_start_ts) +
+    " · 峰值 " + max + " tokens/h";
+  svg.appendChild(tl);
+  svg.appendChild(tr2);
+}
+function renderPerfV3(snap) {
+  var perf = snap.perf || {};
+  renderTtfbHist(perf);
+  renderPhaseByModel(perf);
+  renderSlowTop(snap);
+  renderStability(snap);
+  renderTraffic(perf, snap);
+  renderStalls(perf);
+  renderQwait(perf);
+  renderSettle(perf);
+  renderHourly(snap);
+}
+function loadTpmObs() {
+  fetch("/api/tpm_stats")
+    .then(function (resp) {
+      if (!resp.ok) throw new Error("HTTP " + resp.status);
+      return resp.json();
+    })
+    .then(function (data) {
+      $("tpm-queue-chip").textContent = "排队 " + (data.queue_total || 0);
+      var body = $("tpm-obs-body");
+      body.textContent = "";
+      var buckets = data.buckets || [];
+      if (buckets.length === 0) {
+        var tr0 = el("tr");
+        var td0 = el("td", "empty",
+          "暂无限流桶 —— TPM 限流启用且有带 Authorization 的请求后出现");
+        td0.colSpan = 7;
+        tr0.appendChild(td0);
+        body.appendChild(tr0);
+        return;
+      }
+      for (var i = 0; i < buckets.length; i++) {
+        var b = buckets[i];
+        var tr = el("tr");
+        tr.appendChild(el("td", "", b.key || "—"));
+        tr.appendChild(el("td", "", b.model || "—"));
+        tr.appendChild(el("td", "num", String(b.used || 0)));
+        tr.appendChild(el("td", "num", String(b.remaining != null ? b.remaining : "—")));
+        tr.appendChild(el("td", "num", String(b.queued || 0)));
+        tr.appendChild(el("td", "num", String(b.rejected || 0)));
+        tr.appendChild(el("td", "num", String(b.timeouts || 0)));
+        body.appendChild(tr);
+      }
+    })
+    .catch(function () { $("tpm-queue-chip").textContent = "读取失败"; });
+}
+function loadErrorEvents() {
+  fetch("/api/errors")
+    .then(function (resp) {
+      if (!resp.ok) throw new Error("HTTP " + resp.status);
+      return resp.json();
+    })
+    .then(function (data) {
+      $("err-capture-chip").textContent = data.capture_errors ? "留痕开" : "留痕关";
+      var body = $("err-events-body");
+      body.textContent = "";
+      var events = data.events || [];
+      if (events.length === 0) {
+        var tr0 = el("tr");
+        var td0 = el("td", "empty", "暂无错误事件 —— 代理/上游错误留痕会出现在这里");
+        td0.colSpan = 6;
+        tr0.appendChild(td0);
+        body.appendChild(tr0);
+        return;
+      }
+      for (var i = 0; i < events.length; i++) {
+        var e = events[i];
+        var tr = el("tr");
+        tr.appendChild(el("td", "num", fmtTime(e.ts)));
+        tr.appendChild(el("td", "", e.kind + (e.category ? " / " + e.category : "")));
+        tr.appendChild(el("td", "", e.model || "—"));
+        tr.appendChild(el("td", "", e.path || "—"));
+        tr.appendChild(el("td", "num",
+          e.upstream_status != null ? String(e.upstream_status) : "—"));
+        tr.appendChild(el("td", "", e.retried ? (e.retry_reason || "已重试") : "—"));
+        body.appendChild(tr);
+      }
+    })
+    .catch(function () { $("err-capture-chip").textContent = "读取失败"; });
+}
+function loadProbeTrend() {
+  fetch("/api/probe_history")
+    .then(function (resp) {
+      if (!resp.ok) throw new Error("HTTP " + resp.status);
+      return resp.json();
+    })
+    .then(function (data) {
+      var svg = $("probe-trend");
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var pts = data.points || [];
+      var W = 600, H = 120;
+      if (pts.length < 2) {
+        var t0 = svgEl("text");
+        t0.setAttribute("x", 0);
+        t0.setAttribute("y", 14);
+        t0.setAttribute("font-size", 12);
+        t0.style.fill = "var(--dim)";
+        t0.textContent = data.count_total === 0
+          ? "暂无探测样本（每 30s 成功一次后入库，等几分钟）"
+          : "探测样本不足 2 点（" + data.count_total + "），稍后成线";
+        svg.appendChild(t0);
+        return;
+      }
+      var max = 0, min = Infinity;
+      for (var i = 0; i < pts.length; i++) {
+        max = Math.max(max, pts[i][1]);
+        min = Math.min(min, pts[i][1]);
+      }
+      if (max === min) max = min + 1;
+      var seq = "";
+      for (var j = 0; j < pts.length; j++) {
+        var x = 4 + j / (pts.length - 1) * (W - 8);
+        var y = H - 8 - (pts[j][1] - min) / (max - min) * (H - 24);
+        seq += x.toFixed(1) + "," + y.toFixed(1) + " ";
+      }
+      var line = svgEl("polyline");
+      line.setAttribute("points", seq.trim());
+      line.setAttribute("fill", "none");
+      line.setAttribute("stroke-width", "1.5");
+      line.style.stroke = "var(--amber)";
+      svg.appendChild(line);
+      var tl = svgEl("text");
+      tl.setAttribute("x", 4);
+      tl.setAttribute("y", 12);
+      tl.setAttribute("font-size", 11);
+      tl.style.fill = "var(--dim)";
+      tl.textContent = "max " + fmtDur(max);
+      var tr2 = svgEl("text");
+      tr2.setAttribute("x", W - 4);
+      tr2.setAttribute("y", 12);
+      tr2.setAttribute("text-anchor", "end");
+      tr2.setAttribute("font-size", 11);
+      tr2.style.fill = "var(--dim)";
+      tr2.textContent = "min " + fmtDur(min) + " · " + data.count_total + " 样本";
+      svg.appendChild(tl);
+      svg.appendChild(tr2);
+    })
+    .catch(function () {
+      var svg = $("probe-trend");
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var t0 = svgEl("text");
+      t0.setAttribute("x", 0);
+      t0.setAttribute("y", 14);
+      t0.setAttribute("font-size", 12);
+      t0.style.fill = "var(--dim)";
+      t0.textContent = "探测趋势读取失败（/api/probe_history）";
+      svg.appendChild(t0);
+    });
+}
 loadTpmSettings();
+renderPerfV3(lastSnap || {});
+loadTpmObs();
+loadErrorEvents();
+loadProbeTrend();
+setInterval(function () {
+  loadTpmObs();
+  loadErrorEvents();
+  loadProbeTrend();
+}, 5000);
 """
 
 DASHBOARD_HTML = ("".join([
