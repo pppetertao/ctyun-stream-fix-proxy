@@ -71,6 +71,8 @@ class FakeUpstreamHandler(BaseHTTPRequestHandler):
     rst_calls = ()          # 1-based 呼叫序号元组：命中则 SO_LINGER(1,0) close 强制发 RST（同 rst_all 形态）
     calls = None          # 共享 list：非 None 时按调用序 append 计数；无 body_override 时首次回空流
     bodies = None        # 共享 list：非 None 时按调用序 append 收到的原始请求体 bytes
+    head_calls = None    # P4 probe 测试：非 None 时 do_HEAD 按调用序 append 计数
+    head_fail = False    # P4 probe 测试：True → do_HEAD 回 500（连续失败告警场景）
 
     def do_POST(self) -> None:
         length = int(self.headers.get("Content-Length") or 0)
@@ -238,6 +240,22 @@ class FakeUpstreamHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def do_HEAD(self) -> None:
+        """P4 probe 假上游：HEAD 计数 + 可控 5xx（probe 视 status ≥ 500 为失败）。
+
+        不回 body（HEAD 语义）；BaseHTTPRequestHandler 缺省 do_HEAD 回 501，
+        会使"成功 probe"场景恒失败，故必须覆写。
+        """
+        if self.head_calls is not None:
+            self.head_calls.append(1)
+        if self.head_fail:
+            self.send_response(500)
+        else:
+            self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+        self.close_connection = True
+
     def log_message(self, format: str, *args: object) -> None:
         pass
 
@@ -347,6 +365,22 @@ def make_body_recording_upstream(**kwargs) -> tuple:
     """记录上游收到的原始请求体：返回 (port, bodies)；正常路径响应 SSE_A+SSE_B+DONE。"""
     port = make_fake_upstream(False, record_bodies=True, **kwargs)
     return port, FAKE_SERVERS[-1].RequestHandlerClass.bodies
+
+
+def make_probe_upstream(head_fail: bool = False) -> tuple:
+    """P4 probe 假上游：返回 (port, head_calls)；HEAD 正常 200，head_fail=True 时回 500。
+
+    ThreadingHTTPServer：probe 每 PROBE_INTERVAL_S 一轮，测试收尾 shutdown 不得
+    阻塞在 keep-alive 连接上（与 stall 变体同款理由）。
+    """
+    head_calls = []
+    handler = type("ProbeUpstreamHandler", (FakeUpstreamHandler,),
+                   {"head_calls": head_calls, "head_fail": head_fail})
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    FAKE_SERVERS.append(server)
+    return server.server_address[1], head_calls
 
 
 def stop_fake_upstreams() -> None:
@@ -5210,6 +5244,191 @@ class ClassifyOutcomeTriStateTest(unittest.TestCase):
             self.assertEqual(mod.RECENT_REQUESTS[-1]["outcome"], mod.CLASS_OK)
         finally:
             mod.STATS["daily_by_model"] = orig
+
+
+class ProbeLoopTest(unittest.TestCase):
+    """P4 探测线程黑盒：HEAD 计数 / 间隔加速 / 连续失败告警 / 去抖。"""
+
+    @staticmethod
+    def _wait_head_calls(calls: list, n: int, timeout: float = 8.0) -> None:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if len(calls) >= n:
+                return
+            time.sleep(0.05)
+        raise AssertionError("probe 未在 %.1fs 内发出 %d 次 HEAD（实际 %d）"
+                             % (timeout, n, len(calls)))
+
+    def _spawn(self, head_fail: bool):
+        upstream_port, head_calls = make_probe_upstream(head_fail=head_fail)
+        proxy_port = free_port()
+        proc = start_proxy(upstream_port, proxy_port,
+                           extra_env={"CTYUN_PROBE_INTERVAL_S": "0.5"})
+        return proc, head_calls
+
+    @staticmethod
+    def _teardown_proc(proc) -> None:
+        proc.terminate()
+        proc.wait(timeout=5)
+        stderr_text(proc)
+        shutil.rmtree(proc.persist_dir, ignore_errors=True)
+        stop_fake_upstreams()
+
+    def test_probe_sends_head_and_success_has_no_alert(self) -> None:
+        proc, head_calls = self._spawn(head_fail=False)
+        try:
+            self._wait_head_calls(head_calls, 3)
+            time.sleep(0.3)  # 让最近一轮 probe 落状态
+            _, body, _ = admin_get(proc.admin_port, "/api/stats")
+            snap = json.loads(body.decode("utf-8"))
+            kinds = [e["kind"] for e in snap["events"]]
+            self.assertNotIn("probe_alert", kinds,
+                             "成功 probe 不得产告警；events=%r" % kinds)
+            self.assertEqual(snap["requests_total"], 0,
+                             "probe 不得计入 requests_total（零副作用）")
+        finally:
+            self._teardown_proc(proc)
+
+    def test_consecutive_failures_emit_single_probe_alert(self) -> None:
+        proc, head_calls = self._spawn(head_fail=True)
+        try:
+            self._wait_head_calls(head_calls, 3)  # 达阈值 3 → 触发告警
+            deadline = time.time() + 5
+            alerts = []
+            snap = None
+            while time.time() < deadline:
+                _, body, _ = admin_get(proc.admin_port, "/api/stats")
+                snap = json.loads(body.decode("utf-8"))
+                alerts = [e for e in snap["events"] if e["kind"] == "probe_alert"]
+                if alerts:
+                    break
+                time.sleep(0.1)
+            self.assertIsNotNone(snap)
+            self.assertEqual(len(alerts), 1,
+                             "连续 3 次 5xx 必须恰好 1 条 probe_alert；events=%r"
+                             % snap["events"])
+            self.assertEqual(alerts[0]["reason"], "consecutive_failures")
+            # 去抖：继续累积 ≥7 次失败（0.5s 间隔），300s 窗口内不得重发同类告警
+            self._wait_head_calls(head_calls, 10)
+            _, body, _ = admin_get(proc.admin_port, "/api/stats")
+            snap = json.loads(body.decode("utf-8"))
+            self.assertEqual(
+                len([e for e in snap["events"] if e["kind"] == "probe_alert"]), 1,
+                "PROBE_ALERT_DEBOUNCE_S 窗口内不得重发同类告警（去抖）")
+        finally:
+            self._teardown_proc(proc)
+
+
+class ProbeNoSideEffectTest(unittest.TestCase):
+    """P4 R3：probe 失败零副作用——持续 5xx 期间 STATS.requests_total 不增、
+    RECENT_REQUESTS 不落、daily 不污染；客户端请求计数照常。"""
+
+    def test_failing_probe_does_not_pollute_stats(self) -> None:
+        upstream_port, head_calls = make_probe_upstream(head_fail=True)
+        proxy_port = free_port()
+        proc = start_proxy(upstream_port, proxy_port,
+                           extra_env={"CTYUN_PROBE_INTERVAL_S": "0.5"})
+        try:
+            ProbeLoopTest._wait_head_calls(head_calls, 6)  # ≥3 次失败足以触发告警
+            _, body, _ = admin_get(proc.admin_port, "/api/stats")
+            snap = json.loads(body.decode("utf-8"))
+            self.assertEqual(snap["requests_total"], 0,
+                             "probe 失败不得计入 requests_total（零副作用）")
+            self.assertEqual(len(snap["recent"]), 0)
+            self.assertEqual(sum(b.get("requests", 0)
+                                 for b in snap["daily"].values()), 0,
+                             "probe 不得污染 daily 桶")
+            # 对照组：客户端请求照常计数（probe 不吞客户流量统计）
+            post_sse(proxy_port)
+            _, body, _ = admin_get(proc.admin_port, "/api/stats")
+            snap = json.loads(body.decode("utf-8"))
+            self.assertEqual(snap["requests_total"], 1)
+            self.assertEqual(len(snap["recent"]), 1)
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+            stderr_text(proc)
+            shutil.rmtree(proc.persist_dir, ignore_errors=True)
+            stop_fake_upstreams()
+
+
+class ProbeUnitTest(unittest.TestCase):
+    """P4 白盒：probe 核心纯函数（间隔解析 / 突增判定）。
+
+    开关解析（resolve_probe_enabled/load_probe_enabled）属卡 3，测试在其
+    ProbeEnabledResolutionTest（本卡不落，防卡 2 绿相残留红）。
+    """
+
+    def test_probe_interval_env_resolution(self) -> None:
+        mod = load_proxy_module()
+        f = mod._probe_interval_s_from_env
+        self.assertEqual(f(""), 30.0)     # 缺省 → 默认 30
+        self.assertEqual(f("0.5"), 0.5)   # 显式正数原样（测试加速 seam）
+        self.assertEqual(f("15"), 15.0)
+        self.assertEqual(f("0"), 10.0)    # ≤0 → 防滥用下限
+        self.assertEqual(f("-3"), 10.0)
+        self.assertEqual(f("abc"), 10.0)  # 非法 → 防滥用下限
+
+    def test_probe_spike_due_matrix(self) -> None:
+        mod = load_proxy_module()
+        f = mod._probe_spike_due
+        self.assertFalse(f([]))
+        self.assertFalse(f([50.0] * 19))  # 样本不足 20 不告警
+        self.assertFalse(f([50.0] * 200))  # 无突增
+        # 突增：180×50 + 20×500，基线 P90=50（未污染），最近 20 P90=500 > 100
+        self.assertTrue(f([50.0] * 180 + [500.0] * 20))
+        # 涨幅 < 2×：60×50 + 20×120，基线 P90=120，最近 20 P90=120 ≤ 240
+        self.assertFalse(f([50.0] * 60 + [120.0] * 20))
+
+
+class ProbeEventsCompatTest(unittest.TestCase):
+    """P4 R2：events kind 白名单——新版读 probe_alert 保留 reason；
+    旧版本（3-kind 白名单）读含 probe_alert 的文件整条丢弃不崩。"""
+
+    def test_load_events_keeps_probe_alert_with_reason(self) -> None:
+        mod = load_proxy_module()
+        tmp = tempfile.mkdtemp(prefix="ctyun-proxy-p4evt-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        path = os.path.join(tmp, "settings.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"stats": {"events": [
+                {"ts": 100.0, "kind": "proxy", "model": "m", "status": 502},
+                {"ts": 200.0, "kind": "probe_alert", "model": None, "status": None,
+                 "reason": "consecutive_failures"},
+                {"ts": 300.0, "kind": "probe_alert", "model": None, "status": None,
+                 "reason": "latency_spike"},
+                {"ts": 400.0, "kind": "future_kind", "model": None, "status": None},
+            ]}}, fh)
+        events = mod.load_stats_events(path)
+        self.assertEqual([e["kind"] for e in events],
+                         ["proxy", "probe_alert", "probe_alert"])
+        self.assertEqual(events[1]["reason"], "consecutive_failures")
+        self.assertEqual(events[2]["reason"], "latency_spike")
+        self.assertNotIn("reason", events[0], "非 probe_alert 事件不得带 reason")
+
+    def test_old_whitelist_binary_drops_probe_alert_gracefully(self) -> None:
+        """R2 降级演练：旧版本 3-kind 白名单 load 逻辑读新格式 → 整条丢弃不崩。"""
+        mod = load_proxy_module()
+        tmp = tempfile.mkdtemp(prefix="ctyun-proxy-p4old-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        path = os.path.join(tmp, "settings.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"stats": {"events": [
+                {"ts": 100.0, "kind": "retry", "model": None, "status": None},
+                {"ts": 200.0, "kind": "probe_alert", "model": None, "status": None,
+                 "reason": "consecutive_failures"},
+            ]}}, fh)
+        # 模拟旧版本二进制：白名单写死 ("proxy", "upstream", "retry")——与 P4 前
+        # load_stats_events 源码逐字一致（inline 复刻，独立 oracle）。
+        data = mod._load_persist_file(path)
+        raw = data["stats"]["events"]
+        kept = []
+        for entry in raw:
+            if entry.get("kind") not in ("proxy", "upstream", "retry"):
+                continue
+            kept.append(entry)
+        self.assertEqual([e["kind"] for e in kept], ["retry"],
+                         "旧版本必须丢弃 probe_alert 且不崩（graceful degrade）")
 
 
 if __name__ == "__main__":

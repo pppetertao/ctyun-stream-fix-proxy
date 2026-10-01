@@ -120,6 +120,31 @@ PROBE_TIMEOUT_S = 5                # v2 P4：probe HEAD 请求超时
 PROBE_MIN_INTERVAL_S = 10          # v2 P4：probe 间隔下限（防滥用）
 PROBE_FAILURE_THRESHOLD = 3        # v2 P4：连续失败次数达此值触发 EVENTS probe_alert
 PROBE_ALERT_DEBOUNCE_S = 300       # v2 P4：同类 probe 告警最小间隔（去抖）
+PROBE_LATENCY_SPIKE_FACTOR = 2.0   # v2 P4：延迟突增告警阈值倍数（最近 20 次 P90 > 基线 P90 × 此值）
+PROBE_HISTORY_MAX = 20160          # v2 P4：probe 延迟历史 deque 上限（30s 间隔 × 7 天；内存态不持久化）
+
+
+def _probe_interval_s_from_env(raw: str) -> float:
+    """probe 间隔解析（env seam CTYUN_PROBE_INTERVAL_S，模块导入时求值一次）。
+
+    显式正数值原样采用（测试 0.5s 加速 seam）；空串回落默认 30s；≤0 或非法值
+    回落 PROBE_MIN_INTERVAL_S=10（防误配忙轮询打上游——"最小 10s 防滥用"只兜
+    非法值、不钳显式合法值，否则测试加速 seam 失效，见 PLAN Anchor A1）。
+    """
+    if not raw.strip():
+        return float(PROBE_INTERVAL_S_DEFAULT)
+    try:
+        value = float(raw)
+    except ValueError:
+        # 吞掉的是 env 里非法数值字符串：配置错误按防滥用下限回落，无其他路径可达。
+        return float(PROBE_MIN_INTERVAL_S)
+    if value <= 0:
+        return float(PROBE_MIN_INTERVAL_S)
+    return value
+
+
+PROBE_INTERVAL_S = _probe_interval_s_from_env(
+    os.environ.get("CTYUN_PROBE_INTERVAL_S", ""))
 STALL_THRESHOLD_S = float(os.environ.get("CTYUN_STALL_THRESHOLD_S", "5.0"))  # v2 P2：SSE 相邻 record 间隔 > 此值计一次 stall（env seam，测试降至 0.5 加速）
 
 ERROR_RING_MAX = 50
@@ -740,6 +765,7 @@ STRIP_HEADERS = HOP_HEADERS | {"host", "content-length", "accept-encoding"}
 #   PROBE_LOCK — P4 新增，保护 _PROBE_STATE；独立于 STATS_LOCK：探测线程与请求线程
 #                共享 STATS 时只经 STATS_LOCK 短持锁更新计数器，绝不持锁做网络 IO。
 _CFG_LOCK = threading.Lock()
+PROBE_LOCK = threading.Lock()
 STATS_LOCK = threading.Lock()
 STATS = {"requests_total": 0, "filtered_total": 0, "errors_total": 0,
          "empty_retries_total": 0, "eof_without_done_total": 0,
@@ -753,6 +779,19 @@ STATS = {"requests_total": 0, "filtered_total": 0, "errors_total": 0,
                    "window_chunks": 0, "window_tokens": 0},  # 60s 滑动窗（P2 bytes/chunks；tokens P3 填）
          "stalls_total": 0}
 _stats_dirty = False  # STATS_LOCK 保护：计数落盘脏标记（SIGTERM/60s 脏刷消费）
+
+# v2 P4：probe 主动探测状态。独立于 STATS（失败零副作用：不写 STATS 计数、
+# 不触发 _record_request、不污染 histogram），仅 EVENTS 告警 append 走 STATS_LOCK。
+PROBE_ENABLED = True  # _CFG_LOCK 护写；读侧无锁（bool 引用赋值原子，同 CAPTURE_ERRORS）
+_PROBE_STATE = {      # PROBE_LOCK 保护（探测线程写 / probe_state_snapshot 读）
+    "last_probe_ts": 0.0,           # time.time() 最近一次 probe 尝试（0=从未）
+    "last_probe_ok": False,
+    "last_probe_latency_ms": 0.0,
+    "consecutive_failures": 0,
+    "last_failure_alert_ts": 0.0,   # 连续失败告警去抖时间戳
+    "last_spike_alert_ts": 0.0,     # 延迟突增告警去抖时间戳（同类去抖，两桶独立）
+    "history": collections.deque(maxlen=PROBE_HISTORY_MAX),  # 成功 probe 延迟（ms）历史
+}
 STARTED_AT = time.time()
 RECENT_REQUESTS = collections.deque(maxlen=100)  # {"ts","method","path","status","dur_ms","filtered","model","rid","upstream_host","ttfb_ms","stream","tokens","bytes_out","chunks","outcome"}
 POISON_PREVIEWS = collections.deque(maxlen=20)   # {"ts","preview"} 最近剥除的 record 预览
@@ -1070,7 +1109,13 @@ def load_daily_by_model_buckets(path: str) -> dict:
 
 
 def load_stats_events(path: str) -> list:
-    """读 stats.events（oldest→newest，≤100 条）；缺/损坏/legacy 无键 → []。"""
+    """读 stats.events（oldest→newest，≤100 条）；缺/损坏/legacy 无键 → []。
+
+    kind 白名单含 probe_alert（v2 P4）：旧版本二进制读含 probe_alert 的文件时
+    白名单不命中 → 整条 continue 丢弃（graceful degrade，R2），不会崩。
+    reason 键仅 probe_alert 携带：新版本读入保留（合法 str 且 ≤200 字符），
+    其余 kind 不输出该键。
+    """
     stats = _load_persist_file(path).get("stats")
     raw = stats.get("events") if isinstance(stats, dict) else None
     if not isinstance(raw, list):
@@ -1081,7 +1126,7 @@ def load_stats_events(path: str) -> list:
             continue
         kind, ts = entry.get("kind"), entry.get("ts")
         model, status = entry.get("model"), entry.get("status")
-        if kind not in ("proxy", "upstream", "retry"):
+        if kind not in ("proxy", "upstream", "retry", "probe_alert"):
             continue
         if isinstance(ts, bool) or not isinstance(ts, (int, float)) or ts < 0:
             continue
@@ -1090,8 +1135,137 @@ def load_stats_events(path: str) -> list:
         if status is not None and (isinstance(status, bool) or not isinstance(status, int)
                                    or not 100 <= status <= 599):
             continue
-        out.append({"ts": ts, "kind": kind, "model": model, "status": status})
+        item = {"ts": ts, "kind": kind, "model": model, "status": status}
+        reason = entry.get("reason")
+        if kind == "probe_alert" and isinstance(reason, str) and reason \
+                and len(reason) <= 200:
+            item["reason"] = reason
+        out.append(item)
     return out[-100:]  # 与 deque maxlen 对齐，只留最新
+
+
+def _latency_p90(samples) -> float:
+    """延迟样本（ms，可迭代）的 P90（最近秩法：idx = int(0.9 * (n - 1))）。
+    空序列 → 0.0。样本上限 PROBE_HISTORY_MAX，排序成本可忽略（每成功 probe 一次）。"""
+    if not samples:
+        return 0.0
+    ordered = sorted(samples)
+    return float(ordered[int(0.9 * (len(ordered) - 1))])
+
+
+def _probe_spike_due(history, factor: float = PROBE_LATENCY_SPIKE_FACTOR) -> bool:
+    """延迟突增判定：最近 20 次成功 probe 的 P90 > 全历史 P90 × factor 且样本 ≥ 20。
+
+    history：成功 probe 延迟（ms）deque（新在尾）；len < 20 → False（样本不足不告警）。
+    """
+    if len(history) < 20:
+        return False
+    recent = list(history)[-20:]
+    baseline_p90 = _latency_p90(history)
+    if baseline_p90 <= 0:
+        return False
+    return _latency_p90(recent) > baseline_p90 * factor
+
+
+def _probe_once(host_base: str) -> tuple:
+    """单轮 probe：向 host_base 根 path 发 HEAD（独立连接，超时 PROBE_TIMEOUT_S）。
+
+    返回 (ok, latency_ms)：ok = HTTP status < 500；网络异常（OSError/http.client.HTTPException）
+    视为失败，latency 取整个尝试耗时。不解析响应体（spec Exclusions）。
+    零副作用：不写 STATS、不触发 _record_request、不持任何锁做网络 IO。
+    """
+    parsed = urllib.parse.urlsplit(host_base)
+    path = parsed.path.rstrip("/") or "/"
+    t_start = time.monotonic()
+    conn = None
+    try:
+        if parsed.scheme == "https":
+            conn = http.client.HTTPSConnection(parsed.hostname, parsed.port,
+                                               timeout=PROBE_TIMEOUT_S)
+        else:
+            conn = http.client.HTTPConnection(parsed.hostname, parsed.port,
+                                              timeout=PROBE_TIMEOUT_S)
+        conn.request("HEAD", path)
+        resp = conn.getresponse()
+        resp.read()  # 排空（HEAD 无 body；保证连接可复用语义完整）
+        ok = resp.status < 500
+    except (OSError, http.client.HTTPException):
+        # 吞掉的是连接失败/超时/对端 RST——probe 语义即"不可达=失败"，
+        # 单条 except 已覆盖全部可预期异常，无其他路径可达。
+        ok = False
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except OSError:
+                # 吞掉的是连接关闭阶段对端已断开（close 二次清理）：probe 结果已定，
+                # 关闭失败不影响成败判定，无其他路径可达。
+                pass
+    latency_ms = (time.monotonic() - t_start) * 1000
+    return ok, latency_ms
+
+
+def _probe_loop() -> None:
+    """probe daemon 线程（main() 恒启动一次；开关由每轮 flag 检查控制）。
+
+    probe_enabled=False 时空转：sleep 间隔 + 检查开关，零网络 IO 零副作用——
+    运行时 POST /api/probe 切 on/off 无需管理线程生命周期（裁决见 Anchor A4）。
+    每轮：_probe_once → PROBE_LOCK 内更新 _PROBE_STATE；连续失败 ≥
+    PROBE_FAILURE_THRESHOLD 且距上次同类告警 ≥ PROBE_ALERT_DEBOUNCE_S → EVENTS
+    追加 probe_alert（STATS_LOCK，与 _record_empty_retry 同款模式）；成功清零
+    连续失败并累积延迟历史；延迟突增（_probe_spike_due）同类去抖告警。
+    告警之外不碰 STATS（R3 零副作用，ProbeNoSideEffectTest 锚死）。
+    """
+    global _stats_dirty
+    while True:
+        time.sleep(PROBE_INTERVAL_S)
+        if not PROBE_ENABLED:
+            continue
+        ok, latency_ms = _probe_once(UPSTREAM_BASE)
+        alert_reason = None
+        with PROBE_LOCK:
+            state = _PROBE_STATE
+            state["last_probe_ts"] = time.time()
+            state["last_probe_ok"] = ok
+            state["last_probe_latency_ms"] = round(latency_ms, 1)
+            if ok:
+                state["consecutive_failures"] = 0
+                state["history"].append(round(latency_ms, 1))
+                if _probe_spike_due(state["history"]):
+                    now = time.time()
+                    if now - state["last_spike_alert_ts"] >= PROBE_ALERT_DEBOUNCE_S:
+                        state["last_spike_alert_ts"] = now
+                        alert_reason = "latency_spike"
+            else:
+                state["consecutive_failures"] += 1
+                if state["consecutive_failures"] >= PROBE_FAILURE_THRESHOLD:
+                    now = time.time()
+                    if now - state["last_failure_alert_ts"] >= PROBE_ALERT_DEBOUNCE_S:
+                        state["last_failure_alert_ts"] = now
+                        alert_reason = "consecutive_failures"
+        if alert_reason is not None:
+            with STATS_LOCK:
+                EVENTS.append({"ts": time.time(), "kind": "probe_alert",
+                               "model": None, "status": None,
+                               "reason": alert_reason})
+                _stats_dirty = True
+
+
+def probe_state_snapshot() -> dict:
+    """/api/health 用：spec 定死 6 键（host/last_probe_ts/last_probe_ok/
+    last_probe_latency_ms/consecutive_failures/probe_enabled）。
+    UPSTREAM_BASE 读侧无锁（引用赋值原子，同 _proxy 惯例）。"""
+    with PROBE_LOCK:
+        state = _PROBE_STATE
+        snap = {
+            "host": urllib.parse.urlparse(UPSTREAM_BASE).netloc,
+            "last_probe_ts": state["last_probe_ts"],
+            "last_probe_ok": state["last_probe_ok"],
+            "last_probe_latency_ms": state["last_probe_latency_ms"],
+            "consecutive_failures": state["consecutive_failures"],
+            "probe_enabled": PROBE_ENABLED,
+        }
+    return snap
 
 
 def flush_stats_if_dirty(path: str) -> None:
@@ -2702,6 +2876,10 @@ def main() -> None:
 
     threading.Thread(target=_dirty_flush_loop, daemon=True,
                      name="stats-flush").start()
+
+    # v2 P4：probe daemon（恒启动一次；enabled=False 时空转，见 _probe_loop docstring）
+    threading.Thread(target=_probe_loop, daemon=True,
+                     name="upstream-probe").start()
 
     server = http.server.ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), ProxyHandler)
     server.daemon_threads = True
