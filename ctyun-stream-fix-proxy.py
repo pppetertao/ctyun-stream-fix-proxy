@@ -2456,7 +2456,42 @@ _DASH_SECTIONS_TABLES = """  <section class="card">
   </section>
 """
 
-_DASH_SECTIONS_V2 = ""
+_DASH_SECTIONS_V2 = """  <section class="card">
+    <div class="card-title">上游健康<span class="chip" id="health-status">--</span></div>
+    <table>
+      <tbody id="upstream-health"><tr><td class="empty" colspan="2">读取中……</td></tr></tbody>
+    </table>
+  </section>
+  <section class="card">
+    <div class="card-title">模型速度对比 · TTFB P50/P90（进程内累计，最快在上）</div>
+    <div class="table-wrap">
+    <table>
+      <thead><tr><th>模型</th><th>P50</th><th>P90</th></tr></thead>
+      <tbody id="perf-model-body"><tr><td class="empty" colspan="3">读取中……</td></tr></tbody>
+    </table>
+    </div>
+  </section>
+  <section class="card">
+    <div class="card-title">延迟分布 · 三阶段 P50（连接 / 响应头 / 数据体）</div>
+    <svg id="latency-dist" viewBox="0 0 600 96" preserveAspectRatio="none" role="img"
+         aria-label="阶段延迟 P50 条形图"></svg>
+  </section>
+  <section class="card">
+    <div class="card-title">Token 用量按天 × 模型（<span id="token-title-range">近7天</span>，跨重启保留（每 60s 落盘））</div>
+    <div class="table-wrap">
+    <table>
+      <thead><tr><th>日期</th><th>模型</th><th>prompt tokens</th><th>completion tokens</th></tr></thead>
+      <tbody id="token-daily-body"><tr><td class="empty" colspan="4">读取中……</td></tr></tbody>
+    </table>
+    </div>
+  </section>
+  <section class="card" id="tri-state-card">
+    <div class="card-title">三态可用率 · 所选时段（<span id="tri-state-range">近7天</span>）</div>
+    <div class="tri-bar" style="display:flex;height:14px;border-radius:4px;overflow:hidden;gap:2px"
+         role="img" aria-label="ok / degraded / failed 占比条"></div>
+    <div id="tri-state-legend" style="color:var(--dim);font-size:12px;margin-top:8px"></div>
+  </section>
+"""
 
 _DASH_JS_CORE = """</main>
 <footer><div class="inner">

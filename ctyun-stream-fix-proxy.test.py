@@ -2527,22 +2527,18 @@ class ProxyDashboardUnitTest(unittest.TestCase):
             stop_fake_upstreams()
 
 
-class DashboardRefactorEquivalenceTest(unittest.TestCase):
-    """P5 Card 1 一次性守门：拆分前/后 DASHBOARD_HTML 逐字节等价（sha256 快照）。
-
-    Card 2 起 HTML 有意变化（V2 卡片），本类退役——旧内容不退化改由
-    DashboardV2SkeletonTest.test_old_content_intact + 既有 test_dashboard_html_full_page 守护。
-    """
+class DashboardV2SkeletonTest(unittest.TestCase):
+    """P5：V2 卡片骨架 + 拆分常量契约（模块级常量断言，无需子进程）。"""
 
     def setUp(self) -> None:
         self.mod = load_proxy_module()
 
-    def test_split_join_byte_equivalent(self) -> None:
+    def test_segment_constants_present_and_join(self) -> None:
         for name in ("_DASH_HEAD", "_DASH_SECTIONS_STATIC", "_DASH_SECTIONS_TABLES",
                      "_DASH_SECTIONS_V2", "_DASH_JS_CORE", "_DASH_JS_V2"):
             self.assertTrue(hasattr(self.mod, name), "拆分常量 %s 缺失" % name)
-        self.assertEqual(self.mod._DASH_SECTIONS_V2, "",
-                         "Card 1 阶段 _DASH_SECTIONS_V2 必须为空串（纯重构不加内容）")
+        self.assertTrue(self.mod._DASH_SECTIONS_V2,
+                        "_DASH_SECTIONS_V2 不得为空（V2 卡片应已填充）")
         joined = ("".join([
             self.mod._DASH_HEAD, self.mod._DASH_SECTIONS_STATIC,
             self.mod._DASH_SECTIONS_TABLES, self.mod._DASH_SECTIONS_V2,
@@ -2551,11 +2547,30 @@ class DashboardRefactorEquivalenceTest(unittest.TestCase):
         ])).encode("utf-8")
         self.assertEqual(joined, self.mod.DASHBOARD_HTML,
                          "DASHBOARD_HTML 必须等于 6 段常量按序 join + 尾部字面量")
-        # 重构前 HTML 快照 sha256（main@bd2554f 实测，24466 字节）
-        self.assertEqual(
-            hashlib.sha256(self.mod.DASHBOARD_HTML).hexdigest(),
-            "2e4dfdb4f602fddb1a7f9484b2c14eb73a97bc6ef1d618874d9acb9276c9539c",
-            "拆分后 HTML 与重构前快照逐字节不一致")
+
+    def test_v2_containers_present(self) -> None:
+        v2 = self.mod._DASH_SECTIONS_V2
+        for cid in ("perf-model-body", "token-daily-body", "upstream-health",
+                    "tri-state-card", "latency-dist"):
+            self.assertIn('id="%s"' % cid, v2, "V2 区块缺容器 %s" % cid)
+
+    def test_old_content_intact(self) -> None:
+        # R5 兜底：旧区块不因拆段/加卡退化（模块级快断言；子进程集成测试仍独立守护）
+        html = self.mod.DASHBOARD_HTML.decode("utf-8")
+        for marker in ("保存上游端点", "剥行流带", 'id="daily-body"',
+                       'id="daily-model-body"', "renderStats", "renderDailyByModel",
+                       'data-range="last_month"', "spark"):
+            self.assertIn(marker, html, "旧内容退化，缺 %s" % marker)
+
+    def test_no_inner_html_anywhere(self) -> None:
+        for name in ("_DASH_HEAD", "_DASH_SECTIONS_STATIC", "_DASH_SECTIONS_TABLES",
+                     "_DASH_SECTIONS_V2", "_DASH_JS_CORE", "_DASH_JS_V2"):
+            self.assertIsNone(re.search(r"\.innerHTML\s*=", getattr(self.mod, name)),
+                              "%s 含 innerHTML 赋值（动态数据必须 textContent）" % name)
+        html = self.mod.DASHBOARD_HTML.decode("utf-8")
+        self.assertEqual(html.count("innerHTML"), 0, "整页必须 0 个 innerHTML 出现")
+        self.assertGreaterEqual(html.count("textContent"), 1,
+                                "textContent 出现次数必须 ≥ innerHTML（此处 innerHTML=0）")
 
 
 class AdminIntegrationTest(unittest.TestCase):
