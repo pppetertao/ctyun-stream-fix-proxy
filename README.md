@@ -57,6 +57,7 @@ launchctl kickstart -k gui/$UID/com.ctyun-stream-fix-proxy
 | `CTYUN_HEADER_TIMEOUT` | `45` | 头阶段（连接+响应头）超时（秒），最小值 1 |
 | `CTYUN_HEADER_RETRY` | `1` | 头阶段故障（超时/断连/RST）自动重试开关（>0 开启单次重试，0 禁用） |
 | `CTYUN_MODEL_PRICING` | 空 | 模型价目表 JSON 字符串（可选 cost 估算数据源）；仅落 persist 顶层 `model_pricing` schema，不实现任何计费 UI |
+| `CTYUN_PROBE_INTERVAL_S` | `30` | 主动探测 HEAD 间隔（秒）；显式正数原样采用（测试加速 seam），≤0/非法值回落 `10` |
 
 配置优先级：env > 持久化文件 > 内置默认。
 
@@ -65,6 +66,8 @@ launchctl kickstart -k gui/$UID/com.ctyun-stream-fix-proxy
 - `GET /api/stats` — 全量统计 JSON（计数 / daily 分桶 / daily_by_model / recent 100 / 毒行流带 / range_stats 四维度聚合 / range_bounds 四维度窗口闭区间；后两键为加性新增，旧消费者零破坏）
 - `GET /api/config` — 当前上游 base URL
 - `POST /api/config` `{"upstream_base": "..."}` — 热切上游（本机免鉴权，LAN 需 `X-Admin-Token`）
+- `GET /api/health` — 上游健康（最近 probe 时间/延迟/连续失败/开关 `probe_enabled`）
+- `POST /api/probe` `{"enabled": true|false}` — 切主动探测开关（本机免鉴权，LAN 需 `X-Admin-Token`；env `CTYUN_PROBE_ENABLED`（`1/true` 开、`0/false` 关）优先，否则持久化顶层 `probe_enabled`，缺省开）
 - `GET /api/errors` — 错误留痕列表（newest-first，不含 body/response）。无鉴权（敏感度与 `/api/stats` 同级）。默认 off（`count:0`、`events:[]`）；关闭开关只停止新增，已留痕事件保留至环自然淘汰，期间 `?id=` 详情仍可读取。
 - `GET /api/errors?id=N` — 单条错误事件详情（含 body/response 快照，≤4096/≤2048 字符）。**需鉴权**：本机（127.0.0.1/::1）放行，非本机需 `X-Admin-Token` 头（与 `POST /api/config` 同一 HMAC 比对）。id 不存在返回 404。
 - `POST /api/config` — 现支持可选 `capture_errors` 布尔键：`{"upstream_base":"...","capture_errors":true}`。仅 upstream_base 必填，capture_errors 可选；可单独 POST 开关。
