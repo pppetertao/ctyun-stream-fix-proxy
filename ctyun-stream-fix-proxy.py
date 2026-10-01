@@ -365,7 +365,7 @@ def _outcome_tri_state(outcome) -> str:
 
 # --- TPM rate limiting（module-level state，全部由 TPM_LOCK 保护）---
 
-_TpmWaiter = collections.namedtuple("_TpmWaiter", "key_id est enqueued_at")
+_TpmWaiter = collections.namedtuple("_TpmWaiter", "key_id est enqueued_at model")
 
 # collections.deque 是 C 类型无 __dict__，不能挂 .used 属性；Python 空子类有
 # __dict__ 可承载 .used，而 len()/popleft/append/迭代语义与原 deque 完全一致
@@ -373,10 +373,10 @@ class _TpmBucket(collections.deque):
     pass
 
 TPM_LOCK = threading.Condition()
-TPM_BUCKETS: dict = {}                 # key_id -> _TpmBucket（deque 条目 + 附加属性 .used）
+TPM_BUCKETS: dict = {}                 # (key_id, model) -> _TpmBucket（deque 条目 + 附加属性 .used）
 TPM_WAITERS: collections.deque = collections.deque()  # FIFO 排队（of _TpmWaiter）
-_tpm_rejected: dict = {}               # key_id -> queue-full 拒绝计数（快照用）
-_tpm_timeouts: dict = {}               # key_id -> queue-timeout 计数（快照用）
+_tpm_rejected: dict = {}               # (key_id, model) -> queue-full 拒绝计数（快照用）
+_tpm_timeouts: dict = {}               # (key_id, model) -> queue-timeout 计数（快照用）
 
 
 def tpm_key_id(auth_header):
@@ -446,20 +446,21 @@ def _tpm_prune(bucket, now: float) -> None:
         bucket.used -= tokens
 
 
-def _tpm_get_bucket(key_id: str):
-    """取 key 的桶；不存在则惰性创建（cap 满时先驱逐空桶）。仅在 TPM_LOCK 内调用。"""
-    bucket = TPM_BUCKETS.get(key_id)
+def _tpm_get_bucket(key_id: str, model):
+    """取 (key_id, model) 的桶；不存在则惰性创建（cap 满时先驱逐空桶）。仅在 TPM_LOCK 内调用。"""
+    k = (key_id, model)
+    bucket = TPM_BUCKETS.get(k)
     if bucket is None:
         if len(TPM_BUCKETS) >= TPM_KEY_CAP:
             # 惰性驱逐：窗口空且无排队的桶（窗口自动过期，最旧优先）
-            idle = [k for k, b in TPM_BUCKETS.items()
+            idle = [bkey for bkey, b in TPM_BUCKETS.items()
                     if b.used <= 0
-                    and not any(w.key_id == k for w in TPM_WAITERS)]
-            for k in idle:
-                del TPM_BUCKETS[k]
+                    and not any((w.key_id, w.model) == bkey for w in TPM_WAITERS)]
+            for bkey in idle:
+                del TPM_BUCKETS[bkey]
         bucket = _TpmBucket()
         bucket.used = 0
-        TPM_BUCKETS[key_id] = bucket
+        TPM_BUCKETS[k] = bucket
     return bucket
 
 
@@ -476,13 +477,16 @@ def _tpm_remove_waiter(waiter) -> None:
             return
 
 
-def tpm_admit(key_id: str, est: int):
-    """TPM 准入（与入队同锁，原子）。返回 (status, qwait_ms)。
+def tpm_admit(key_id: str, est: int, model):
+    """TPM 准入（与入队同原子）。返回 (status, qwait_ms)。
 
-    status: "ok"（准入）/ "full"（队列满或 est 超预算，立即 429）/
+    status: "ok"（准入）/ "full"（队列满或 est 超预算且窗口非空闲，立即 429）/
             "timeout"（排队超时，429）。
     规则：
-    - est > TPM_LIMIT → 直接 ("full", 0)（永远等不到，不入队）。
+    - budget = tpm_limit_for(model)（per-model 表 → 内置默认 → TPM_LIMIT）。
+    - est > budget → 空闲放行判定：prune 后 bucket.used <= 0 且无同桶 waiter →
+      放行（超大请求占满窗口，后续排队至窗口滚过属预期）；否则 ("full", 0)
+      并计 rejected（先 touch 建桶，拒绝计数可见）。
     - 窗口内充足 → 入桶 ("ok", 0)。
     - 否则入队 FIFO；仅队首 waiter 可被准入（严格 FIFO 防惊群）；
       wait 循环 TPM_LOCK.wait(timeout=min(1.0, remaining)) + deadline 检查
@@ -491,34 +495,47 @@ def tpm_admit(key_id: str, est: int):
     - deadline 到仍未准入 → ("timeout", 0) 并自队列移除。
     排队期间不持有任何上游连接（hook 点在 _open_upstream 之前）。
     """
-    if est > TPM_LIMIT:
-        return ("full", 0)
+    budget = tpm_limit_for(model)
     started = time.time()
     with TPM_LOCK:
-        bucket = _tpm_get_bucket(key_id)
+        bucket = _tpm_get_bucket(key_id, model)
         _tpm_prune(bucket, started)
-        if bucket.used + est <= TPM_LIMIT:
+        if est > budget:
+            # 超大请求唯一例外：窗口空闲（used<=0）且无同桶排队 → 放行（决策 3）；
+            # 否则硬拒并计 rejected（决策 4：先 touch 建桶，拒绝计数可见）。
+            if bucket.used <= 0 and not any(
+                    (w.key_id, w.model) == (key_id, model) for w in TPM_WAITERS):
+                bucket.append((started, est))
+                bucket.used += est
+                return ("ok", 0)
+            _tpm_rejected[(key_id, model)] = \
+                _tpm_rejected.get((key_id, model), 0) + 1
+            return ("full", 0)
+        if bucket.used + est <= budget:
             bucket.append((started, est))
             bucket.used += est
             return ("ok", 0)
         if len(TPM_WAITERS) >= TPM_QUEUE_MAX:
-            _tpm_rejected[key_id] = _tpm_rejected.get(key_id, 0) + 1
+            _tpm_rejected[(key_id, model)] = \
+                _tpm_rejected.get((key_id, model), 0) + 1
             return ("full", 0)
-        waiter = _TpmWaiter(key_id=key_id, est=est, enqueued_at=started)
+        waiter = _TpmWaiter(key_id=key_id, est=est, enqueued_at=started,
+                            model=model)
         TPM_WAITERS.append(waiter)
         deadline = started + TPM_QUEUE_TIMEOUT_S
         try:
             while True:
                 remaining = deadline - time.time()
                 if remaining <= 0:
-                    _tpm_timeouts[key_id] = _tpm_timeouts.get(key_id, 0) + 1
+                    _tpm_timeouts[(key_id, model)] = \
+                        _tpm_timeouts.get((key_id, model), 0) + 1
                     return ("timeout", 0)
                 head = TPM_WAITERS[0] if TPM_WAITERS else None
                 if head is waiter:
                     now = time.time()
-                    bucket = _tpm_get_bucket(key_id)
+                    bucket = _tpm_get_bucket(key_id, model)
                     _tpm_prune(bucket, now)
-                    if bucket.used + est <= TPM_LIMIT:
+                    if bucket.used + est <= budget:
                         TPM_WAITERS.popleft()
                         bucket.append((now, est))
                         bucket.used += est
@@ -530,7 +547,7 @@ def tpm_admit(key_id: str, est: int):
             _tpm_remove_waiter(waiter)
 
 
-def tpm_settle(key_id: str, est: int, actual: int) -> None:
+def tpm_settle(key_id: str, est: int, actual: int, model) -> None:
     """结算：以实际 usage 校正窗口占用。
 
     prune 后追加校正条目 (now, delta)，delta = actual - est（可为负 = 退款）；
@@ -539,9 +556,9 @@ def tpm_settle(key_id: str, est: int, actual: int) -> None:
     """
     now = time.time()
     with TPM_LOCK:
-        bucket = TPM_BUCKETS.get(key_id)
+        bucket = TPM_BUCKETS.get((key_id, model))
         if bucket is None:
-            return  # 该 key 从未准入（不可能路径，防御处理）
+            return  # 该 (key, model) 从未准入（不可能路径，防御处理）
         _tpm_prune(bucket, now)
         delta = actual - est
         if delta != 0:
@@ -553,33 +570,38 @@ def tpm_settle(key_id: str, est: int, actual: int) -> None:
 def tpm_snapshot() -> dict:
     """TPM 状态快照（/api/tpm_stats 端点用）。
 
-    返回 {"config": {"limit", "window_s", "queue_max"},
+    返回 {"config": {"limit", "window_s", "queue_max", "limit_by_model"},
           "queue_total", "buckets": [...]}；
-    bucket 条目 {"key"（sha256: 前缀 + 前 12 位 hex）, "used", "remaining",
-                 "queued", "rejected", "timeouts"}——key 脱敏，无原始 key 泄漏。
+    bucket 条目 {"key"（sha256: 前缀 + 前 12 位 hex）, "model", "used",
+                 "remaining", "queued", "rejected", "timeouts"}——key 脱敏，
+    无原始 key 泄漏。
     展示层钳位：存储 used 可为负（窗口欠账，见 _tpm_prune 不变量），
-    对外 used 取 max(0, used)，避免暴露/展示负值。
+    对外 used 取 max(0, used)，remaining 按 per-model 预算计算，避免暴露/展示负值。
     """
     now = time.time()
     with TPM_LOCK:
         buckets = []
-        for key_id, bucket in TPM_BUCKETS.items():
+        for (key_id, model), bucket in TPM_BUCKETS.items():
             _tpm_prune(bucket, now)
-            if bucket.used <= 0 and not any(w.key_id == key_id for w in TPM_WAITERS):
+            if bucket.used <= 0 and not any(
+                    (w.key_id, w.model) == (key_id, model) for w in TPM_WAITERS):
                 continue  # 空桶不展示（噪声）
             buckets.append({
                 "key": "sha256:" + key_id[:12],
+                "model": model,
                 "used": max(0, bucket.used),
-                "remaining": max(0, TPM_LIMIT - bucket.used),
-                "queued": sum(1 for w in TPM_WAITERS if w.key_id == key_id),
-                "rejected": _tpm_rejected.get(key_id, 0),
-                "timeouts": _tpm_timeouts.get(key_id, 0),
+                "remaining": max(0, tpm_limit_for(model) - bucket.used),
+                "queued": sum(1 for w in TPM_WAITERS
+                              if (w.key_id, w.model) == (key_id, model)),
+                "rejected": _tpm_rejected.get((key_id, model), 0),
+                "timeouts": _tpm_timeouts.get((key_id, model), 0),
             })
         return {
             "config": {
                 "limit": TPM_LIMIT,
                 "window_s": TPM_WINDOW_S,
                 "queue_max": TPM_QUEUE_MAX,
+                "limit_by_model": TPM_LIMIT_BY_MODEL,
             },
             "queue_total": len(TPM_WAITERS),
             "buckets": buckets,
@@ -1401,7 +1423,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         tpm_final_used = None
         if tpm_key is not None:
             tpm_est = estimate_request_tokens(body)
-            tpm_status, tpm_qwait_ms = tpm_admit(tpm_key, tpm_est)
+            tpm_status, tpm_qwait_ms = tpm_admit(tpm_key, tpm_est, model)
             if tpm_status in ("full", "timeout"):
                 # 锁外记录（tpm_admit 已释放 TPM_LOCK，锁序安全）
                 self._reply_tpm_429(tpm_status)
@@ -1460,7 +1482,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self._reply_502(exc)
             # TPM 退款：上游不可达/响应头阶段异常 → 全额退款
             if tpm_key is not None:
-                tpm_settle(tpm_key, tpm_est, 0)
+                tpm_settle(tpm_key, tpm_est, 0, model)
             outcome = classify_outcome(synth_502=True)
             self._log(started, 502, outcome.log_result, 0, model=model, exc=exc,
                       retried=header_retried, retry_reason=header_retry_reason,
@@ -1507,7 +1529,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     self._reply_502(retry_exc)  # 客户端尚未收到字节，502 语义与既有路径一致
                     # TPM 退款：重试仍失败 → 全额退款
                     if tpm_key is not None:
-                        tpm_settle(tpm_key, tpm_est, 0)
+                        tpm_settle(tpm_key, tpm_est, 0, model)
                     outcome = classify_outcome(synth_502=True)
                     self._log(started, 502, outcome.log_result, 0, model=model, retried=1,
                               retry_reason=retry_reason, exc=retry_exc,
@@ -1568,7 +1590,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             if tpm_key is not None and self._tpm_usage is not None:
                 total = self._tpm_usage.get("total_tokens")
                 if isinstance(total, int) and total >= 0:
-                    tpm_settle(tpm_key, tpm_est, total)
+                    tpm_settle(tpm_key, tpm_est, total, model)
                     tpm_final_used = total
             self._log(started, resp.status, result, filtered, model=model, retried=retried,
                       retry_reason=retry_reason,
@@ -1614,7 +1636,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                             if tpm_key is not None:
                                 total = usage.get("total_tokens")
                                 if isinstance(total, int) and total >= 0:
-                                    tpm_settle(tpm_key, tpm_est, total)
+                                    tpm_settle(tpm_key, tpm_est, total, model)
                                     tpm_final_used = total
             outcome = classify_outcome(status=resp.status, body_error=body_error)
             self._log(started, resp.status, outcome.log_result, 0, model=model,

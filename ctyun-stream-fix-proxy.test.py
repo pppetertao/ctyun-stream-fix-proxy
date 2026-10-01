@@ -1051,35 +1051,50 @@ class ProxyDashboardUnitTest(unittest.TestCase):
     def test_tpm_admit_ok_immediate(self) -> None:
         mod = self.mod
         self._tpm_cleanup(mod)
-        status, qwait = mod.tpm_admit("key:imm", 100)
+        status, qwait = mod.tpm_admit("key:imm", 100, "m:imm")
         self.assertEqual(status, "ok")
         self.assertEqual(qwait, 0)
-        self.assertEqual(mod.TPM_BUCKETS["key:imm"].used, 100)
+        self.assertEqual(mod.TPM_BUCKETS[("key:imm", "m:imm")].used, 100)
         self.assertEqual(len(mod.TPM_WAITERS), 0)
 
     def test_tpm_admit_full_oversized(self) -> None:
+        """est > budget：窗口空闲放行（决策 3）、忙时硬拒并计 rejected（决策 4）。"""
         mod = self.mod
         self._tpm_cleanup(mod)
-        status, qwait = mod.tpm_admit("key:big", mod.TPM_LIMIT + 1)
-        self.assertEqual(status, "full")
+        # ① 空闲：used=0 且无同桶 waiter → 放行（budget 来自 tpm_limit_for）
+        status, qwait = mod.tpm_admit("key:big", mod.TPM_LIMIT + 1, "m:big")
+        self.assertEqual(status, "ok", "idle window must release oversized request")
         self.assertEqual(qwait, 0)
-        self.assertNotIn("key:big", mod.TPM_BUCKETS)  # 不入桶
-        self.assertEqual(len(mod.TPM_WAITERS), 0)     # 不入队
+        self.assertEqual(mod.TPM_BUCKETS[("key:big", "m:big")].used,
+                         mod.TPM_LIMIT + 1)
+        self.assertEqual(len(mod.TPM_WAITERS), 0)
+        # ② 忙时：used > 0 → 硬拒 + rejected 计数（同桶）
+        status2, qwait2 = mod.tpm_admit("key:big", mod.TPM_LIMIT + 1, "m:big")
+        self.assertEqual(status2, "full", "busy window must reject oversized request")
+        self.assertEqual(qwait2, 0)
+        self.assertEqual(mod._tpm_rejected.get(("key:big", "m:big")), 1)
+        self.assertEqual(len(mod.TPM_WAITERS), 0)  # 不入队
+        # ③ 窗口滚过后（模拟 prune 后 used<=0）→ 再次空闲放行，模型隔离
+        bucket = mod.TPM_BUCKETS[("key:big", "m:big")]
+        bucket.clear()
+        bucket.used = 0
+        status3, qwait3 = mod.tpm_admit("key:big", mod.TPM_LIMIT + 1, "m:big")
+        self.assertEqual(status3, "ok")
 
     def test_tpm_admit_queue_full(self) -> None:
         mod = self.mod
         self._tpm_cleanup(mod)
         mod.TPM_QUEUE_MAX = 2
         try:
-            mod.tpm_admit("key:qfull", mod.TPM_LIMIT)  # 占满预算
+            mod.tpm_admit("key:qfull", mod.TPM_LIMIT, "m:qfull")  # 占满预算
             # 两个 waiter 已在队（绕过 wait 循环用私有结构直接入队，验证队满拒绝分支）
             with mod.TPM_LOCK:
-                mod.TPM_WAITERS.append(mod._TpmWaiter("key:qfull", 1, 0))
-                mod.TPM_WAITERS.append(mod._TpmWaiter("key:qfull", 1, 0))
-            status3, qwait3 = mod.tpm_admit("key:qfull", 1)
+                mod.TPM_WAITERS.append(mod._TpmWaiter("key:qfull", 1, 0, "m:qfull"))
+                mod.TPM_WAITERS.append(mod._TpmWaiter("key:qfull", 1, 0, "m:qfull"))
+            status3, qwait3 = mod.tpm_admit("key:qfull", 1, "m:qfull")
             self.assertEqual(status3, "full")
             self.assertEqual(qwait3, 0)
-            self.assertEqual(mod._tpm_rejected.get("key:qfull"), 1)
+            self.assertEqual(mod._tpm_rejected.get(("key:qfull", "m:qfull")), 1)
             self.assertEqual(len(mod.TPM_WAITERS), 2)  # 第三个未入队
         finally:
             mod.TPM_QUEUE_MAX = 20
@@ -1088,16 +1103,16 @@ class ProxyDashboardUnitTest(unittest.TestCase):
     def test_tpm_settle_corrects_usage(self) -> None:
         mod = self.mod
         self._tpm_cleanup(mod)
-        mod.tpm_admit("key:settle", 500)
+        mod.tpm_admit("key:settle", 500, "m:settle")
         # 实际 200 → 退款 300
-        mod.tpm_settle("key:settle", 500, 200)
-        self.assertEqual(mod.TPM_BUCKETS["key:settle"].used, 200)
+        mod.tpm_settle("key:settle", 500, 200, "m:settle")
+        self.assertEqual(mod.TPM_BUCKETS[("key:settle", "m:settle")].used, 200)
         # 实际 800 → 追加 300
-        mod.tpm_settle("key:settle", 500, 800)
-        self.assertEqual(mod.TPM_BUCKETS["key:settle"].used, 500)
+        mod.tpm_settle("key:settle", 500, 800, "m:settle")
+        self.assertEqual(mod.TPM_BUCKETS[("key:settle", "m:settle")].used, 500)
         # 0 → 全额退款
-        mod.tpm_settle("key:settle", 500, 0)
-        self.assertEqual(mod.TPM_BUCKETS["key:settle"].used, 0)
+        mod.tpm_settle("key:settle", 500, 0, "m:settle")
+        self.assertEqual(mod.TPM_BUCKETS[("key:settle", "m:settle")].used, 0)
 
     def test_tpm_settle_prune_invariant_no_ghost_tokens(self) -> None:
         """存储不变量：used 恒等于 deque 条目之和（rev spec 0f2e88e 决策 2）。
@@ -1128,14 +1143,14 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         mod.TPM_QUEUE_TIMEOUT_S = 5.0
         results = {}
         # 占满预算
-        mod.tpm_admit("key:wake", mod.TPM_LIMIT)
+        mod.tpm_admit("key:wake", mod.TPM_LIMIT, "m:wake")
         def waiter():
-            results["w"] = mod.tpm_admit("key:wake", 10)
+            results["w"] = mod.tpm_admit("key:wake", 10, "m:wake")
         t = threading.Thread(target=waiter)
         t.start()
         time.sleep(0.2)  # 给 waiter 入队时间（确定性：settle 后立即 notify）
         self.assertEqual(len(mod.TPM_WAITERS), 1)
-        mod.tpm_settle("key:wake", mod.TPM_LIMIT, 0)  # 全额退款唤醒
+        mod.tpm_settle("key:wake", mod.TPM_LIMIT, 0, "m:wake")  # 全额退款唤醒
         t.join(timeout=5)
         self.assertFalse(t.is_alive())
         self.assertIn("w", results)
@@ -1148,12 +1163,12 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         self._tpm_cleanup(mod)
         mod.TPM_QUEUE_TIMEOUT_S = 0.3
         try:
-            mod.tpm_admit("key:to", mod.TPM_LIMIT)  # 占满
+            mod.tpm_admit("key:to", mod.TPM_LIMIT, "m:to")  # 占满
             started = time.time()
-            status, qwait = mod.tpm_admit("key:to", 10)
+            status, qwait = mod.tpm_admit("key:to", 10, "m:to")
             self.assertEqual(status, "timeout")
             self.assertLess(time.time() - started, 3.0)
-            self.assertEqual(mod._tpm_timeouts.get("key:to"), 1)
+            self.assertEqual(mod._tpm_timeouts.get(("key:to", "m:to")), 1)
             self.assertEqual(len(mod.TPM_WAITERS), 0)  # 已自队列移除
         finally:
             mod.TPM_QUEUE_TIMEOUT_S = 120
@@ -1167,8 +1182,8 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         """
         mod = self.mod
         self._tpm_cleanup(mod)
-        w1 = mod._TpmWaiter("k", 10, 123.5)
-        w2 = mod._TpmWaiter("k", 10, 123.5)
+        w1 = mod._TpmWaiter("k", 10, 123.5, "m:ident")
+        w2 = mod._TpmWaiter("k", 10, 123.5, "m:ident")
         self.assertEqual(w1, w2)      # namedtuple 值相等
         self.assertIsNot(w1, w2)      # 但非同一对象
         mod.TPM_WAITERS.append(w1)
@@ -1191,11 +1206,12 @@ class ProxyDashboardUnitTest(unittest.TestCase):
     def test_tpm_snapshot_shape_and_masking(self) -> None:
         mod = self.mod
         self._tpm_cleanup(mod)
-        mod.tpm_admit(mod.tpm_key_id("Bearer key:snap"), 100)
+        mod.tpm_admit(mod.tpm_key_id("Bearer key:snap"), 100, "m:snap")
         snap = mod.tpm_snapshot()
         self.assertEqual(snap["config"]["limit"], mod.TPM_LIMIT)
         self.assertEqual(snap["config"]["window_s"], mod.TPM_WINDOW_S)
         self.assertEqual(snap["config"]["queue_max"], mod.TPM_QUEUE_MAX)
+        self.assertEqual(snap["config"]["limit_by_model"], mod.TPM_LIMIT_BY_MODEL)
         self.assertEqual(snap["queue_total"], 0)
         self.assertEqual(len(snap["buckets"]), 1)
         b = snap["buckets"][0]
@@ -1203,6 +1219,7 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         expected_short = "sha256:" + hashlib.sha256(b"key:snap").hexdigest()[:12]
         self.assertEqual(b["key"], expected_short)
         self.assertNotIn("key:snap", b["key"])  # 无原始 key 泄漏
+        self.assertEqual(b["model"], "m:snap")
         self.assertEqual(b["used"], 100)
         self.assertEqual(b["remaining"], mod.TPM_LIMIT - 100)
         self.assertEqual(b["queued"], 0)
@@ -4432,7 +4449,7 @@ class RequestIdTest(unittest.TestCase):
             "502 响应必须带 X-Request-Id，got %r" % x_request_id)
 
 class TpmAdmitHookTest(unittest.TestCase):
-    """TPM 准入 hook 冒烟：est 超预算的带 key 请求被 429 拦截（不触上游）。"""
+    """TPM 准入 hook 冒烟：est 超预算的带 key 请求空闲放行、忙时 429（不触上游）。"""
 
     def setUp(self) -> None:
         self.upstream_port, self.calls = make_scripted_upstream(
@@ -4449,21 +4466,27 @@ class TpmAdmitHookTest(unittest.TestCase):
             shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
         stop_fake_upstreams()
 
-    def test_oversized_est_rejected_before_upstream(self) -> None:
-        """est > TPM_LIMIT(50) 的请求直接 429，上游 calls 计数不变。"""
+    def test_oversized_idle_release_then_busy_429(self) -> None:
+        """est > TPM_LIMIT(50)：窗口空闲首发放行（200，触上游）；
+        窗口占用后同 key 同 model 再发 → 429（used>0），上游 calls 不再增长。"""
         # len ~209 bytes → est = max(1, 209*0.25) = 52 > 50
         big = (b'{"model":"x","stream":true,"messages":[{"role":"user","content":"'
                + b"y" * 140 + b'"}]}')
+        # ① 空闲放行
         status, data = post_sse_auth(self.proxy_port, big, "Bearer test-key")
-        self.assertEqual(status, 429, "oversized est must be rejected, got body %r"
-                         % data[:120])
-        parsed = json.loads(data.decode("utf-8"))
-        self.assertEqual(parsed["error"]["code"], "model_tpm_limit")
-        self.assertEqual(self.calls, [], "rejected request must not hit upstream")
-        # 无 Authorization 的同体请求直通
-        status2, _ = post_sse_auth(self.proxy_port, big, None)
-        self.assertEqual(status2, 200, "no-auth request must bypass TPM")
+        self.assertEqual(status, 200, "idle window must release oversized request")
+        self.assertEqual(data, SSE_A + SSE_B + SSE_DONE)
         self.assertEqual(len(self.calls), 1)
+        # ② 同 key 同 model 再发：used=52>0 → 429，不触上游
+        status2, data2 = post_sse_auth(self.proxy_port, big, "Bearer test-key")
+        self.assertEqual(status2, 429, "busy window must reject oversized request")
+        parsed = json.loads(data2.decode("utf-8"))
+        self.assertEqual(parsed["error"]["code"], "model_tpm_limit")
+        self.assertEqual(len(self.calls), 1, "rejected request must not hit upstream")
+        # ③ 无 Authorization 的同体请求直通（向后兼容）
+        status3, _ = post_sse_auth(self.proxy_port, big, None)
+        self.assertEqual(status3, 200, "no-auth request must bypass TPM")
+        self.assertEqual(len(self.calls), 2)
 
 
 class TpmRateLimitTest(unittest.TestCase):
@@ -4675,28 +4698,31 @@ class TpmRateLimitTest(unittest.TestCase):
         self.assertNotIn("tpm-queue", stderr)
 
     def test_tpm_stats_endpoint(self) -> None:
-        """/api/tpm_stats 返回 200 JSON：config 与 env seam 一致，bucket used 与
-        REQ 行 tpm= 计数一致，key 字段 sha256: 前缀脱敏（无原始 key 泄漏）。"""
-        small_body = b'{"model":"m","stream":true,"messages":[]}'   # 41B → est = 10
+        """/api/tpm_stats 返回 200 JSON：config 与 env seam 一致（含 limit_by_model），
+        bucket used 与 REQ 行 tpm= 计数一致，key 字段 sha256: 前缀脱敏，model 字段存在。"""
+        small_body = b'{"model":"m","stream":true,"messages":[]}'   # 41B -> est = 10
         auth = "Bearer test-key-stats"
         status, _ = post_sse_auth(self.proxy_port, small_body, auth)
         self.assertEqual(status, 200)
-        expected_used = max(1, int(len(small_body) * TPM_RATIO))   # 无 usage 帧 → used 保持 est
+        expected_used = max(1, int(len(small_body) * TPM_RATIO))
         status, body, ctype = admin_get(self.proc.admin_port, "/api/tpm_stats")
         self.assertEqual(status, 200)
         self.assertTrue(ctype and ctype.startswith("application/json"),
                         "Content-Type must be application/json, got %r" % ctype)
         snap = json.loads(body.decode("utf-8"))
-        self.assertEqual(snap["config"], {"limit": 110, "window_s": 2, "queue_max": 2},
+        self.assertEqual(snap["config"],
+                         {"limit": 110, "window_s": 2, "queue_max": 2,
+                          "limit_by_model": {}},
                          "config must reflect env seams, got %r" % snap["config"])
         self.assertEqual(snap["queue_total"], 0)
         self.assertEqual(len(snap["buckets"]), 1)
         b = snap["buckets"][0]
-        # key 脱敏：sha256(token) 前 12 位 hex，无原始 key（依赖卡 2 的 import hashlib）
         expected_short = "sha256:" + hashlib.sha256(b"test-key-stats").hexdigest()[:12]
         self.assertEqual(b["key"], expected_short,
                          "bucket key must be sha256: prefix + 12 hex, got %r" % b["key"])
         self.assertNotIn("test-key-stats", b["key"], "bucket key must not leak raw key")
+        self.assertEqual(b["model"], "m",
+                         "bucket must carry model field, got %r" % b["model"])
         self.assertEqual(b["used"], expected_used,
                          "bucket used must match REQ line tpm= value")
         self.assertEqual(b["remaining"], 110 - expected_used)
