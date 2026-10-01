@@ -2836,7 +2836,7 @@ function bar(idx, bw, h, H, fill) {
   rect.setAttribute("y", (H - h).toFixed(1));
   rect.setAttribute("width", Math.max(1, bw - 2).toFixed(1));
   rect.setAttribute("height", h.toFixed(1));
-  rect.setAttribute("fill", fill);
+  rect.style.fill = fill;  // 展示属性不支持 var()，必须走 CSSOM style
   return rect;
 }
 """
@@ -2879,20 +2879,20 @@ function renderLatencyDist(phases) {
     var t = document.createElementNS(svgns, "text");
     t.setAttribute("x", 0);
     t.setAttribute("y", 24 + i * 30);
-    t.setAttribute("fill", "var(--dim)");
     t.setAttribute("font-size", 12);
+    t.style.fill = "var(--dim)";
     t.textContent = label;
     var r = document.createElementNS(svgns, "rect");
     r.setAttribute("x", 90);
     r.setAttribute("y", 12 + i * 30);
     r.setAttribute("width", Math.max(2, w).toFixed(1));
     r.setAttribute("height", 14);
-    r.setAttribute("fill", "var(--amber)");
+    r.style.fill = "var(--amber)";
     var v = document.createElementNS(svgns, "text");
     v.setAttribute("x", 96 + Math.max(2, w));
     v.setAttribute("y", 24 + i * 30);
-    v.setAttribute("fill", "var(--text)");
     v.setAttribute("font-size", 12);
+    v.style.fill = "var(--text)";
     v.textContent = ms === undefined ? "—" : fmtDur(ms);
     g.appendChild(t);
     g.appendChild(r);
