@@ -46,6 +46,10 @@ SEND_TIMEOUT_S = float(os.environ.get("CTYUN_SEND_TIMEOUT", "60"))
 POST_BODY_LIMIT = 8192
 FLUSH_INTERVAL_S = 60
 BY_MODEL_CAP = 32
+BY_KEY_CAP = 64              # v3 T1：daily_by_key 每日 key 数上限（对齐 TPM_KEY_CAP）
+QWAIT_RING_MAX = 500         # v3 P8：per-model qwait 样本环形容量
+SETTLE_RING_MAX = 500        # v3 T4：per-model TPM 结算偏差（actual/est）环形容量
+HOURLY_RING_MAX = 49         # v3 T6：小时级 token 曲线条目上限（48h 视图 + 当前小时）
 DAILY_RETENTION_DAYS = 90  # daily 分桶滚动保留天数（save 时 prune）
 RANGE_KEYS = ("3d", "7d", "mtd", "last_month")  # 时间维度 tab 键序（快照/dashboard 共用）
 POISON_RE = re.compile(rb"^data:\s*null\s*$")
@@ -301,10 +305,17 @@ def sse_line_usage(line: bytes):
 
 
 def usage_dict_tokens(usage) -> tuple:
-    """从已解析的 usage dict 提取 (prompt_tokens, completion_tokens, total_tokens)。
+    """从已解析的 usage dict 提取 (prompt_tokens, completion_tokens, total_tokens,
+    cache_read_tokens, reasoning_tokens)（v3 五元组）。
 
     非 dict → None；各字段取 int ≥0 原值，缺失/非 int/负数 → 0（best-effort）。
     零 IO、零 parse：入参必须是 json.loads 已产出的 dict（复用解析一次，R1）。
+
+    cache_read 三级别名序，首个命中即取：
+      prompt_cache_hit_tokens → cache_read_input_tokens
+      → prompt_tokens_details.cached_tokens
+    reasoning 两级：completion_tokens_details.reasoning_tokens → reasoning_tokens（顶层）。
+    cache_write 本次不解析（Exclusions：待上游实证字段形态后另开 episode）。
     """
     if not isinstance(usage, dict):
         return None
@@ -315,12 +326,35 @@ def usage_dict_tokens(usage) -> tuple:
             return 0
         return value if isinstance(value, int) and value >= 0 else 0
 
+    def _int_nested(parent_key, child_key):
+        """取 usage[parent_key][child_key] int ≥0，非 dict/缺失/非 int → 0。"""
+        parent = usage.get(parent_key)
+        if not isinstance(parent, dict):
+            return 0
+        value = parent.get(child_key)
+        if isinstance(value, bool):
+            return 0
+        return value if isinstance(value, int) and value >= 0 else 0
+
+    # cache_read：三级别名序，首个命中即取
+    cache_read = _int_field("prompt_cache_hit_tokens")
+    if cache_read == 0:
+        cache_read = _int_field("cache_read_input_tokens")
+    if cache_read == 0:
+        cache_read = _int_nested("prompt_tokens_details", "cached_tokens")
+
+    # reasoning：两级，首个命中即取
+    reasoning = _int_nested("completion_tokens_details", "reasoning_tokens")
+    if reasoning == 0:
+        reasoning = _int_field("reasoning_tokens")
+
     return (_int_field("prompt_tokens"), _int_field("completion_tokens"),
-            _int_field("total_tokens"))
+            _int_field("total_tokens"), cache_read, reasoning)
 
 
 def sse_line_extract_usage(line: bytes):
-    """SSE data 行 usage 帧数值抽取：返回 (prompt_tokens, completion_tokens, total_tokens)。
+    """SSE data 行 usage 帧数值抽取：返回 (prompt_tokens, completion_tokens, total_tokens,
+    cache_read_tokens, reasoning_tokens)（v3 五元组，委托 usage_dict_tokens）。
 
     无 usage 帧（非 data: 前缀 / [DONE] / 非 JSON / 非 dict / usage 空）→ None。
     解析委托 sse_line_usage（单次 json.loads，与 sse_line_has_usage 同解析路径）；
@@ -1201,19 +1235,30 @@ def set_probe_enabled(enabled: bool) -> None:
 _DAILY_FIELDS = ("requests", "filtered", "errors_proxy", "errors_upstream",
                  "retries", "eof_without_done", "header_retries")
 
-# v2 P3 起用（P1 先声明）：daily/daily_by_model 16 字段 schema。
+# v2 P3 起用（P1 先声明）：daily/daily_by_model 16 字段 schema；v3 扩 20 字段。
 # P3 切换前零引用；load/save 循环各按迭代时的 _DAILY_FIELDS 白名单，
 # 切换后旧格式自动补 0，新格式被旧版加载时自动丢新字段。
 DAILY_V2_FIELDS = _DAILY_FIELDS + ("tokens_prompt", "tokens_completion",
                                    "bytes_out", "stream_requests",
                                    "ttfb_sum_ms", "ttfb_count",
                                    "outcome_ok", "outcome_degraded",
-                                   "outcome_failed")
+                                   "outcome_failed",
+                                   # v3 追加 4 字段（spec 决策 1）：cache_write 占位不解析，
+                                   # reasoning 落 daily 供按天×模型扩列，zero_token 供 T5
+                                   "tokens_cache_read", "tokens_cache_write",
+                                   "tokens_reasoning", "requests_zero_token")
 
-# v2 P3：daily/daily_by_model 切换 16 字段 schema（DAILY_V2_FIELDS 已在 P1 声明，见下）。
-# load/save 循环与四处 entry 创建均按 _DAILY_FIELDS 迭代 → 切换后旧 7 字段桶自动补 0，
-# 新 16 字段桶被旧版二进制读入自动丢新字段（R2 双向 degrade，无需版本号）。
+# v2 P3：daily/daily_by_model 切换 16 字段 schema（DAILY_V2_FIELDS 已在 P1 声明，见下）；
+# v3 扩 20 字段——load/save 循环与四处 entry 创建均按 _DAILY_FIELDS 迭代 → 切换后旧
+# 16 字段桶自动补 4 个 0，新 20 字段桶被旧版二进制读入自动丢 4 新字段（双向 degrade，
+# 无需版本号）。
 _DAILY_FIELDS = DAILY_V2_FIELDS
+
+# v3 T1：daily_by_key 8 字段（DAILY_V2_FIELDS 子集——砍 errors/retries/outcome/ttfb，
+# per-key 维度不做错误归因与延迟，控制持久化体积；cache_write 占位不解析）。
+_DAILY_BY_KEY_FIELDS = ("requests", "tokens_prompt", "tokens_completion",
+                        "tokens_cache_read", "tokens_cache_write",
+                        "tokens_reasoning", "bytes_out", "stream_requests")
 
 
 def load_daily_buckets(path: str) -> dict:

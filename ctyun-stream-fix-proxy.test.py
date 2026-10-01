@@ -1747,7 +1747,7 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         self.assertEqual(
             set(dm_today["m-a"]),
             set(mod.DAILY_V2_FIELDS),
-            "dm entry shape must stay in sync across both creation sites (16 fields)")
+            "dm entry shape must stay in sync across both creation sites (20 fields)")
         mod._record_request("POST", "/dm", 502, 1.0, 0, model="m-a", error=True)
         self.assertEqual(dm_today["m-a"]["errors_proxy"], 1,
                          "error=True (proxy-made 502) must land in dm errors_proxy")
@@ -1768,7 +1768,7 @@ class ProxyDashboardUnitTest(unittest.TestCase):
             self.assertGreaterEqual(total, summed,
                                     "daily[%r][%r]=%d < Σ daily_by_model=%d"
                                     % (today, k, total, summed))
-        # v3：_record_empty_retry 的 dm entry 创建点（site-2）同样 16 字段（DAILY_V2_FIELDS）——
+        # v3：_record_empty_retry 的 dm entry 创建点（site-2）同样 20 字段（DAILY_V2_FIELDS）——
         # 用全新日期隔离（真实 today 的键位已被 cap 用例占满 32，新建会被 cap 拒绝）
         orig_today = mod.today_key
         try:
@@ -1779,7 +1779,7 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         self.assertEqual(
             set(mod.STATS["daily_by_model"]["2026-01-03"]["m-retry-only"]),
             set(mod.DAILY_V2_FIELDS),
-            "empty-retry creation site must keep dm entry shape in sync (16 fields)")
+            "empty-retry creation site must keep dm entry shape in sync (20 fields)")
 
     def test_events_record_and_cap(self) -> None:
         mod = self.mod
@@ -1903,7 +1903,9 @@ class ProxyDashboardUnitTest(unittest.TestCase):
                            "bytes_out": 0, "stream_requests": 0,
                            "ttfb_sum_ms": 0, "ttfb_count": 0,
                            "outcome_ok": 0, "outcome_degraded": 0,
-                           "outcome_failed": 0},
+                           "outcome_failed": 0,
+                           "tokens_cache_read": 0, "tokens_cache_write": 0,
+                           "tokens_reasoning": 0, "requests_zero_token": 0},
                     "m2": {"requests": 7, "filtered": 0, "errors_proxy": 0,
                            "errors_upstream": 0, "retries": 4, "eof_without_done": 0,
                            "header_retries": 0,
@@ -1911,7 +1913,9 @@ class ProxyDashboardUnitTest(unittest.TestCase):
                            "bytes_out": 0, "stream_requests": 0,
                            "ttfb_sum_ms": 0, "ttfb_count": 0,
                            "outcome_ok": 0, "outcome_degraded": 0,
-                           "outcome_failed": 0}},
+                           "outcome_failed": 0,
+                           "tokens_cache_read": 0, "tokens_cache_write": 0,
+                           "tokens_reasoning": 0, "requests_zero_token": 0}},
                 "2026-01-05": {
                     "m1": {"requests": 1, "filtered": 0, "errors_proxy": 0,
                            "errors_upstream": 0, "retries": 0, "eof_without_done": 0,
@@ -1920,7 +1924,9 @@ class ProxyDashboardUnitTest(unittest.TestCase):
                            "bytes_out": 0, "stream_requests": 0,
                            "ttfb_sum_ms": 0, "ttfb_count": 0,
                            "outcome_ok": 0, "outcome_degraded": 0,
-                           "outcome_failed": 0}}}
+                           "outcome_failed": 0,
+                           "tokens_cache_read": 0, "tokens_cache_write": 0,
+                           "tokens_reasoning": 0, "requests_zero_token": 0}}}
             mod.STATS["daily_by_model"] = matrix
             mod.save_stats_counters(path)
             self.assertEqual(mod.load_daily_by_model_buckets(path), matrix,
@@ -1956,7 +1962,11 @@ class ProxyDashboardUnitTest(unittest.TestCase):
                                                 "bytes_out": 0, "stream_requests": 0,
                                                 "ttfb_sum_ms": 0, "ttfb_count": 0,
                                                 "outcome_ok": 0, "outcome_degraded": 0,
-                                                "outcome_failed": 0}}},
+                                                "outcome_failed": 0,
+                                                "tokens_cache_read": 0,
+                                                "tokens_cache_write": 0,
+                                                "tokens_reasoning": 0,
+                                                "requests_zero_token": 0}}},
                          "non-dict bucket/entry must be skipped; bad fields coerced to 0")
         # 用例 4：非 ISO 日期 key 跳过（round-trip 校验，版本无关）
         with open(path, "w", encoding="utf-8") as fh:
@@ -1977,7 +1987,9 @@ class ProxyDashboardUnitTest(unittest.TestCase):
                           "bytes_out": 0, "stream_requests": 0,
                           "ttfb_sum_ms": 0, "ttfb_count": 0,
                           "outcome_ok": 0, "outcome_degraded": 0,
-                          "outcome_failed": 0},
+                          "outcome_failed": 0,
+                          "tokens_cache_read": 0, "tokens_cache_write": 0,
+                          "tokens_reasoning": 0, "requests_zero_token": 0},
                          "missing fields must be filled with 0")
         # 用例 5：单日 40 模型 → 读回恰 32（文件出现序前 32）
         with open(path, "w", encoding="utf-8") as fh:
@@ -4447,8 +4459,8 @@ class P1ConstantsTest(unittest.TestCase):
         self.assertEqual(mod.PROBE_MIN_INTERVAL_S, 10)
         self.assertEqual(mod.PROBE_FAILURE_THRESHOLD, 3)
         self.assertEqual(mod.PROBE_ALERT_DEBOUNCE_S, 300)
-        # v2 P3 起 _DAILY_FIELDS 即 DAILY_V2_FIELDS（16 字段，同一 tuple）：
-        # 契约按 16 字段字面精确断言，不再写成 "旧 7 字段 + 9 新字段" 的增量式。
+        # v2 P3 起 _DAILY_FIELDS 即 DAILY_V2_FIELDS（v3 扩 20 字段，同一 tuple）：
+        # 契约按 20 字段字面精确断言。
         self.assertEqual(
             mod.DAILY_V2_FIELDS,
             ("requests", "filtered", "errors_proxy", "errors_upstream",
@@ -4456,11 +4468,14 @@ class P1ConstantsTest(unittest.TestCase):
              "tokens_prompt", "tokens_completion",
              "bytes_out", "stream_requests",
              "ttfb_sum_ms", "ttfb_count",
-             "outcome_ok", "outcome_degraded", "outcome_failed"))
+             "outcome_ok", "outcome_degraded", "outcome_failed",
+             "tokens_cache_read", "tokens_cache_write",
+             "tokens_reasoning", "requests_zero_token"))
 
 
 class UsageExtractTest(unittest.TestCase):
-    """P3 Token期：usage 帧数值抽取矩阵（标准/缺 prompt/缺 completion/extra key/非 dict/空 usage/负值）。"""
+    """P3 Token期：usage 帧数值抽取矩阵（标准/缺 prompt/缺 completion/extra key/非 dict/空 usage/负值）；
+    v3 扩 5 元组（cache_read/reasoning 兜底 0）。"""
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -4471,20 +4486,20 @@ class UsageExtractTest(unittest.TestCase):
     def test_standard_usage_frame(self) -> None:
         line = (b'data: {"id":"u","choices":[],"usage":'
                 b'{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}\n\n')
-        self.assertEqual(self.extract(line), (10, 5, 15))
+        self.assertEqual(self.extract(line), (10, 5, 15, 0, 0))
 
     def test_missing_prompt_tokens_defaults_zero(self) -> None:
         line = b'data: {"usage":{"completion_tokens":5,"total_tokens":10}}\n\n'
-        self.assertEqual(self.extract(line), (0, 5, 10))
+        self.assertEqual(self.extract(line), (0, 5, 10, 0, 0))
 
     def test_missing_completion_tokens_defaults_zero(self) -> None:
         line = b'data: {"usage":{"prompt_tokens":3,"total_tokens":8}}\n\n'
-        self.assertEqual(self.extract(line), (3, 0, 8))
+        self.assertEqual(self.extract(line), (3, 0, 8, 0, 0))
 
     def test_extra_key_ignored(self) -> None:
         line = (b'data: {"usage":{"prompt_tokens":1,"completion_tokens":2,'
                 b'"total_tokens":3,"extra":"x","nested":{"a":1}}}\n\n')
-        self.assertEqual(self.extract(line), (1, 2, 3))
+        self.assertEqual(self.extract(line), (1, 2, 3, 0, 0))
 
     def test_non_dict_returns_none(self) -> None:
         self.assertIsNone(self.extract(b"data: [DONE]\n\n"))
@@ -4502,17 +4517,17 @@ class UsageExtractTest(unittest.TestCase):
     def test_negative_tokens_coerced_zero(self) -> None:
         line = (b'data: {"usage":{"prompt_tokens":-1,"completion_tokens":5,'
                 b'"total_tokens":10}}\n\n')
-        self.assertEqual(self.extract(line), (0, 5, 10))
+        self.assertEqual(self.extract(line), (0, 5, 10, 0, 0))
 
     def test_non_int_fields_coerced_zero(self) -> None:
         line = (b'data: {"usage":{"prompt_tokens":"9","completion_tokens":null,'
                 b'"total_tokens":true}}\n\n')
-        self.assertEqual(self.extract(line), (0, 0, 0))
+        self.assertEqual(self.extract(line), (0, 0, 0, 0, 0))
 
     def test_ride_on_finish_frame_usage_extracted(self) -> None:
         line = (b'data: {"choices":[{"delta":{},"finish_reason":"stop"}],'
                 b'"usage":{"prompt_tokens":7,"completion_tokens":2,"total_tokens":9}}\n\n')
-        self.assertEqual(self.extract(line), (7, 2, 9))
+        self.assertEqual(self.extract(line), (7, 2, 9, 0, 0))
 
     def test_has_usage_bool_consistent_with_extract(self) -> None:
         """与 sse_line_has_usage 布尔判据一致性：has_usage=True ⟺ extract 非 None。"""
@@ -4524,6 +4539,49 @@ class UsageExtractTest(unittest.TestCase):
             self.assertEqual(mod.sse_line_has_usage(line),
                              mod.sse_line_extract_usage(line) is not None,
                              "has_usage/extract must agree on %r" % line)
+
+    # ---- v3：cache_read / reasoning 五元组第 4/5 位解析矩阵 ----
+
+    def test_cache_read_hit_tokens_primary_alias(self) -> None:
+        line = (b'data: {"usage":{"prompt_tokens":1,"completion_tokens":2,'
+                b'"total_tokens":3,"prompt_cache_hit_tokens":4}}\n\n')
+        self.assertEqual(self.extract(line), (1, 2, 3, 4, 0))
+
+    def test_cache_read_input_tokens_alias(self) -> None:
+        line = (b'data: {"usage":{"prompt_tokens":1,"completion_tokens":2,'
+                b'"total_tokens":3,"cache_read_input_tokens":40}}\n\n')
+        self.assertEqual(self.extract(line), (1, 2, 3, 40, 0))
+
+    def test_cache_read_nested_cached_tokens(self) -> None:
+        line = (b'data: {"usage":{"prompt_tokens":1,"completion_tokens":2,'
+                b'"total_tokens":3,"prompt_tokens_details":'
+                b'{"cached_tokens":400}}}\n\n')
+        self.assertEqual(self.extract(line), (1, 2, 3, 400, 0))
+
+    def test_cache_read_alias_priority_first_hit_wins(self) -> None:
+        # 多级别名同时存在 → 首个命中（prompt_cache_hit_tokens）优先
+        line = (b'data: {"usage":{"prompt_tokens":1,"completion_tokens":2,'
+                b'"total_tokens":3,"prompt_cache_hit_tokens":4,'
+                b'"cache_read_input_tokens":40,"prompt_tokens_details":'
+                b'{"cached_tokens":400}}}\n\n')
+        self.assertEqual(self.extract(line), (1, 2, 3, 4, 0))
+
+    def test_reasoning_nested_completion_details(self) -> None:
+        line = (b'data: {"usage":{"prompt_tokens":1,"completion_tokens":2,'
+                b'"total_tokens":3,"completion_tokens_details":'
+                b'{"reasoning_tokens":5}}}\n\n')
+        self.assertEqual(self.extract(line), (1, 2, 3, 0, 5))
+
+    def test_reasoning_top_level(self) -> None:
+        line = (b'data: {"usage":{"prompt_tokens":1,"completion_tokens":2,'
+                b'"total_tokens":3,"reasoning_tokens":50}}\n\n')
+        self.assertEqual(self.extract(line), (1, 2, 3, 0, 50))
+
+    def test_cache_read_non_int_nested_coerced_zero(self) -> None:
+        # prompt_tokens_details 非 dict → cache_read 归 0
+        line = (b'data: {"usage":{"prompt_tokens":1,"completion_tokens":2,'
+                b'"total_tokens":3,"prompt_tokens_details":"oops"}}\n\n')
+        self.assertEqual(self.extract(line), (1, 2, 3, 0, 0))
 
 
 class TokenRelayTest(unittest.TestCase):
@@ -4691,8 +4749,8 @@ class TokenPersistTest(unittest.TestCase):
 class DailyV2CompatTest(unittest.TestCase):
     """P3 Token期：daily_by_model v2 向后兼容双向 degrade（R2 锁死）。
 
-    旧 7 字段 JSON → 16 字段内存桶零值补齐；
-    新 16 字段 JSON → 7 字段加载函数（模拟旧版二进制）只取 7 字段不崩。
+    旧 7 字段 JSON → 20 字段内存桶零值补齐；
+    新 20 字段 JSON → 7 字段加载函数（模拟旧版二进制）只取 7 字段不崩。
     """
 
     def test_legacy_7_field_load_fills_new_fields_with_zero(self) -> None:
@@ -4713,16 +4771,16 @@ class DailyV2CompatTest(unittest.TestCase):
         buckets = mod.load_daily_buckets(path)
         self.assertEqual(buckets["2026-01-02"]["requests"], 5)
         self.assertEqual(set(buckets["2026-01-02"]), set(mod.DAILY_V2_FIELDS),
-                         "legacy 7-field bucket must load with 16-field zero-fill")
+                         "legacy 7-field bucket must load with 20-field zero-fill")
         self.assertEqual(buckets["2026-01-02"]["tokens_prompt"], 0)
         self.assertEqual(buckets["2026-01-02"]["stream_requests"], 0)
         dbm = mod.load_daily_by_model_buckets(path)
         self.assertEqual(set(dbm["2026-01-02"]["m1"]), set(mod.DAILY_V2_FIELDS),
-                         "legacy 7-field dm entry must load with 16-field zero-fill")
+                         "legacy 7-field dm entry must load with 20-field zero-fill")
         self.assertEqual(dbm["2026-01-02"]["m1"]["tokens_completion"], 0)
 
-    def test_new_16_field_downgrade_reads_7_fields_without_crash(self) -> None:
-        """降级演练：16 字段 JSON 被'旧版 7 字段白名单'加载函数读入 → 只返 7 字段不崩。"""
+    def test_new_20_field_downgrade_reads_7_fields_without_crash(self) -> None:
+        """降级演练：20 字段 JSON 被'旧版 7 字段白名单'加载函数读入 → 只返 7 字段不崩。"""
         mod = load_proxy_module()
         tmp = tempfile.mkdtemp(prefix="ctyun-proxy-p3compat-")
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
@@ -4745,11 +4803,11 @@ class DailyV2CompatTest(unittest.TestCase):
         out = legacy_loader(raw_entry)
         self.assertEqual(out["requests"], 4)
         self.assertEqual(set(out), set(legacy_7),
-                         "old 7-field whitelist must silently drop the 9 new fields")
+                         "old 7-field whitelist must silently drop the 13 new fields")
         self.assertNotIn("tokens_prompt", out)
 
-    def test_roundtrip_16_field_full_equality(self) -> None:
-        """16 字段桶 save→load 全等（含新字段值）。"""
+    def test_roundtrip_full_equality(self) -> None:
+        """20 字段桶 save→load 全等（含新字段值）。"""
         mod = load_proxy_module()
         tmp = tempfile.mkdtemp(prefix="ctyun-proxy-p3compat-")
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
@@ -4774,7 +4832,7 @@ class DailyV2CompatTest(unittest.TestCase):
             mod.save_stats_counters(path)
             self.assertEqual(mod.load_daily_by_model_buckets(path),
                              mod.STATS["daily_by_model"],
-                             "16-field buckets must roundtrip verbatim")
+                             "20-field buckets must roundtrip verbatim")
         finally:
             mod.STATS["daily_by_model"] = orig
 
@@ -4788,6 +4846,102 @@ class DailyV2CompatTest(unittest.TestCase):
         self.assertEqual(f(mod.CLASS_UPSTREAM_FAULT), "failed")
         self.assertEqual(f(mod.CLASS_BODY_ERROR), "failed")
         self.assertEqual(f(mod.CLASS_REQUEST_FAULT), "failed")
+
+
+class SchemaV3MigrationTest(unittest.TestCase):
+    """v3 schema 迁移：DAILY_V2_FIELDS 16→20 双向 degrade，daily_by_key 8 字段常量。"""
+
+    def test_daily_v2_fields_count_20_and_order(self) -> None:
+        mod = load_proxy_module()
+        self.assertEqual(len(mod.DAILY_V2_FIELDS), 20)
+        self.assertEqual(
+            mod.DAILY_V2_FIELDS,
+            ("requests", "filtered", "errors_proxy", "errors_upstream",
+             "retries", "eof_without_done", "header_retries",
+             "tokens_prompt", "tokens_completion",
+             "bytes_out", "stream_requests",
+             "ttfb_sum_ms", "ttfb_count",
+             "outcome_ok", "outcome_degraded", "outcome_failed",
+             "tokens_cache_read", "tokens_cache_write",
+             "tokens_reasoning", "requests_zero_token"))
+
+    def test_legacy_16_field_persist_loads_with_4_zero_fill(self) -> None:
+        """AC1：写一份 16 字段 legacy persist（无 4 新键）→ load 后每桶 20 键、4 新键 0。"""
+        mod = load_proxy_module()
+        tmp = tempfile.mkdtemp(prefix="ctyun-proxy-v3schema-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        path = os.path.join(tmp, "settings.json")
+        legacy16 = ("requests", "filtered", "errors_proxy", "errors_upstream",
+                    "retries", "eof_without_done", "header_retries",
+                    "tokens_prompt", "tokens_completion",
+                    "bytes_out", "stream_requests",
+                    "ttfb_sum_ms", "ttfb_count",
+                    "outcome_ok", "outcome_degraded", "outcome_failed")
+        entry = dict.fromkeys(legacy16, 0)
+        entry.update({"requests": 5, "tokens_prompt": 11, "stream_requests": 2})
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"stats": {"daily": {"2026-01-02": entry},
+                                 "daily_by_model": {"2026-01-02": {"m1": entry}}}},
+                      fh)
+        buckets = mod.load_daily_buckets(path)
+        self.assertEqual(len(buckets["2026-01-02"]), 20,
+                         "legacy 16-field file must load as 20-field bucket")
+        self.assertEqual(set(buckets["2026-01-02"]), set(mod.DAILY_V2_FIELDS))
+        for f in ("tokens_cache_read", "tokens_cache_write",
+                  "tokens_reasoning", "requests_zero_token"):
+            self.assertEqual(buckets["2026-01-02"][f], 0,
+                             "%s must zero-fill from legacy 16-field file" % f)
+        self.assertEqual(buckets["2026-01-02"]["tokens_prompt"], 11)
+        dbm = mod.load_daily_by_model_buckets(path)
+        self.assertEqual(len(dbm["2026-01-02"]["m1"]), 20)
+        self.assertEqual(set(dbm["2026-01-02"]["m1"]), set(mod.DAILY_V2_FIELDS))
+        self.assertEqual(dbm["2026-01-02"]["m1"]["tokens_cache_read"], 0)
+
+    def test_new_20_field_downgrade_reads_16_without_crash(self) -> None:
+        """AC1 反向：20 字段被'旧版 16 字段白名单'加载丢 4 新键不崩。"""
+        mod = load_proxy_module()
+        tmp = tempfile.mkdtemp(prefix="ctyun-proxy-v3downgrade-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        path = os.path.join(tmp, "settings.json")
+        entry20 = dict.fromkeys(mod.DAILY_V2_FIELDS, 0)
+        entry20.update({"requests": 4, "tokens_cache_read": 9,
+                        "tokens_reasoning": 7, "requests_zero_token": 1})
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"stats": {"daily_by_model": {
+                "2026-01-02": {"m1": entry20}}}}, fh)
+        legacy_16 = ("requests", "filtered", "errors_proxy", "errors_upstream",
+                     "retries", "eof_without_done", "header_retries",
+                     "tokens_prompt", "tokens_completion",
+                     "bytes_out", "stream_requests",
+                     "ttfb_sum_ms", "ttfb_count",
+                     "outcome_ok", "outcome_degraded", "outcome_failed")
+
+        def legacy_loader(raw):
+            return {k: raw.get(k, 0) for k in legacy_16}
+
+        raw_entry = json.loads(open(path, encoding="utf-8").read())[
+            "stats"]["daily_by_model"]["2026-01-02"]["m1"]
+        out = legacy_loader(raw_entry)
+        self.assertEqual(out["requests"], 4)
+        self.assertEqual(set(out), set(legacy_16),
+                         "old 16-field whitelist must silently drop the 4 new fields")
+        self.assertNotIn("tokens_cache_read", out)
+
+    def test_daily_by_key_fields_constant_8(self) -> None:
+        mod = load_proxy_module()
+        # 用 getattr 防 AttributeError——RED 期常量未定义时干净 FAIL
+        self.assertEqual(
+            getattr(mod, "_DAILY_BY_KEY_FIELDS", None),
+            ("requests", "tokens_prompt", "tokens_completion",
+             "tokens_cache_read", "tokens_cache_write",
+             "tokens_reasoning", "bytes_out", "stream_requests"))
+
+    def test_v3_capacity_constants(self) -> None:
+        mod = load_proxy_module()
+        self.assertEqual(getattr(mod, "BY_KEY_CAP", None), 64)
+        self.assertEqual(getattr(mod, "QWAIT_RING_MAX", None), 500)
+        self.assertEqual(getattr(mod, "SETTLE_RING_MAX", None), 500)
+        self.assertEqual(getattr(mod, "HOURLY_RING_MAX", None), 49)
 
 
 class RequestIdTest(unittest.TestCase):
