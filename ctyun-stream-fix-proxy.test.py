@@ -4946,6 +4946,202 @@ class StallTailGapTest(unittest.TestCase):
             stop_fake_upstreams()
 
 
+class TpmPerModelTest(unittest.TestCase):
+    """per-model 预算集成测试（卡 3/3，spec Acceptance ①-⑥ 交叉验证）。
+
+    kimi 独立 30k 预算 vs 全局 110k / 超大空闲放行 / 超大忙时 429 /
+    拒绝计数可见 / tpm_stats 形态演进。
+    复用 make_scripted_upstream + start_proxy(extra_env) + post_sse_auth +
+    admin_get + stderr_text + stop_fake_upstreams。
+    """
+
+    def setUp(self) -> None:
+        self.upstream_port, self.calls = make_scripted_upstream(
+            body_override=SSE_A + SSE_USAGE + SSE_DONE)  # 带 usage 帧 → settle
+        self.proxy_port = free_port()
+
+    def tearDown(self) -> None:
+        if self.proc:
+            self.proc.terminate()
+            self.proc.wait(timeout=5)
+            stderr_text(self.proc)
+            shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        stop_fake_upstreams()
+
+    def test_kimi_independent_budget(self) -> None:
+        """env CTYUN_TPM_LIMIT=110000 CTYUN_TPM_LIMIT_BY_MODEL="kimi-k3-oc:1000"：
+        同 key 发 kimi 请求 est>1000 → 429；同 key 发 deepseek 请求 est>1000
+        但 <=110000 → 200。证明 (key,model) 桶隔离（决策 1、决策 2）。
+        """
+        self.proc = start_proxy(self.upstream_port, self.proxy_port,
+                                extra_env={
+                                    "CTYUN_TPM_LIMIT": "110000",
+                                    "CTYUN_TPM_LIMIT_BY_MODEL":
+                                        "kimi-k3-oc:1000",
+                                    "CTYUN_TPM_WINDOW_S": "5",
+                                    "CTYUN_TPM_QUEUE_MAX": "2",
+                                })
+        # kimi budget 1000：需 est > kimi budget 才见拒绝；用 max_tokens 拉高 est。
+        big_kimi = (b'{"model":"kimi-k3-oc","stream":true,'
+                    b'"messages":[{"role":"user","content":"'
+                    + b"x" * 1000
+                    + b'"}],"max_tokens":3000}')   # len~1096 → int(1096*0.25)+3000=3274 > 1000
+        auth = "Bearer test-per-model"
+        # priming：先发小 kimi 请求（est≈7 < 1000 → 200）占住 kimi 桶，
+        # 规避决策 3 的"空闲窗口超大请求放行"，让后续大请求走 429 拒绝路径。
+        small_kimi = (b'{"model":"kimi-k3-oc","stream":true,'
+                      b'"messages":[{"role":"user","content":"hi"}]}')
+        prime_status, _ = post_sse_auth(self.proxy_port, small_kimi, auth)
+        self.assertEqual(prime_status, 200,
+                         "priming kimi request must be admitted (est < kimi budget)")
+        status1, _ = post_sse_auth(self.proxy_port, big_kimi, auth)
+        self.assertEqual(status1, 429,
+                         "kimi est > kimi budget must be rejected (per-model bucket)")
+        # deepseek 同一 key：大请求仍 ≤ 全局 110000
+        big_ds = (b'{"model":"deepseek-v4-pro-0813-oc","stream":true,'
+                  b'"messages":[{"role":"user","content":"'
+                  + b"x" * 1000
+                  + b'"}],"max_tokens":3000}')   # est 3260 ≤ 110000
+        status2, _ = post_sse_auth(self.proxy_port, big_ds, auth)
+        self.assertEqual(status2, 200,
+                         "deepseek est ≤ global budget must pass (key,model isolated)")
+        # stderr：kimi REQ 行 result=tpm-queue-full（或 full if oversized busy）
+        stderr = stderr_text(self.proc)
+        self.assertIn("tpm-queue-full", stderr,
+                      "kimi reject must log tpm-queue-full, stderr:\n" + stderr)
+
+    def test_oversized_idle_release_first_then_reject(self) -> None:
+        """CTYUN_TPM_LIMIT=50：首发 est>50（空闲窗口）→ 200（放行，决策 3）；
+        窗口内再发同 key 请求 → 429（used>0）。
+        """
+        self.proc = start_proxy(self.upstream_port, self.proxy_port,
+                                extra_env={
+                                    "CTYUN_TPM_LIMIT": "50",
+                                    "CTYUN_TPM_WINDOW_S": "60",
+                                    "CTYUN_TPM_QUEUE_MAX": "2",
+                                })
+        # len ~209B → est = int(209*0.25) = 52 > 50
+        big = (b'{"model":"y","stream":true,"messages":[{"role":"user","content":"'
+               + b"y" * 140 + b'"}]}')
+        auth = "Bearer test-oversized"
+        status1, data1 = post_sse_auth(self.proxy_port, big, auth)
+        self.assertEqual(status1, 200, "idle oversized must be released")
+        self.assertEqual(len(self.calls), 1, "released request must hit upstream")
+        # 同 key 立即再发 → 429（used=52>0）
+        status2, data2 = post_sse_auth(self.proxy_port, big, auth)
+        self.assertEqual(status2, 429, "busy oversized must be rejected")
+        parsed = json.loads(data2.decode("utf-8"))
+        self.assertEqual(parsed["error"]["code"], "model_tpm_limit")
+        self.assertEqual(len(self.calls), 1,
+                         "rejected request must not hit upstream again")
+
+    def test_oversized_busy_429(self) -> None:
+        """CTYUN_TPM_LIMIT=50：先发正常请求占预算（est <=50 → 200），
+        再发 est>50 请求 → 429（used>0，decision 3 忙时硬拒）。
+        """
+        self.proc = start_proxy(self.upstream_port, self.proxy_port,
+                                extra_env={
+                                    "CTYUN_TPM_LIMIT": "50",
+                                    "CTYUN_TPM_WINDOW_S": "60",
+                                    "CTYUN_TPM_QUEUE_MAX": "2",
+                                })
+        auth = "Bearer test-busy"
+        # small: ~45B → est ≈ 11 ≤ 50
+        small = b'{"model":"z","stream":true,"messages":[]}'
+        status1, _ = post_sse_auth(self.proxy_port, small, auth)
+        self.assertEqual(status1, 200, "normal request must be admitted")
+        # big: ~209B → est ≈ 52 > 50
+        big = (b'{"model":"z","stream":true,"messages":[{"role":"user","content":"'
+               + b"y" * 140 + b'"}]}')
+        status2, data2 = post_sse_auth(self.proxy_port, big, auth)
+        self.assertEqual(status2, 429, "oversized must be rejected when budget used")
+        parsed = json.loads(data2.decode("utf-8"))
+        self.assertEqual(parsed["error"]["code"], "model_tpm_limit")
+
+    def test_rejected_counting_in_tpm_stats(self) -> None:
+        """est>limit 硬拒后 GET /api/tpm_stats：bucket rejected>=1 且 model 字段正确。"""
+        self.proc = start_proxy(self.upstream_port, self.proxy_port,
+                                extra_env={
+                                    "CTYUN_TPM_LIMIT": "50",
+                                    "CTYUN_TPM_WINDOW_S": "60",
+                                    "CTYUN_TPM_QUEUE_MAX": "2",
+                                })
+        auth = "Bearer test-reject-count"
+        big = (b'{"model":"w","stream":true,"messages":[{"role":"user","content":"'
+               + b"y" * 140 + b'"}]}')   # est 52 > 50
+        # 首发空闲 → 放行（used<=0, 200）
+        post_sse_auth(self.proxy_port, big, auth)
+        # 再发忙时 → 429 硬拒，rejected 应计数
+        status, data = post_sse_auth(self.proxy_port, big, auth)
+        self.assertEqual(status, 429)
+        parsed = json.loads(data.decode("utf-8"))
+        self.assertEqual(parsed["error"]["code"], "model_tpm_limit")
+        # 查 tpm_stats
+        _, body, _ = admin_get(self.proc.admin_port, "/api/tpm_stats")
+        snap = json.loads(body.decode("utf-8"))
+        self.assertEqual(len(snap["buckets"]), 1,
+                         "桶空则防撞忙致占满仍留痕，got %d 桶" % len(snap["buckets"]))
+        b = snap["buckets"][0]
+        self.assertEqual(b["model"], "w",
+                         "bucket must carry model field")
+        self.assertGreaterEqual(b["rejected"], 1,
+                                "hard-rejected must be counted, got rejected=%d"
+                                % b["rejected"])
+
+    def test_tpm_stats_shape_with_limit_by_model(self) -> None:
+        """/api/tpm_stats config 含 limit_by_model dict（默认空 {}），bucket 含 model 字段。"""
+        self.proc = start_proxy(self.upstream_port, self.proxy_port,
+                                extra_env={
+                                    "CTYUN_TPM_LIMIT": "110",
+                                    "CTYUN_TPM_WINDOW_S": "2",
+                                    "CTYUN_TPM_QUEUE_MAX": "2",
+                                })
+        auth = "Bearer test-shape"
+        small = b'{"model":"v","stream":true,"messages":[]}'   # est = 10
+        post_sse_auth(self.proxy_port, small, auth)
+        _, body, ctype = admin_get(self.proc.admin_port, "/api/tpm_stats")
+        self.assertTrue(ctype and ctype.startswith("application/json"))
+        snap = json.loads(body.decode("utf-8"))
+        self.assertEqual(snap["config"]["limit_by_model"], {},
+                         "limit_by_model must default to empty dict")
+        self.assertEqual(len(snap["buckets"]), 1)
+        b = snap["buckets"][0]
+        self.assertEqual(b["model"], "v",
+                         "bucket must carry model field (not None/null)")
+        self.assertFalse(b["model"] is None,
+                         "model field must be the string value, not null")
+        # limit_by_model 含 env 设置时（决策 6 "原样"）
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+        stderr_text(self.proc)
+        shutil.rmtree(self.proc.persist_dir, ignore_errors=True)
+        self.proc = start_proxy(self.upstream_port, free_port(),
+                                extra_env={
+                                    "CTYUN_TPM_LIMIT": "110",
+                                    "CTYUN_TPM_WINDOW_S": "2",
+                                    "CTYUN_TPM_QUEUE_MAX": "2",
+                                    "CTYUN_TPM_LIMIT_BY_MODEL":
+                                        "glm-5.3-oc:110000",
+                                })
+        post_sse_auth(self.proc.proxy_port, small, auth)
+        _, body2, _ = admin_get(self.proc.admin_port, "/api/tpm_stats")
+        snap2 = json.loads(body2.decode("utf-8"))
+        self.assertEqual(snap2["config"]["limit_by_model"],
+                         {"glm-5.3-oc": 110000},
+                         "limit_by_model must reflect env seam dict as-is")
+
+    def test_no_auth_bypasses_tpm(self) -> None:
+        """无 Authorization 头请求直通不限流，stderr 无任何 TPM 字段（向后兼容 spec）。"""
+        self.proc = start_proxy(self.upstream_port, self.proxy_port)
+        data = post_sse(self.proc.proxy_port)
+        self.assertEqual(data, SSE_A + SSE_USAGE + SSE_DONE)
+        stderr = stderr_text(self.proc)
+        self.assertNotIn("qwait=", stderr,
+                         "no-auth requests must not log TPM fields")
+        self.assertNotIn("tpm=", stderr)
+        self.assertNotIn("tpm-queue", stderr)
+
+
 if __name__ == "__main__":
     import atexit
     atexit.register(kill_registered)
