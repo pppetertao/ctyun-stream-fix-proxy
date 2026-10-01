@@ -2544,6 +2544,19 @@ footer .inner { color:var(--dim); font-size:12px; padding-top:4px; padding-botto
   .stat .num { font-size:24px; }
   main { padding:12px; }
 }
+/* P6：页面级 tab 分页——tab-bar 横向条 / pane 网格间距 / 显隐 / 移动端防压缩 */
+.tab-bar { display:flex; gap:8px; overflow-x:auto; flex-wrap:nowrap;
+  -webkit-overflow-scrolling:touch; padding-bottom:4px; }
+.tab { font-weight:400; font-size:12.5px; background:transparent; color:var(--dim);
+  border:1px solid var(--line); border-radius:99px; padding:4px 14px;
+  cursor:pointer; white-space:nowrap; }
+.tab:hover { filter:none; color:var(--text); }
+.tab.active { background:var(--amber); color:var(--ink); border-color:var(--amber); font-weight:700; }
+.tab-pane { display:grid; gap:12px; }
+[hidden] { display:none !important; }
+@media (max-width:720px) {
+  .tab { flex:0 0 auto; }
+}
 </style>
 </head>
 <body>
@@ -2554,6 +2567,21 @@ footer .inner { color:var(--dim); font-size:12px; padding-top:4px; padding-botto
 """
 
 _DASH_SECTIONS_STATIC = """<main>
+<!-- P6 pane 包裹说明：settings 在本段开闭；overview 在本段开、在 _DASH_SECTIONS_TABLES
+     段内闭（跨段闭合，改排布前先核对配对注释 "pane X 开/闭"）。 -->
+<nav class="tab-bar" role="tablist" aria-label="运行台分页">
+  <button type="button" class="tab active" role="tab" data-tab="overview" id="tab-overview"
+          aria-selected="true" aria-controls="pane-overview" tabindex="0">监控概览</button>
+  <button type="button" class="tab" role="tab" data-tab="requests" id="tab-requests"
+          aria-selected="false" aria-controls="pane-requests" tabindex="-1">请求与剥行</button>
+  <button type="button" class="tab" role="tab" data-tab="perf" id="tab-perf"
+          aria-selected="false" aria-controls="pane-perf" tabindex="-1">性能与健康</button>
+  <button type="button" class="tab" role="tab" data-tab="settings" id="tab-settings"
+          aria-selected="false" aria-controls="pane-settings" tabindex="-1">设置</button>
+</nav>
+  <!-- pane settings 开 -->
+  <div class="tab-pane" data-pane="settings" role="tabpanel" id="pane-settings"
+       aria-labelledby="tab-settings" hidden>
   <section class="card">
     <div class="card-title">上游端点<span class="chip" id="upstream-source">--</span></div>
     <div class="upstream-url dimmed" id="upstream-base">读取中……</div>
@@ -2573,6 +2601,11 @@ _DASH_SECTIONS_STATIC = """<main>
       <p class="msg" id="tpm-msg" role="status"></p>
     </div>
   </section>
+  </div>
+  <!-- pane settings 闭 -->
+  <!-- pane overview 开（闭合见 _DASH_SECTIONS_TABLES 段尾） -->
+  <div class="tab-pane" data-pane="overview" role="tabpanel" id="pane-overview"
+       aria-labelledby="tab-overview">
   <section class="card range-tabs" role="tablist" aria-label="统计时间维度">
     <button type="button" class="range-tab" role="tab" data-range="3d">近3天</button>
     <button type="button" class="range-tab" role="tab" data-range="7d">近7天</button>
@@ -2610,6 +2643,18 @@ _DASH_SECTIONS_TABLES = """  <section class="card">
     </table>
     </div>
   </section>
+  <!-- P6：tri-state-card 自 _DASH_SECTIONS_V2 移入 overview pane（pane 开自 _DASH_SECTIONS_STATIC） -->
+  <section class="card" id="tri-state-card">
+    <div class="card-title">三态可用率 · 所选时段（<span id="tri-state-range">近7天</span>）</div>
+    <div class="tri-bar" style="display:flex;height:14px;border-radius:4px;overflow:hidden;gap:2px"
+         role="img" aria-label="ok / degraded / failed 占比条"></div>
+    <div id="tri-state-legend" style="color:var(--dim);font-size:12px;margin-top:8px"></div>
+  </section>
+  </div>
+  <!-- pane overview 闭（开自 _DASH_SECTIONS_STATIC，跨段闭合勿误切配对） -->
+  <!-- pane requests 开 -->
+  <div class="tab-pane" data-pane="requests" role="tabpanel" id="pane-requests"
+       aria-labelledby="tab-requests" hidden>
   <section class="card">
     <div class="card-title">剥行流带 · 最近剥除的毒 record</div>
     <div class="strip" id="poison-strip"><span class="empty">读取中……</span></div>
@@ -2623,9 +2668,14 @@ _DASH_SECTIONS_TABLES = """  <section class="card">
     </table>
     </div>
   </section>
+  </div>
+  <!-- pane requests 闭 -->
 """
 
-_DASH_SECTIONS_V2 = """  <section class="card">
+_DASH_SECTIONS_V2 = """  <!-- pane perf 开 -->
+  <div class="tab-pane" data-pane="perf" role="tabpanel" id="pane-perf"
+       aria-labelledby="tab-perf" hidden>
+  <section class="card">
     <div class="card-title">上游健康<span class="chip" id="health-status">--</span></div>
     <table>
       <tbody id="upstream-health"><tr><td class="empty" colspan="2">读取中……</td></tr></tbody>
@@ -2654,12 +2704,8 @@ _DASH_SECTIONS_V2 = """  <section class="card">
     </table>
     </div>
   </section>
-  <section class="card" id="tri-state-card">
-    <div class="card-title">三态可用率 · 所选时段（<span id="tri-state-range">近7天</span>）</div>
-    <div class="tri-bar" style="display:flex;height:14px;border-radius:4px;overflow:hidden;gap:2px"
-         role="img" aria-label="ok / degraded / failed 占比条"></div>
-    <div id="tri-state-legend" style="color:var(--dim);font-size:12px;margin-top:8px"></div>
-  </section>
+  </div>
+  <!-- pane perf 闭 -->
 """
 
 _DASH_JS_CORE = """</main>
@@ -3008,6 +3054,75 @@ function bar(idx, bw, h, H, fill) {
   rect.style.fill = fill;  // 展示属性不支持 var()，必须走 CSSOM style
   return rect;
 }
+/* ===== P6: 页面级 tab 分页（tab-bar ↔ pane 显隐 ↔ aria ↔ hash ↔ localStorage） ===== */
+var DASH_TAB_KEYS = ["overview", "requests", "perf", "settings"];
+var dashTabMem = "overview";  // localStorage 不可用（隐私模式等）时的会话内降级
+function initTabs() {
+  var bar = document.querySelector(".tab-bar");
+  if (!bar) return;
+  function readStoredTab() {
+    try {
+      var v = localStorage.getItem("ctyun-dash-tab");
+      if (v) return v;
+    } catch (e) { /* SecurityError：localStorage 读被禁，走内存降级 */ }
+    return dashTabMem;
+  }
+  function storeTab(key) {
+    try { localStorage.setItem("ctyun-dash-tab", key); }
+    catch (e) { /* SecurityError（隐私模式/禁用 cookie）：吞掉降级内存变量。
+                    该 try 仅包 setItem 一条语句，除安全策略阻断无其他失败路径；
+                    用户无跨会话持久化诉求，会话内记忆已是合理降级 */ }
+    dashTabMem = key;
+  }
+  function hashTab() {
+    var h = location.hash ? location.hash.slice(1) : "";
+    return DASH_TAB_KEYS.indexOf(h) !== -1 ? h : null;
+  }
+  function applyTab(key, persist) {
+    var panes = document.querySelectorAll(".tab-pane");
+    for (var i = 0; i < panes.length; i++) {
+      if (panes[i].getAttribute("data-pane") === key) panes[i].removeAttribute("hidden");
+      else panes[i].setAttribute("hidden", "");
+    }
+    var tabs = bar.querySelectorAll(".tab");
+    for (var j = 0; j < tabs.length; j++) {
+      var on = tabs[j].getAttribute("data-tab") === key;
+      tabs[j].classList.toggle("active", on);
+      tabs[j].setAttribute("aria-selected", on ? "true" : "false");
+      tabs[j].setAttribute("tabindex", on ? "0" : "-1");
+    }
+    if (persist) {
+      storeTab(key);
+      if (history.replaceState) history.replaceState(null, "", "#" + key);
+    }
+  }
+  bar.addEventListener("click", function (e) {
+    var btn = e.target && e.target.closest ? e.target.closest(".tab") : null;
+    if (!btn) return;
+    applyTab(btn.getAttribute("data-tab"), true);
+  });
+  // 左/右方向键循环切换（WAI-APG 简化版）；keydown 挂在 tab-bar 上，不劫持 range-tab
+  bar.addEventListener("keydown", function (e) {
+    if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+    var tabs = bar.querySelectorAll(".tab");
+    var idx = -1;
+    for (var i = 0; i < tabs.length; i++) {
+      if (tabs[i] === document.activeElement) { idx = i; break; }
+    }
+    if (idx === -1) return;
+    e.preventDefault();
+    var next = e.key === "ArrowRight" ? (idx + 1) % tabs.length
+                                       : (idx - 1 + tabs.length) % tabs.length;
+    tabs[next].focus();
+    applyTab(tabs[next].getAttribute("data-tab"), true);
+  });
+  window.addEventListener("hashchange", function () {
+    var key = hashTab();
+    if (key) applyTab(key, true);
+  });
+  applyTab(hashTab() || readStoredTab(), false);
+}
+initTabs();
 """
 
 _DASH_JS_V2 = """function renderPerf(snap) {

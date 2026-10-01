@@ -2849,8 +2849,13 @@ class DashboardV2SkeletonTest(unittest.TestCase):
     def test_v2_containers_present(self) -> None:
         v2 = self.mod._DASH_SECTIONS_V2
         for cid in ("perf-model-body", "token-daily-body", "upstream-health",
-                    "tri-state-card", "latency-dist"):
+                    "latency-dist"):
             self.assertIn('id="%s"' % cid, v2, "V2 区块缺容器 %s" % cid)
+        # P6：tri-state-card 移入 overview pane（落在 _DASH_SECTIONS_TABLES 段内）——
+        # 全页落位由 DashboardTabsSkeletonTest.test_pane_mapping /
+        # test_no_regression_existing_ids 守护
+        self.assertIn('id="tri-state-card"', self.mod._DASH_SECTIONS_TABLES,
+                      "tri-state-card 应移入 _DASH_SECTIONS_TABLES")
 
     def test_old_content_intact(self) -> None:
         # R5 兜底：旧区块不因拆段/加卡退化（模块级快断言；子进程集成测试仍独立守护）
@@ -2894,6 +2899,83 @@ class DashboardV2SkeletonTest(unittest.TestCase):
         self.assertIn("renderTriState(lastSnap)", core)
         # 健康卡 chip 挂 probe_alert 事件标记（hover 出 tooltip）
         self.assertIn('markEvents(chip, "probe_alert", null, null)', js)
+
+
+class DashboardTabsSkeletonTest(unittest.TestCase):
+    """P6：页面级 tab 分页骨架（模块级常量断言，无需子进程）。"""
+
+    def setUp(self) -> None:
+        self.mod = load_proxy_module()
+
+    def test_tab_bar_present(self) -> None:
+        html = self.mod.DASHBOARD_HTML.decode("utf-8")
+        self.assertIn('<nav class="tab-bar"', html)
+        self.assertIn('role="tablist"', html)
+        for key in ("overview", "requests", "perf", "settings"):
+            self.assertIn('data-tab="%s"' % key, html,
+                          "tab-bar 缺 data-tab=%s" % key)
+            self.assertIn('aria-controls="pane-%s"' % key, html,
+                          "tab %s 缺 aria-controls" % key)
+
+    def test_pane_mapping(self) -> None:
+        html = self.mod.DASHBOARD_HTML.decode("utf-8")
+        self.assertEqual(html.count('class="tab-pane"'), 4,
+                         "pane 包裹 div 必须恰好 4 个")
+        pane_order = ("settings", "overview", "requests", "perf")
+        starts = []
+        for name in pane_order:
+            pos = html.find('data-pane="%s"' % name)
+            self.assertNotEqual(pos, -1, "缺 pane %s" % name)
+            starts.append(pos)
+        self.assertEqual(starts, sorted(starts),
+                         "pane 须按 settings/overview/requests/perf 顺序出现（%r）"
+                         % starts)
+        main_end = html.find("</main>")
+        boundaries = starts[1:] + [main_end if main_end != -1 else len(html)]
+        pane_ids = {
+            "settings": ("upstream-form", "tpm-models"),
+            "overview": ("st-requests", "daily-body", "daily-model-body",
+                         "tri-state-card"),
+            "requests": ("poison-strip", "req-body"),
+            "perf": ("upstream-health", "perf-model-body", "latency-dist",
+                     "token-daily-body"),
+        }
+        for name, start, end in zip(pane_order, starts, boundaries):
+            seg = html[start:end]
+            for cid in pane_ids[name]:
+                self.assertIn('id="%s"' % cid, seg,
+                              "id=%s 未落在 pane %s" % (cid, name))
+
+    def test_initial_hidden_state(self) -> None:
+        html = self.mod.DASHBOARD_HTML.decode("utf-8")
+        tags = re.findall(r'<div class="tab-pane" data-pane="[a-z]+"[^>]*>',
+                          html)
+        self.assertEqual(len(tags), 4,
+                         "初始 HTML 应有 4 个 pane 开标签，实得 %d" % len(tags))
+        for tag in tags:
+            if 'data-pane="overview"' in tag:
+                self.assertNotIn("hidden", tag,
+                                 "overview pane 初始不得 hidden：%s" % tag)
+            else:
+                self.assertIn("hidden", tag,
+                              "非 overview pane 初始必须 hidden：%s" % tag)
+
+    def test_tab_js_wiring(self) -> None:
+        js = self.mod._DASH_JS_CORE
+        for token in ("initTabs", "localStorage", "location.hash",
+                      "hashchange", "aria-selected", "history.replaceState"):
+            self.assertIn(token, js, "_DASH_JS_CORE 缺 tab 接线 %s" % token)
+
+    def test_no_regression_existing_ids(self) -> None:
+        html = self.mod.DASHBOARD_HTML.decode("utf-8")
+        for cid in ("daily-body", "daily-model-body", "req-body",
+                    "poison-strip", "tpm-models", "tpm-save",
+                    "upstream-form", "upstream-health", "perf-model-body",
+                    "latency-dist", "token-daily-body", "tri-state-card",
+                    "spark", "evt-tip"):
+            self.assertEqual(html.count('id="%s"' % cid), 1,
+                             "id=%s 应恰好出现 1 次（防 pane 包裹复制/丢段），实得 %d"
+                             % (cid, html.count('id="%s"' % cid)))
 
 
 class AdminIntegrationTest(unittest.TestCase):
@@ -3072,6 +3154,12 @@ class AdminIntegrationTest(unittest.TestCase):
         self.assertIn("function renderHealth(", html)
         self.assertIn("function renderTriState(", html)
         self.assertIn("probe_alert", html)
+        # P6：页面级 tab 分页（tab-bar / 4 pane / settings pane / initTabs JS）
+        self.assertIn('<nav class="tab-bar"', html)
+        self.assertEqual(html.count('class="tab-pane"'), 4)
+        self.assertIn('data-pane="settings"', html)
+        self.assertIn("initTabs", html)
+        self.assertIn("localStorage", html)
 
     def test_favicon_served(self) -> None:
         status, body, ctype = admin_get(self.proc.admin_port, "/favicon.ico")
