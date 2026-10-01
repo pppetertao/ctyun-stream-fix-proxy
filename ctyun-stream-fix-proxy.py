@@ -1104,6 +1104,7 @@ def calibrate_state_snapshot() -> dict:
             "model": _CALIBRATE_STATE["model"],
             "progress": dict(_CALIBRATE_STATE["progress"]),
             "result": _CALIBRATE_STATE["result"],
+            "error": _CALIBRATE_STATE["error"],
         }
 
 
@@ -1215,10 +1216,6 @@ def _calibrate_log(model, task_id, result, dur_s) -> None:
                result.get("outcome"), result.get("consumed", 0),
                time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime())))
     _safe_log_stderr(line)
-    global _LOG_SEQ
-    with LOG_LOCK:
-        _LOG_SEQ += 1
-        LOG_RING.append({"seq": _LOG_SEQ, "line": line})
 
 
 def _calibrate_loop() -> None:
@@ -1231,6 +1228,7 @@ def _calibrate_loop() -> None:
     顶层 except Exception：写 _CALIBRATE_STATE["error"] + _safe_log_stderr 后复位
     running=False——不静默吞掉（R6），供 Dashboard 展示。
     """
+    global _CALIBRATE_TOKEN
     while True:
         time.sleep(1)
         with CALIBRATE_LOCK:

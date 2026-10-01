@@ -7722,6 +7722,7 @@ class TpmCalibrateStateTest(unittest.TestCase):
         snap = self.mod.calibrate_state_snapshot()
         for key in ("running", "task_id", "model", "progress", "result"):
             self.assertIn(key, snap)
+        self.assertIn("error", snap)
         self.assertIs(snap["running"], False)
         self.assertIsNone(snap["model"])
 
@@ -7783,6 +7784,59 @@ class TpmCalibrateStateTest(unittest.TestCase):
         with mod.CALIBRATE_LOCK:
             self.assertTrue(mod._CALIBRATE_STATE["abort"])
         self.assertTrue(mod.calibrate_abort())   # 幂等
+
+    def test_calibrate_loop_consumes_task_and_sets_result(self) -> None:
+        mod = self.mod
+        # 批间隙/最小间隔 seam 调小（模块级常量 import 期读取，运行时改
+        # os.environ 无效——直接改模块属性，addCleanup 还原）
+        orig_gap = mod.TPM_CALIBRATE_BATCH_GAP_S
+        orig_interval = mod.TPM_CALIBRATE_MIN_INTERVAL_S
+        mod.TPM_CALIBRATE_BATCH_GAP_S = 0.05
+        mod.TPM_CALIBRATE_MIN_INTERVAL_S = 0
+        self.addCleanup(setattr, mod, "TPM_CALIBRATE_BATCH_GAP_S", orig_gap)
+        self.addCleanup(setattr, mod, "TPM_CALIBRATE_MIN_INTERVAL_S", orig_interval)
+
+        calls = []
+        reject_est = []
+
+        def fake_send(model, batch, est, auth_token):
+            """脚本化发送器：前 2 批 200，第 3 批 429（限流首拒即停）。"""
+            calls.append(batch)
+            if len(calls) <= 2:
+                return 200, False
+            reject_est.append(est)
+            return 429, False
+
+        orig_send = mod._calibrate_send
+        mod._calibrate_send = fake_send
+        self.addCleanup(setattr, mod, "_calibrate_send", orig_send)
+
+        thread = threading.Thread(target=mod._calibrate_loop, daemon=True)
+        thread.start()
+
+        def stop_loop():
+            with mod.CALIBRATE_LOCK:
+                mod._CALIBRATE_STATE["running"] = False
+            mod._CALIBRATE_TOKEN = None
+            thread.join(2)
+        self.addCleanup(stop_loop)
+
+        status, _ = mod.calibrate_start("m-x", token="Bearer t")
+        self.assertEqual(status, 200)
+
+        result = None
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            with mod.CALIBRATE_LOCK:
+                result = mod._CALIBRATE_STATE["result"]
+            if result is not None:
+                break
+            time.sleep(0.05)
+        self.assertIsNotNone(
+            result, "daemon 10s 内未产出 result（error=%r, calls=%r）"
+            % (mod._CALIBRATE_STATE["error"], calls))
+        self.assertEqual(result["outcome"], "rejected")
+        self.assertEqual(result["threshold"], reject_est[0])
 
 
 class CalibrateSendTest(unittest.TestCase):
