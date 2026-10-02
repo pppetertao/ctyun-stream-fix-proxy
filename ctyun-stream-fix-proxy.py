@@ -913,7 +913,8 @@ STATS = {"requests_total": 0, "filtered_total": 0, "errors_total": 0,
          "phase_ms": {"connect": [0] * 9, "headers": [0] * 9, "body": [0] * 9},  # 全局三阶段（R4：不按模型）
          "rates": {"bytes_out_total": 0, "chunks_total": 0, "tokens_total": 0,
                    "window_start": time.monotonic(), "window_bytes": 0,
-                   "window_chunks": 0, "window_tokens": 0},  # 60s 滑动窗（P2 bytes/chunks；tokens P3 填）
+                   "window_chunks": 0, "window_tokens": 0,
+                   "bytes_in_total": 0, "window_bytes_in": 0},  # 60s 滑动窗（P2 bytes/chunks；tokens P3 填；v3.1 bytes_in）
          "stalls_total": 0,
          # v3：per-key/每模型扩展观测（spec 决策 2/3/4/5）
          "daily_by_key": {},          # {day: {key_id12: _DAILY_BY_KEY_FIELDS 8 字段}}，BY_KEY_CAP 截断
@@ -1628,7 +1629,9 @@ def _record_request(method: str, path: str, status: int, dur_ms: float,
                     phase_ms: dict = None,
                     # v3：cache_read/reasoning 落桶 + TPM 排队观测 + per-key 标识
                     tokens_cache_read: int = 0, tokens_reasoning: int = 0,
-                    qwait_ms=None, key_id12=None) -> None:
+                    qwait_ms=None, key_id12=None,
+                    # v3.1：入方向字节（请求体 Content-Length）
+                    bytes_in: int = 0) -> None:
     global _stats_dirty
     # v2 P4：outcome 兼容两形态——_Outcome namedtuple（落桶用 tri_state 字段）或
     # category 字符串（旧调用点/测试，回退 _outcome_tri_state 纯函数）。
@@ -1770,10 +1773,13 @@ def _record_request(method: str, path: str, status: int, dur_ms: float,
             rates["window_bytes"] = 0
             rates["window_chunks"] = 0
             rates["window_tokens"] = 0
+            rates["window_bytes_in"] = 0
         rates["bytes_out_total"] += bytes_out
         rates["chunks_total"] += chunks
         rates["window_bytes"] += bytes_out
         rates["window_chunks"] += chunks
+        rates["bytes_in_total"] += bytes_in
+        rates["window_bytes_in"] += bytes_in
         if tokens:  # P3 填 tokens；P2 阶段恒 None → 不累计
             rates["tokens_total"] += tokens
             rates["window_tokens"] += tokens
@@ -1784,16 +1790,21 @@ def _record_request(method: str, path: str, status: int, dur_ms: float,
                 qwait_ring[model] = collections.deque(maxlen=QWAIT_RING_MAX)
             if model in qwait_ring:
                 qwait_ring[model].append(qwait_ms)
-        # v3 T6：小时级 token 曲线滚动（决策 5）
+        # v3 T6：小时级 token 曲线滚动（决策 5）；v3.1 扩 bytes_out/chunks 同环
         hour_start = int(time.time() // 3600 * 3600)
         hourly = STATS["hourly_tokens"]
         if not hourly or hourly[-1]["hour_start_ts"] != hour_start:
             hourly.append({"hour_start_ts": hour_start,
-                           "tokens_prompt": 0, "tokens_completion": 0})
+                           "tokens_prompt": 0, "tokens_completion": 0,
+                           "bytes_out": 0, "chunks": 0})
         if tokens_prompt > 0:
             hourly[-1]["tokens_prompt"] += tokens_prompt
         if tokens_completion > 0:
             hourly[-1]["tokens_completion"] += tokens_completion
+        if bytes_out > 0:
+            hourly[-1]["bytes_out"] += bytes_out
+        if chunks > 0:
+            hourly[-1]["chunks"] += chunks
         _stats_dirty = True
 
 
@@ -1916,7 +1927,7 @@ def stats_snapshot() -> dict:
     perf = {"ttfb_p50_ms_by_model": {}, "ttfb_p90_ms_by_model": {},
             "phase_p50_ms": {}, "bytes_per_s": 0.0, "chunks_per_s": 0.0,
             "tokens_per_s": 0.0, "stalls_total": stalls_total,
-            "stream_share": 0.0,
+            "stream_share": 0.0, "bytes_in_per_s": 0.0,
             # v3：P1 直方图数据源 + per-model 分位（P6/P7/P8/T4）
             "ttfb_hist_by_model": ttfb_hist,
             "phase_p50_ms_by_model": {}, "phase_p90_ms_by_model": {},
@@ -1955,6 +1966,7 @@ def stats_snapshot() -> dict:
         perf["bytes_per_s"] = round(rates["window_bytes"] / elapsed, 1)
         perf["chunks_per_s"] = round(rates["window_chunks"] / elapsed, 1)
         perf["tokens_per_s"] = round(rates["window_tokens"] / elapsed, 1)
+        perf["bytes_in_per_s"] = round(rates["window_bytes_in"] / elapsed, 1)
     if recent_len:
         perf["stream_share"] = round(recent_stream / recent_len, 4)
     snap["perf"] = perf
@@ -2220,6 +2232,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                             tokens_reasoning=p3_tokens[4] if p3_tokens else 0,
                             qwait_ms=tpm_qwait_ms,
                             key_id12=tpm_key[:12] if tpm_key else None,
+                            bytes_in=length,
                             phase_ms={"connect": connect_ms, "headers": headers_ms,
                                       "body": body_ms})
         else:
@@ -2269,6 +2282,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                             tokens_reasoning=p3_buf_tokens[4] if p3_buf_tokens else 0,
                             qwait_ms=tpm_qwait_ms,
                             key_id12=tpm_key[:12] if tpm_key else None,
+                            bytes_in=length,
                             phase_ms={"connect": connect_ms, "headers": headers_ms,
                                       "body": body_ms})
             if outcome.capture:

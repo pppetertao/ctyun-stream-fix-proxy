@@ -5162,6 +5162,33 @@ class RecordRequestV3Test(unittest.TestCase):
         self.assertEqual(b["tokens_cache_write"], 0,
                          "cache_write 不解析，桶字段恒 0（Exclusions）")
 
+    def test_hourly_bytes_chunks_accumulate(self) -> None:
+        """吞吐 v3.1：hourly_tokens 条目扩 bytes_out/chunks 字段同环滚动。"""
+        mod = self.mod
+        mod.STATS["hourly_tokens"].clear()
+        try:
+            mod._record_request("POST", "/hb", 200, 1.0, 0, model="m1",
+                                bytes_out=500, chunks=7,
+                                tokens_prompt=10, tokens_completion=5)
+            entry = mod.STATS["hourly_tokens"][-1]
+            self.assertEqual(entry["bytes_out"], 500)
+            self.assertEqual(entry["chunks"], 7)
+            self.assertEqual(entry["tokens_prompt"], 10)
+            self.assertEqual(entry["tokens_completion"], 5)
+        finally:
+            mod.STATS["hourly_tokens"].clear()
+
+    def test_bytes_in_rates_window(self) -> None:
+        """吞吐 v3.1：入方向字节（请求体）进 60s rates 窗口 + perf.bytes_in_per_s。"""
+        mod = self.mod
+        before_total = mod.STATS["rates"]["bytes_in_total"]
+        before_win = mod.STATS["rates"]["window_bytes_in"]
+        mod._record_request("POST", "/bi", 200, 1.0, 0, model="m1", bytes_in=2048)
+        self.assertEqual(mod.STATS["rates"]["bytes_in_total"], before_total + 2048)
+        self.assertEqual(mod.STATS["rates"]["window_bytes_in"], before_win + 2048)
+        snap = mod.stats_snapshot()
+        self.assertIn("bytes_in_per_s", snap["perf"])
+
 
 class RelaySseV3Test(unittest.TestCase):
     """v3 _relay_sse model kwarg + stalls per-model 双写（决策 3）。
