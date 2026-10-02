@@ -1063,8 +1063,9 @@ def calibrate_engine(model, send_one, should_abort=None, sleep=None):
     send_one 返回 CALIBRATE_STATUS_TIMEOUT（读超时哨兵）→ probe_timeout，
     不重试、不翻倍（同批大请求是读挂上游的根因，R3）。
     首拒即停（不追加确认批次）。安全阀：下一批 est 将超过
-    TPM_CALIBRATE_HARD_CAP_TOKENS → capped 且不超发，batches 记已成功发送的批次数
-    （被判超顶那一批未发送，不计入）；墙钟超 TPM_CALIBRATE_MAX_DURATION_S → timeout；
+    TPM_CALIBRATE_HARD_CAP_TOKENS 或超 TPM_CALIBRATE_MAX_PROBE_TOKENS
+    → capped 且不超发，batches 记已成功发送的批次数（被判超顶那一批未发送，
+    不计入）；墙钟超 TPM_CALIBRATE_MAX_DURATION_S → timeout；
     should_abort() 为真（批间隙检查）→ aborted。返回
     {"threshold", "batches", "consumed", "outcome", "status", "ts"}：
     threshold = 拒绝批 est（rejected）或最后成功批 est（probe_timeout/timeout/
@@ -1102,6 +1103,9 @@ def calibrate_engine(model, send_one, should_abort=None, sleep=None):
         est = calibrate_est_for_batch(model, batch)
         if consumed + est > TPM_CALIBRATE_HARD_CAP_TOKENS:
             # 本批未发送：batches 只报已成功发送的批次数（batch - 1）
+            return _result("capped", None, None, batches=batch - 1)
+        if est > TPM_CALIBRATE_MAX_PROBE_TOKENS:
+            # 单批上限（ramp-up 终止条件，R1/R2）：越限批不发送，口径同硬顶
             return _result("capped", None, None, batches=batch - 1)
         category, status = _attempt(batch, est)
         consumed += est
@@ -1270,10 +1274,11 @@ def _calibrate_log(model, task_id, result, dur_s) -> None:
     line = ("REQ POST /v1/chat/completions -> %s dur=%.1fs result=calibrate "
             "filtered=0 model=%s retried=0 retry_reason=- exc=- "
             "rid=calibrate-%s host=%s ttfb=- stream=0 outcome=%s "
-            "consumed=%d probe=1 ts=%s"
+            "batch=%d consumed=%d probe=1 ts=%s"
             % (status if status is not None else "-", dur_s, model, task_id,
                urllib.parse.urlparse(UPSTREAM_BASE).netloc,
-               result.get("outcome"), result.get("consumed", 0),
+               result.get("outcome"), result.get("batches", 0),
+               result.get("consumed", 0),
                time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime())))
     _safe_log_stderr(line)
 

@@ -5011,11 +5011,53 @@ class AdminIntegrationTest(unittest.TestCase):
         lines = [entry["line"] for entry in logs["lines"]]
         self.assertTrue(any("probe=1" in line for line in lines),
                         "calibration log line must carry probe=1")
+        self.assertTrue(any("batch=" in line and "probe=1" in line
+                            for line in lines),
+                        "calibration log line must carry batch= progress field")
         # tpm_stats 桶不增（校准不调 tpm_admit）
         _, body_bytes, _ = admin_get(self.proc.admin_port, "/api/tpm_stats")
         tpm_snap = json.loads(body_bytes.decode("utf-8"))
         self.assertEqual(tpm_snap["buckets"], [],
                          "calibration must not touch tpm buckets")
+
+    def test_calibrate_capped_does_not_source_probe(self) -> None:
+        """AC5+AC8 集成：真实流量使模型可见 → 单批上限 capped（无 reject）
+        → GET /api/tpm_settings 该模型 recommend.source 不得为 probe、probe None。"""
+        stop_proxy(self.proc)  # 重启前释放 self.proxy_port（同 class 既有重启写法）
+        self.proc = start_proxy(self.upstream_port, self.proxy_port, extra_env={
+            "CTYUN_CALIBRATE_BATCH_GAP_S": "0.1",
+            "CTYUN_CALIBRATE_MAX_PROBE_TOKENS": "100000",
+            "CTYUN_CALIBRATE_SETTLE_WAIT_S": "0.1",
+        })
+        post_sse_auth(self.proxy_port,
+                      b'{"model":"kimi-k3-oc","stream":true,'
+                      b'"messages":[{"role":"user","content":"hi"}]}',
+                      "Bearer test-cal-token")
+        status, body = admin_post(
+            self.proc.admin_port, "/api/tpm_calibrate",
+            json.dumps({"model": "kimi-k3-oc"}).encode("utf-8"))
+        self.assertEqual(status, 200, body)
+        deadline = time.time() + 30
+        snap = None
+        while time.time() < deadline:
+            _, body, _ = admin_get(self.proc.admin_port, "/api/tpm_calibrate")
+            snap = json.loads(body.decode("utf-8"))
+            if not snap["running"]:
+                break
+            time.sleep(0.2)
+        self.assertIsNotNone(snap)
+        self.assertFalse(snap["running"], "calibration must finish (capped)")
+        self.assertEqual(snap["result"]["outcome"], "capped")
+        self.assertEqual(snap["result"]["batches"], 7,
+                         "MAX_PROBE=100000 时前 7 批（≤92k）已发送、第 8 批越限跳过")
+        _, body_bytes, _ = admin_get(self.proc.admin_port, "/api/tpm_settings")
+        settings = json.loads(body_bytes.decode("utf-8"))
+        by_name = {m["name"]: m for m in settings["models"]}
+        self.assertIn("kimi-k3-oc", by_name, "真实流量模型必须出现在 tpm_settings")
+        rec = by_name["kimi-k3-oc"]["recommend"]
+        self.assertNotEqual(rec["source"], "probe",
+                            "capped（无 reject）不得写 PROBE_RESULTS/probe 源")
+        self.assertIsNone(rec["probe"])
 
 
 class BodyErrorTest(unittest.TestCase):
@@ -7817,6 +7859,21 @@ class TpmCalibrateEngineTest(unittest.TestCase):
         self.assertEqual(result["consumed"], mod.calibrate_est_for_batch("m", 1))
         self.assertEqual(calls["n"], 1, "must not oversend beyond hard cap")
 
+    def test_calibrate_engine_max_probe_stops_before_oversend(self) -> None:
+        """AC5：单批目标 est 超 TPM_CALIBRATE_MAX_PROBE_TOKENS → capped 且不发送该批。"""
+        mod = self.mod
+        orig = mod.TPM_CALIBRATE_MAX_PROBE_TOKENS
+        mod.TPM_CALIBRATE_MAX_PROBE_TOKENS = 100000
+        self.addCleanup(setattr, mod, "TPM_CALIBRATE_MAX_PROBE_TOKENS", orig)
+        sender, calls = self._scripted([(200, False)])
+        result = mod.calibrate_engine("m", sender, sleep=lambda _: None)
+        self.assertEqual(result["outcome"], "capped")
+        self.assertEqual(result["batches"], 7, "前 7 批 ≤100k 已发送")
+        self.assertEqual(calls["n"], 7, "第 8 批（112k）越限不得发送")
+        self.assertEqual(result["consumed"],
+                         sum(mod.calibrate_est_for_batch("m", b)
+                             for b in range(1, 8)))
+
     def test_calibrate_engine_probe_timeout_not_retried(self) -> None:
         """AC6：读超时哨兵 → probe_timeout，不重试不翻倍；threshold = last_ok。"""
         mod = self.mod
@@ -8204,6 +8261,66 @@ class TpmCalibrateStateTest(unittest.TestCase):
         self.assertEqual(rec["source"], "none",
                          "无拒绝证据 → 推荐源不得因本次探测变为 probe")
         self.assertIsNone(rec["probe"])
+
+    def test_calibrate_loop_capped_skips_probe_results(self) -> None:
+        """AC5/AC8：单批上限 capped 终止不写 PROBE_RESULTS（无拒绝阈值）。"""
+        mod = self.mod
+        orig_gap = mod.TPM_CALIBRATE_BATCH_GAP_S
+        orig_interval = mod.TPM_CALIBRATE_MIN_INTERVAL_S
+        orig_probe_max = mod.TPM_CALIBRATE_MAX_PROBE_TOKENS
+        mod.TPM_CALIBRATE_BATCH_GAP_S = 0.05
+        mod.TPM_CALIBRATE_MIN_INTERVAL_S = 0
+        mod.TPM_CALIBRATE_MAX_PROBE_TOKENS = 5000
+        self.addCleanup(setattr, mod, "TPM_CALIBRATE_BATCH_GAP_S", orig_gap)
+        self.addCleanup(setattr, mod, "TPM_CALIBRATE_MIN_INTERVAL_S", orig_interval)
+        self.addCleanup(setattr, mod, "TPM_CALIBRATE_MAX_PROBE_TOKENS", orig_probe_max)
+        orig_probe = {m: list(v) for m, v in mod.PROBE_RESULTS.items()}
+
+        def restore():
+            mod.PROBE_RESULTS.clear()
+            mod.PROBE_RESULTS.update(orig_probe)
+        self.addCleanup(restore)
+        mod.PROBE_RESULTS.clear()
+
+        calls = []
+
+        def fake_send(model, batch, est, auth_token):
+            calls.append(batch)
+            return 200, False
+
+        orig_send = mod._calibrate_send
+        mod._calibrate_send = fake_send
+        self.addCleanup(setattr, mod, "_calibrate_send", orig_send)
+
+        thread = threading.Thread(target=mod._calibrate_loop, daemon=True)
+        thread.start()
+
+        def stop_loop():
+            with mod.CALIBRATE_LOCK:
+                mod._CALIBRATE_STATE["running"] = False
+            mod._CALIBRATE_TOKEN = None
+            thread.join(2)
+        self.addCleanup(stop_loop)
+
+        status, _ = mod.calibrate_start("m-probe-cap", token="Bearer t")
+        self.assertEqual(status, 200)
+
+        result = None
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            with mod.CALIBRATE_LOCK:
+                result = mod._CALIBRATE_STATE["result"]
+            if result is not None:
+                break
+            time.sleep(0.05)
+        self.assertIsNotNone(
+            result, "daemon 10s 内未产出 result（error=%r）"
+            % mod._CALIBRATE_STATE["error"])
+        self.assertEqual(result["outcome"], "capped")
+        self.assertEqual(result["batches"], 1)
+        self.assertEqual(calls, [1], "第 2 批（8k）越单批上限，不得发送")
+        self.assertNotIn("m-probe-cap", mod.PROBE_RESULTS,
+                         "capped 无拒绝阈值，不得写 PROBE_RESULTS")
 
     def test_tpm_last_success_ts(self) -> None:
         """tpm_last_success_ts：扫描 REQ 行，提取指定模型最近 result=ok 的 ts。"""
