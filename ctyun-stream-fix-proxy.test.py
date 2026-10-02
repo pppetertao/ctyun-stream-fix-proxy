@@ -7817,6 +7817,43 @@ class TpmCalibrateEngineTest(unittest.TestCase):
         self.assertEqual(result["consumed"], mod.calibrate_est_for_batch("m", 1))
         self.assertEqual(calls["n"], 1, "must not oversend beyond hard cap")
 
+    def test_calibrate_engine_probe_timeout_not_retried(self) -> None:
+        """AC6：读超时哨兵 → probe_timeout，不重试不翻倍；threshold = last_ok。"""
+        mod = self.mod
+        est1 = mod.calibrate_est_for_batch("m", 1)
+        est2 = mod.calibrate_est_for_batch("m", 2)
+        sender, calls = self._scripted([(200, False),
+                                        (mod.CALIBRATE_STATUS_TIMEOUT, False)])
+        result = mod.calibrate_engine("m", sender, sleep=lambda _: None)
+        self.assertEqual(result["outcome"], "probe_timeout")
+        self.assertEqual(result["batches"], 2)
+        self.assertEqual(result["threshold"], est1)
+        self.assertEqual(result["consumed"], est1 + est2)
+        self.assertEqual(calls["n"], 2, "timeout must not retry the same batch")
+
+    def test_calibrate_engine_probe_timeout_first_batch_threshold_none(self) -> None:
+        """AC6：首批即读超时 → threshold=None、仅 1 次调用。"""
+        mod = self.mod
+        sender, calls = self._scripted([(mod.CALIBRATE_STATUS_TIMEOUT, False)])
+        result = mod.calibrate_engine("m", sender, sleep=lambda _: None)
+        self.assertEqual(result["outcome"], "probe_timeout")
+        self.assertEqual(result["batches"], 1)
+        self.assertIsNone(result["threshold"])
+        self.assertEqual(calls["n"], 1)
+
+    def test_calibrate_engine_retry_timeout_probe_timeout(self) -> None:
+        """AC6：503 重试期间读超时 → 同样 probe_timeout（不判 upstream_error）。"""
+        mod = self.mod
+        est1 = mod.calibrate_est_for_batch("m", 1)
+        sender, calls = self._scripted([(503, False),
+                                        (mod.CALIBRATE_STATUS_TIMEOUT, False)])
+        result = mod.calibrate_engine("m", sender, sleep=lambda _: None)
+        self.assertEqual(result["outcome"], "probe_timeout")
+        self.assertEqual(result["batches"], 1)
+        self.assertIsNone(result["threshold"])
+        self.assertEqual(result["consumed"], est1 * 2)
+        self.assertEqual(calls["n"], 2)
+
     def test_calibrate_engine_timeout_zero_duration(self) -> None:
         """AC6②：墙钟上限为 0 → 首轮检查即 timeout，发送器零调用。"""
         mod = self.mod
@@ -8104,6 +8141,70 @@ class TpmCalibrateStateTest(unittest.TestCase):
             "校准运行中 progress 未逐批更新：snapshots=%r" % progress_snapshots)
         self.assertEqual(result["outcome"], "rejected")
 
+    def test_calibrate_loop_probe_timeout_skips_probe_results(self) -> None:
+        """AC6/AC8：probe_timeout 终止不写 PROBE_RESULTS；快照推荐源保持 none。"""
+        mod = self.mod
+        orig_gap = mod.TPM_CALIBRATE_BATCH_GAP_S
+        orig_interval = mod.TPM_CALIBRATE_MIN_INTERVAL_S
+        mod.TPM_CALIBRATE_BATCH_GAP_S = 0.05
+        mod.TPM_CALIBRATE_MIN_INTERVAL_S = 0
+        self.addCleanup(setattr, mod, "TPM_CALIBRATE_BATCH_GAP_S", orig_gap)
+        self.addCleanup(setattr, mod, "TPM_CALIBRATE_MIN_INTERVAL_S", orig_interval)
+        orig_probe = {m: list(v) for m, v in mod.PROBE_RESULTS.items()}
+        orig_recent = list(mod.RECENT_REQUESTS)
+
+        def restore():
+            mod.PROBE_RESULTS.clear()
+            mod.PROBE_RESULTS.update(orig_probe)
+            mod.RECENT_REQUESTS.clear()
+            mod.RECENT_REQUESTS.extend(orig_recent)
+        self.addCleanup(restore)
+        mod.PROBE_RESULTS.clear()
+        mod.RECENT_REQUESTS.append({"model": "m-probe-timeout"})
+
+        def fake_send(model, batch, est, auth_token):
+            return mod.CALIBRATE_STATUS_TIMEOUT, False
+
+        orig_send = mod._calibrate_send
+        mod._calibrate_send = fake_send
+        self.addCleanup(setattr, mod, "_calibrate_send", orig_send)
+
+        thread = threading.Thread(target=mod._calibrate_loop, daemon=True)
+        thread.start()
+
+        def stop_loop():
+            with mod.CALIBRATE_LOCK:
+                mod._CALIBRATE_STATE["running"] = False
+            mod._CALIBRATE_TOKEN = None
+            thread.join(2)
+        self.addCleanup(stop_loop)
+
+        status, _ = mod.calibrate_start("m-probe-timeout", token="Bearer t")
+        self.assertEqual(status, 200)
+
+        result = None
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            with mod.CALIBRATE_LOCK:
+                result = mod._CALIBRATE_STATE["result"]
+            if result is not None:
+                break
+            time.sleep(0.05)
+        self.assertIsNotNone(
+            result, "daemon 10s 内未产出 result（error=%r）"
+            % mod._CALIBRATE_STATE["error"])
+        self.assertEqual(result["outcome"], "probe_timeout")
+        self.assertEqual(result["batches"], 1)
+        self.assertIsNone(result["threshold"])
+        self.assertNotIn("m-probe-timeout", mod.PROBE_RESULTS,
+                         "probe_timeout 无可靠阈值，不得写 PROBE_RESULTS")
+        snap = mod.tpm_settings_snapshot()
+        by_name = {m["name"]: m for m in snap["models"]}
+        rec = by_name["m-probe-timeout"]["recommend"]
+        self.assertEqual(rec["source"], "none",
+                         "无拒绝证据 → 推荐源不得因本次探测变为 probe")
+        self.assertIsNone(rec["probe"])
+
     def test_tpm_last_success_ts(self) -> None:
         """tpm_last_success_ts：扫描 REQ 行，提取指定模型最近 result=ok 的 ts。"""
         mod = self.mod
@@ -8344,6 +8445,25 @@ class CalibrateSendTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIs(body_error, False)
         self.assertEqual(seen, [("m", mod.calibrate_input_bytes(3))])
+
+    def test_calibrate_status_timeout_sentinel(self) -> None:
+        """状态哨兵为字符串，与 int HTTP 状态码区分（engine 判 probe_timeout）。"""
+        self.assertEqual(self.mod.CALIBRATE_STATUS_TIMEOUT, "timeout")
+        self.assertNotIsInstance(self.mod.CALIBRATE_STATUS_TIMEOUT, int)
+
+    def test_calibrate_send_read_timeout_classified(self) -> None:
+        """AC6：上游持连静默超过 TPM_CALIBRATE_TIMEOUT_S → socket.timeout →
+        (CALIBRATE_STATUS_TIMEOUT, False)，区别于连接异常的 (None, False)。"""
+        mod = self.mod
+        stop_fake_upstreams()
+        stall_port = make_fake_upstream(False, sleep_stall_all=True)
+        mod.UPSTREAM_BASE = "http://127.0.0.1:%d" % stall_port
+        orig = mod.TPM_CALIBRATE_TIMEOUT_S
+        mod.TPM_CALIBRATE_TIMEOUT_S = 0.5
+        self.addCleanup(setattr, mod, "TPM_CALIBRATE_TIMEOUT_S", orig)
+        status, body_error = mod._calibrate_send("m", 1, 4023, "Bearer t")
+        self.assertEqual(status, mod.CALIBRATE_STATUS_TIMEOUT)
+        self.assertIs(body_error, False)
 
 
 class GenSpeedRecentEntryTest(unittest.TestCase):

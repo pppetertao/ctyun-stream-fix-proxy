@@ -127,6 +127,8 @@ TPM_CALIBRATE_MAX_DURATION_S = float(os.environ.get("CTYUN_CALIBRATE_MAX_DURATIO
 TPM_CALIBRATE_MIN_INTERVAL_S = float(os.environ.get("CTYUN_CALIBRATE_MIN_INTERVAL_S", "1800"))
 TPM_CALIBRATE_HARD_CAP_TOKENS = int(os.environ.get("CTYUN_CALIBRATE_HARD_CAP_TOKENS", "400000"))
 TPM_CALIBRATE_SETTLE_WAIT_S = float(os.environ.get("CTYUN_CALIBRATE_SETTLE_WAIT_S", "60"))
+# 校准发送器状态哨兵：读超时（socket.timeout）与 int HTTP 状态码区分（engine 判 probe_timeout）
+CALIBRATE_STATUS_TIMEOUT = "timeout"
 # 样本/探测结果持久化上限（R7：防持久化膨胀）
 TPM_SAMPLES_MAX = int(os.environ.get("CTYUN_TPM_SAMPLES_MAX", "200"))
 TPM_SAMPLES_RETENTION_DAYS = int(os.environ.get("CTYUN_TPM_SAMPLES_RETENTION_DAYS", "30"))
@@ -1057,14 +1059,16 @@ def calibrate_engine(model, send_one, should_abort=None, sleep=None):
     连接级异常（无 HTTP 响应）。判定复用 classify_outcome：CLASS_BODY_ERROR /
     CLASS_REQUEST_FAULT（status>=400）→ 拒绝；CLASS_OK / CLASS_POISON_FIXED →
     未拒绝继续加压；CLASS_UPSTREAM_FAULT（5xx/连接异常）→ 同一批重试一次后仍败
-    → 中止标 upstream_error（不把上游故障误判为阈值，R5）。
+    → 中止标 upstream_error（不把上游故障误判为阈值，R5）；
+    send_one 返回 CALIBRATE_STATUS_TIMEOUT（读超时哨兵）→ probe_timeout，
+    不重试、不翻倍（同批大请求是读挂上游的根因，R3）。
     首拒即停（不追加确认批次）。安全阀：下一批 est 将超过
     TPM_CALIBRATE_HARD_CAP_TOKENS → capped 且不超发，batches 记已成功发送的批次数
     （被判超顶那一批未发送，不计入）；墙钟超 TPM_CALIBRATE_MAX_DURATION_S → timeout；
     should_abort() 为真（批间隙检查）→ aborted。返回
     {"threshold", "batches", "consumed", "outcome", "status", "ts"}：
-    threshold = 拒绝批 est（rejected）或最后成功批 est（timeout/aborted），
-    其余 None。
+    threshold = 拒绝批 est（rejected）或最后成功批 est（probe_timeout/timeout/
+    aborted），其余 None。
     """
     started = time.monotonic()
     batch = 0
@@ -1080,10 +1084,13 @@ def calibrate_engine(model, send_one, should_abort=None, sleep=None):
                 "outcome": outcome, "status": status, "ts": time.time()}
 
     def _attempt(batch_num, est):
-        """发送一次，返回 (category, status)；连接异常 → (CLASS_UPSTREAM_FAULT, None)。"""
+        """发送一次，返回 (category, status)；连接异常 → (CLASS_UPSTREAM_FAULT, None)；
+        读超时哨兵（字符串，非 int HTTP 码）直通，不交 classify_outcome 做阈值比较。"""
         status, body_error = send_one(batch_num, est)
         if status is None:
             return CLASS_UPSTREAM_FAULT, None
+        if status == CALIBRATE_STATUS_TIMEOUT:
+            return CALIBRATE_STATUS_TIMEOUT, status
         return classify_outcome(status=status, body_error=body_error).category, status
 
     while True:
@@ -1098,6 +1105,9 @@ def calibrate_engine(model, send_one, should_abort=None, sleep=None):
             return _result("capped", None, None, batches=batch - 1)
         category, status = _attempt(batch, est)
         consumed += est
+        if category == CALIBRATE_STATUS_TIMEOUT:
+            # 读超时单独分类（R3）：不重试、不翻倍（同批大请求是读挂上游的根因）
+            return _result("probe_timeout", last_ok_est, None)
         if category in (CLASS_BODY_ERROR, CLASS_REQUEST_FAULT):
             return _result("rejected", est, status)
         if category == CLASS_UPSTREAM_FAULT:
@@ -1107,6 +1117,8 @@ def calibrate_engine(model, send_one, should_abort=None, sleep=None):
             sleep_fn(TPM_CALIBRATE_BATCH_GAP_S)
             category, status = _attempt(batch, est)
             consumed += est
+            if category == CALIBRATE_STATUS_TIMEOUT:
+                return _result("probe_timeout", last_ok_est, None)
             if category in (CLASS_BODY_ERROR, CLASS_REQUEST_FAULT):
                 return _result("rejected", est, status)
             if category == CLASS_UPSTREAM_FAULT:
@@ -1198,9 +1210,11 @@ def _calibrate_send(model, batch, est, auth_token):
     Authorization = auth_token 或 _LAST_AUTH。
     est 由 engine 传入（形参保留，签名与 send_one(batch, est) 契约一致），当前函数
     体内不读，传入供未来观测/断言用。
-    返回 (status, body_error)；连接异常（OSError / HTTPException，R6 显式分类）
-    → (None, False) 并 _safe_log_stderr 留痕；engine 将连接异常判为
-    CLASS_UPSTREAM_FAULT 走重试路径。
+    返回 (status, body_error)；读超时（socket.timeout）→ (CALIBRATE_STATUS_TIMEOUT,
+    False) 并 _safe_log_stderr 留痕（engine 判 probe_timeout 终止，不重试）；
+    其余连接异常（OSError / HTTPException，R6 显式分类）→ (None, False) 并留痕，
+    engine 判 CLASS_UPSTREAM_FAULT 走重试路径。socket 超时用
+    TPM_CALIBRATE_TIMEOUT_S（整请求读超时，独立于 HEADER_TIMEOUT_S）。
     """
     input_bytes = calibrate_input_bytes(batch)
     body = build_calibrate_body(model, input_bytes)
@@ -1214,15 +1228,21 @@ def _calibrate_send(model, batch, est, auth_token):
     try:
         if parsed.scheme == "https":
             conn = http.client.HTTPSConnection(
-                parsed.hostname, parsed.port, timeout=HEADER_TIMEOUT_S)
+                parsed.hostname, parsed.port, timeout=TPM_CALIBRATE_TIMEOUT_S)
         else:
             conn = http.client.HTTPConnection(
-                parsed.hostname, parsed.port, timeout=HEADER_TIMEOUT_S)
+                parsed.hostname, parsed.port, timeout=TPM_CALIBRATE_TIMEOUT_S)
         conn.request("POST", upstream_path, body=body_bytes, headers=headers)
         resp = conn.getresponse()
         status = resp.status
         data = resp.read()
         conn.close()
+    except socket.timeout as exc:
+        # 读超时单独分类（R3）：不发重试信号（避免同批翻倍灌大请求），
+        # 返回字符串哨兵由 engine 判 probe_timeout 并终止。
+        _safe_log_stderr("ctyun-stream-fix-proxy: calibrate read timeout "
+                         "model=%s batch=%d: %s" % (model, batch, exc))
+        return CALIBRATE_STATUS_TIMEOUT, False
     except (OSError, http.client.HTTPException) as exc:
         # 显式分类（R6）：连接级异常不是限流信号；stderr 留痕，由 engine 判
         # CLASS_UPSTREAM_FAULT 走重试。
