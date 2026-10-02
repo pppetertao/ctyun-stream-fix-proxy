@@ -3351,6 +3351,21 @@ class DashboardV3CardsTest(unittest.TestCase):
                       "token 按天×模型表缺缓存列（T2）")
         self.assertIn("<th>推理</th>", v2,
                       "token 按天×模型表缺推理列（T3）")
+        self.assertIn("<th>输入</th>", v2, "token 按天×模型表缺输入合计列")
+        self.assertIn("<th>输出</th>", v2, "token 按天×模型表缺输出合计列")
+        self.assertIn("<th>总用量</th>", v2, "token 按天×模型表缺总用量列")
+        self.assertIn("<th>缓存命中率</th>", v2, "token 按天×模型表缺缓存命中率列")
+
+    def test_usage_aggregate_formulas(self) -> None:
+        js = self.mod._DASH_JS_V2
+        self.assertIn("Math.max(tp, cr)", js, "输入必须=max(prompt,cache_read) 防重复计入")
+        self.assertIn("Math.max(tc, rn)", js, "输出必须=max(completion,reasoning) 防重复计入")
+        self.assertIn('(cr / inp * 100).toFixed(1) + "%"', js, "命中率=cache_read/输入 1位小数")
+        self.assertIn('inp > 0 ? (cr / inp * 100).toFixed(1) + "%" : "-"', js,
+                      "输入为0命中率必须显示 -（0 除防护）")
+        self.assertIn("var inp = Math.max(tp, cr);", js, "表B缺 inp 计算")
+        for sub in ("fmtTok(inp)", "fmtTok(out)", "fmtTok(tot)"):
+            self.assertIn(sub, js, "缺 fmtTok 合计列接线 %s" % sub)
 
     def test_v3_js_functions_and_wiring(self) -> None:
         js = self.mod._DASH_JS_V2
@@ -3649,6 +3664,8 @@ class AdminIntegrationTest(unittest.TestCase):
         self.assertEqual(html.count("<th>代理错误</th>"), 3)
         self.assertEqual(html.count("<th>上游5xx</th>"), 3)
         self.assertIn('colspan="7"', html)
+        self.assertIn('<tbody id="token-daily-body"><tr><td class="empty" colspan="10">', html,
+                      "表B空态 colspan 必须随 10 列同步")
         self.assertIn("String(ent.errors_proxy || 0)", html)
         self.assertIn("String(ent.errors_upstream || 0)", html)
         self.assertIn("(ent.errors_proxy || 0) + (ent.errors_upstream || 0)", html)

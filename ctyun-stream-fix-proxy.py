@@ -3814,8 +3814,8 @@ _DASH_SECTIONS_V2 = """  <!-- pane perf 开 -->
     <div class="card-title">Token 用量按天 × 模型（<span id="token-title-range">近7天</span>，跨重启保留（每 60s 落盘））</div>
     <div class="table-wrap">
     <table>
-      <thead><tr><th>日期</th><th>模型</th><th>提示</th><th>补全</th><th>缓存</th><th>推理</th></tr></thead>
-      <tbody id="token-daily-body"><tr><td class="empty" colspan="6">读取中……</td></tr></tbody>
+      <thead><tr><th>日期</th><th>模型</th><th>输入</th><th>输出</th><th>提示</th><th>补全</th><th>缓存</th><th>推理</th><th>缓存命中率</th><th>总用量</th></tr></thead>
+      <tbody id="token-daily-body"><tr><td class="empty" colspan="10">读取中……</td></tr></tbody>
     </table>
     </div>
   </section>
@@ -4460,20 +4460,28 @@ function renderTokens(snap) {
       var rn = ent.tokens_reasoning || 0;
       if (tp + tc + cr + rn === 0) continue;  // 全零行（502/剥行等）不展示
       hasData = true;
+      var inp = Math.max(tp, cr);
+      var out = Math.max(tc, rn);
+      var tot = inp + out;
+      var hit = inp > 0 ? (cr / inp * 100).toFixed(1) + "%" : "-";
       var tr = el("tr");
       tr.appendChild(el("td", "num", days[i]));
       tr.appendChild(el("td", "", names[j]));
+      tr.appendChild(el("td", "num", fmtTok(inp)));
+      tr.appendChild(el("td", "num", fmtTok(out)));
       tr.appendChild(el("td", "num", fmtTok(tp)));
       tr.appendChild(el("td", "num", fmtTok(tc)));
       tr.appendChild(el("td", "num", fmtTok(cr)));
       tr.appendChild(el("td", "num", fmtTok(rn)));
+      tr.appendChild(el("td", "num", hit));
+      tr.appendChild(el("td", "num", fmtTok(tot)));
       body.appendChild(tr);
     }
   }
   if (!hasData) {
     var tr0 = el("tr");
     var td0 = el("td", "empty", "暂无 token 用量 —— 上游返回 usage 帧后这里会出现记录");
-    td0.colSpan = 6;
+    td0.colSpan = 10;
     tr0.appendChild(td0);
     body.appendChild(tr0);
   }
