@@ -8339,6 +8339,31 @@ class GenSpeedRecentEntryTest(unittest.TestCase):
                                 "gen_ms must be >= 0 (monotonic window)")
 
 
+class GenSpeedDashJSV2Test(unittest.TestCase):
+    """生成速度修复：_DASH_JS_V2 中 genSpeed 新公式 + fmtTok helper 及接线
+    （模块级字符串断言，无需子进程）。"""
+
+    def setUp(self) -> None:
+        self.mod = load_proxy_module()
+
+    def test_genspeed_js_formula_and_fmt_tok(self) -> None:
+        js = self.mod._DASH_JS_V2
+        self.assertIn("function genSpeed(", js, "缺生成速度计算")
+        self.assertIn("r.tokens_completion / (r.gen_ms / 1000)",
+                      js, "genSpeed 分子分母必须为 completion tokens / gen_ms")
+        self.assertIn("r.gen_ms >= 100", js,
+                      "genSpeed 必须保留 >=100ms 下界 guard")
+        self.assertNotIn("r.dur_ms - r.ttfb_ms", js,
+                         "旧公式 tokens/(dur_ms-ttfb_ms) 必须移除")
+        self.assertIn("function fmtTok(", js, "缺 token M 单位格式化 helper")
+
+    def test_fmt_tok_call_sites(self) -> None:
+        js = self.mod._DASH_JS_V2
+        for sub in ("fmtTok(tp)", "fmtTok(tc)", "fmtTok(cr)", "fmtTok(rn)",
+                    "fmtTok(mtd)", 'fmtTok(max) + " tokens/h"'):
+            self.assertIn(sub, js, "缺 fmtTok 接线 %s" % sub)
+
+
 if __name__ == "__main__":
     import atexit
     atexit.register(kill_registered)

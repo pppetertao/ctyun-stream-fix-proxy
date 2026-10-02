@@ -4288,11 +4288,11 @@ function initTabs() {
 initTabs();
 """
 
-_DASH_JS_V2 = """// v3.1：单请求生成速度（流式且 tokens>0 且耗时>首字节时有效，tokens/s 综合）
+_DASH_JS_V2 = """// v3.1：单请求生成速度（流式，completion tokens / monotonic 生成窗口 >=100ms 时有效，tokens/s）
 function genSpeed(r) {
-  if (!r || !r.stream || !r.tokens || !(r.dur_ms > 0) || r.ttfb_ms == null ||
-      r.dur_ms <= r.ttfb_ms) return null;
-  return r.tokens / ((r.dur_ms - r.ttfb_ms) / 1000);
+  if (!r || !r.stream || !r.tokens_completion || r.gen_ms == null ||
+      !(r.gen_ms >= 100)) return null;
+  return r.tokens_completion / (r.gen_ms / 1000);
 }
 function median(xs) {
   if (!xs.length) return null;
@@ -4398,10 +4398,10 @@ function renderTokens(snap) {
       var tr = el("tr");
       tr.appendChild(el("td", "num", days[i]));
       tr.appendChild(el("td", "", names[j]));
-      tr.appendChild(el("td", "num", String(tp)));
-      tr.appendChild(el("td", "num", String(tc)));
-      tr.appendChild(el("td", "num", String(cr)));
-      tr.appendChild(el("td", "num", String(rn)));
+      tr.appendChild(el("td", "num", fmtTok(tp)));
+      tr.appendChild(el("td", "num", fmtTok(tc)));
+      tr.appendChild(el("td", "num", fmtTok(cr)));
+      tr.appendChild(el("td", "num", fmtTok(rn)));
       body.appendChild(tr);
     }
   }
@@ -4774,9 +4774,9 @@ function renderByKey(snap) {
     var tr = el("tr");
     tr.appendChild(el("td", "", names[i]));
     tr.appendChild(el("td", "num", String(k.requests || 0)));
-    tr.appendChild(el("td", "num", String(k.tokens_prompt || 0)));
-    tr.appendChild(el("td", "num", String(k.tokens_completion || 0)));
-    tr.appendChild(el("td", "num", String(k.tokens_cache_read || 0)));
+    tr.appendChild(el("td", "num", fmtTok(k.tokens_prompt || 0)));
+    tr.appendChild(el("td", "num", fmtTok(k.tokens_completion || 0)));
+    tr.appendChild(el("td", "num", fmtTok(k.tokens_cache_read || 0)));
     tr.appendChild(el("td", "num", String(k.bytes_out || 0)));
     tr.appendChild(el("td", "num", String(k.stream_requests || 0)));
     body.appendChild(tr);
@@ -4810,10 +4810,10 @@ function renderQuota(snap) {
     daysSeen += 1;
   }
   var daysInMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
-  $("q-mtd").textContent = String(mtd);
+  $("q-mtd").textContent = fmtTok(mtd);
   $("q-days").textContent = daysSeen + "/" + daysInMonth;
   $("q-proj").textContent = daysSeen > 0
-    ? String(Math.round(mtd / daysSeen * daysInMonth)) : "—";
+    ? fmtTok(Math.round(mtd / daysSeen * daysInMonth)) : "—";
 }
 // ---- v3 卡 8：perf tab 十项（P1/P6/P9/P2/P5/P7/P8/T4/T6 snap 驱动；P3/P4/P10 fetch 驱动） ----
 var SVGNS = "http://www.w3.org/2000/svg";
@@ -4822,6 +4822,11 @@ function fmtBytes(n) {
   if (n >= 1048576) return (n / 1048576).toFixed(1) + "MB";
   if (n >= 1024) return (n / 1024).toFixed(1) + "KB";
   return String(Math.round(n)) + "B";
+}
+function fmtTok(n) {
+  if (n == null || !isFinite(n)) return "—";
+  if (n >= 1e6) return (n / 1e6).toFixed(2) + "M";
+  return String(Math.round(n));
 }
 function fmtHour(ts) {
   var d = new Date(ts * 1000);
@@ -5084,7 +5089,7 @@ function renderHourly(snap) {
   tr2.setAttribute("font-size", 11);
   tr2.style.fill = "var(--dim)";
   tr2.textContent = fmtHour(data[data.length - 1].hour_start_ts) +
-    " · 峰值 " + max + " tokens/h";
+    " · 峰值 " + fmtTok(max) + " tokens/h";
   svg.appendChild(tl);
   svg.appendChild(tr2);
 }
