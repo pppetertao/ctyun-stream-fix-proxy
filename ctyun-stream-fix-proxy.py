@@ -3751,7 +3751,7 @@ _DASH_SECTIONS_TABLES = """  <section class="card">
     <div class="card-title">Token 用量按 API Key · <span id="bykey-title-day">--</span>（sha256 前 12 位，跨重启保留）</div>
     <div class="table-wrap">
     <table>
-      <thead><tr><th>Key</th><th>请求</th><th>prompt</th><th>completion</th><th>cache</th><th>出流量</th><th>流式</th></tr></thead>
+      <thead><tr><th>密钥</th><th>请求</th><th>提示</th><th>补全</th><th>缓存</th><th>出流量</th><th>流式</th></tr></thead>
       <tbody id="bykey-body"><tr><td class="empty" colspan="7">读取中……</td></tr></tbody>
     </table>
     </div>
@@ -3814,7 +3814,7 @@ _DASH_SECTIONS_V2 = """  <!-- pane perf 开 -->
     <div class="card-title">Token 用量按天 × 模型（<span id="token-title-range">近7天</span>，跨重启保留（每 60s 落盘））</div>
     <div class="table-wrap">
     <table>
-      <thead><tr><th>日期</th><th>模型</th><th>prompt tokens</th><th>completion tokens</th><th>cache tokens</th><th>reasoning tokens</th></tr></thead>
+      <thead><tr><th>日期</th><th>模型</th><th>提示</th><th>补全</th><th>缓存</th><th>推理</th></tr></thead>
       <tbody id="token-daily-body"><tr><td class="empty" colspan="6">读取中……</td></tr></tbody>
     </table>
     </div>

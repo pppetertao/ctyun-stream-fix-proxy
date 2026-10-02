@@ -3347,10 +3347,10 @@ class DashboardV3CardsTest(unittest.TestCase):
 
     def test_v3_token_table_columns(self) -> None:
         v2 = self.mod._DASH_SECTIONS_V2
-        self.assertIn("<th>cache tokens</th>", v2,
-                      "token 按天×模型表缺 cache 列（T2）")
-        self.assertIn("<th>reasoning tokens</th>", v2,
-                      "token 按天×模型表缺 reasoning 列（T3）")
+        self.assertIn("<th>缓存</th>", v2,
+                      "token 按天×模型表缺缓存列（T2）")
+        self.assertIn("<th>推理</th>", v2,
+                      "token 按天×模型表缺推理列（T3）")
 
     def test_v3_js_functions_and_wiring(self) -> None:
         js = self.mod._DASH_JS_V2
