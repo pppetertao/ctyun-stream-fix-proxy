@@ -1242,9 +1242,17 @@ def _calibrate_loop() -> None:
             _CALIBRATE_TOKEN = None
         auth_token = token or _LAST_AUTH
         started = time.time()
+        consumed_est = 0  # 累计 est（与 engine consumed 同一进度口径）
 
         def send_one(batch, est):
-            return _calibrate_send(model, batch, est, auth_token)
+            nonlocal consumed_est
+            status, body_error = _calibrate_send(model, batch, est, auth_token)
+            consumed_est += est
+            with CALIBRATE_LOCK:
+                if _CALIBRATE_STATE.get("task_id") == task_id:
+                    _CALIBRATE_STATE["progress"] = {
+                        "batch": batch, "consumed": consumed_est}
+            return status, body_error
 
         def should_abort():
             with CALIBRATE_LOCK:

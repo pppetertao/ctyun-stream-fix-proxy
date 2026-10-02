@@ -8005,6 +8005,62 @@ class TpmCalibrateStateTest(unittest.TestCase):
         self.assertEqual(result["outcome"], "rejected")
         self.assertEqual(result["threshold"], reject_est[0])
 
+    def test_calibrate_loop_updates_progress_per_batch(self) -> None:
+        """校准运行中 send_one 逐批更新 progress——每批消费后 progress.batch == 当前批序。"""
+        mod = self.mod
+        orig_gap = mod.TPM_CALIBRATE_BATCH_GAP_S
+        orig_interval = mod.TPM_CALIBRATE_MIN_INTERVAL_S
+        mod.TPM_CALIBRATE_BATCH_GAP_S = 0.05
+        mod.TPM_CALIBRATE_MIN_INTERVAL_S = 0
+        self.addCleanup(setattr, mod, "TPM_CALIBRATE_BATCH_GAP_S", orig_gap)
+        self.addCleanup(setattr, mod, "TPM_CALIBRATE_MIN_INTERVAL_S", orig_interval)
+
+        calls = []
+        progress_snapshots = []
+
+        def fake_send(model, batch, est, auth_token):
+            """脚本化发送器：3×200 后 429；每次调用快照当前 progress。"""
+            progress_snapshots.append(dict(mod._CALIBRATE_STATE["progress"]))
+            calls.append(batch)
+            if len(calls) <= 3:
+                return 200, False
+            return 429, False
+
+        orig_send = mod._calibrate_send
+        mod._calibrate_send = fake_send
+        self.addCleanup(setattr, mod, "_calibrate_send", orig_send)
+
+        thread = threading.Thread(target=mod._calibrate_loop, daemon=True)
+        thread.start()
+
+        def stop_loop():
+            with mod.CALIBRATE_LOCK:
+                mod._CALIBRATE_STATE["running"] = False
+            mod._CALIBRATE_TOKEN = None
+            thread.join(2)
+        self.addCleanup(stop_loop)
+
+        status, _ = mod.calibrate_start("m-x", token="Bearer t")
+        self.assertEqual(status, 200)
+
+        result = None
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            with mod.CALIBRATE_LOCK:
+                result = mod._CALIBRATE_STATE["result"]
+            if result is not None:
+                break
+            time.sleep(0.05)
+        self.assertIsNotNone(
+            result, "daemon 10s 内未产出 result（error=%r, calls=%r）"
+            % (mod._CALIBRATE_STATE["error"], calls))
+        self.assertGreaterEqual(len(calls), 2)
+        # 第 2 次调用时快照 batch 应 >=1：证明首批发送后 progress 已更新
+        self.assertGreaterEqual(
+            progress_snapshots[1]["batch"], 1,
+            "校准运行中 progress 未逐批更新：snapshots=%r" % progress_snapshots)
+        self.assertEqual(result["outcome"], "rejected")
+
 
 class CalibrateSendTest(unittest.TestCase):
     @classmethod
