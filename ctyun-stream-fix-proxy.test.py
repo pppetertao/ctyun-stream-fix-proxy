@@ -3480,6 +3480,56 @@ class AdminIntegrationTest(unittest.TestCase):
         self.assertGreaterEqual(snap["requests_total"], 1)
         self.assertGreaterEqual(len(snap["recent"]), 1)
 
+    def test_dashboard_tpm_two_choice_and_calibrate_ui(self) -> None:
+        """AC8/AC12③：HTML 含校准测试/中止校准/一键应用/使用推荐值/自定义文案；
+        不含旧档位文案（宽松×1.5/宽松×2/默认×2/默认/2）与 select choices 标记；
+        不含 innerHTML（XSS 门禁）。"""
+        _, html_bytes, _ = admin_get(self.proc.admin_port, "/")
+        html = html_bytes.decode("utf-8")
+        for text in ("校准测试", "中止校准", "一键应用", "使用推荐值", "自定义",
+                     "tpm-cali-status", "tpm-cali-abort", "/api/tpm_calibrate",
+                     "/api/tpm_calibrate_abort", "data-cali-model",
+                     "data-rec-value", "tpm-mode-"):
+            self.assertIn(text, html)
+        # 旧档位文案与 select choices 标记零残留
+        for stale in ("宽松×1.5", "宽松×2", "默认×2", "默认/2", "预算档位",
+                      "tpm-select", "m.recommend.choices",
+                      "recommend.choices"):
+            self.assertNotIn(stale, html, "stale UI text must be gone: %s" % stale)
+        # XSS 门禁：动态数据禁走 innerHTML，必须 textContent（沿用 :3011-3012 口径）
+        self.assertNotIn("innerHTML", html)
+        self.assertIn("textContent", html)
+
+    def test_dashboard_tpm_settings_render_contract(self) -> None:
+        """AC8/AC12④：renderTpmSettings 对 probe/enabled_advice/source 的渲染分支存在；
+        recommended=None → radio disabled + 默认自定义（JS 源锁定，
+        集成测试无法执行 JS——与既有静态源断言口径一致）。"""
+        _, html_bytes, _ = admin_get(self.proc.admin_port, "/")
+        html = html_bytes.decode("utf-8")
+        self.assertIn("enabled_advice", html)
+        self.assertIn("rec.source", html)
+        self.assertIn("rec.enabled_advice.suggest", html)
+        self.assertIn("radioRec.disabled = true", html)  # AC12④
+        self.assertIn("m.budget === rec.recommended", html)  # 默认选中逻辑
+        self.assertIn('rec.source === "probe"', html)  # 一键应用仅 probe 源
+        self.assertIn("tpm-apply-btn", html)
+
+    def test_tpm_settings_api_no_choices_anywhere(self) -> None:
+        """AC12②：GET /api/tpm_settings 每模型 recommend 均不含 choices 键，
+        且含 enabled_advice/source。"""
+        stop_proxy(self.proc)  # 释放 setUp 占用的 proxy_port（沿用本文件重赋泄漏口径）
+        self.proc = start_proxy(self.upstream_port, self.proxy_port,
+                                seed_persist={"tpm_model_budgets":
+                                              {"kimi-k3-oc": 30000}})
+        post_sse(self.proxy_port)  # 无 auth，model=deepseek-v4-pro-0813-oc
+        _, body_bytes, _ = admin_get(self.proc.admin_port, "/api/tpm_settings")
+        snap = json.loads(body_bytes.decode("utf-8"))
+        self.assertGreaterEqual(len(snap["models"]), 1)
+        for m in snap["models"]:
+            self.assertNotIn("choices", m["recommend"])
+            self.assertIn("enabled_advice", m["recommend"])
+            self.assertIn("source", m["recommend"])
+
     def test_config_get_reports_env_source(self) -> None:
         status, body, ctype = admin_get(self.proc.admin_port, "/api/config")
         self.assertEqual(status, 200)

@@ -3534,8 +3534,12 @@ _DASH_SECTIONS_STATIC = """<main>
   </section>
   <section class="card" id="tpm-settings-card">
     <div class="card-title">TPM 限流设置（勾选启用的模型）</div>
-    <p class="dimmed">仅勾选的模型走限流（桶/排队/429），其余模型直通；预算档位由上游拒绝实证推荐。加载中……</p>
+    <p class="dimmed">仅勾选的模型走限流（桶/排队/429），其余模型直通；预算推荐值由上游拒绝实证或校准探测得出。加载中……</p>
     <div id="tpm-models"></div>
+    <div class="calibrate-bar dimmed" id="tpm-cali-status" style="display:none">
+      <span id="tpm-cali-status-text"></span>
+      <button id="tpm-cali-abort" type="button" style="display:none">中止校准</button>
+    </div>
     <div class="actions">
       <button id="tpm-save" type="button">保存限流设置</button>
       <p class="msg" id="tpm-msg" role="status"></p>
@@ -4521,6 +4525,8 @@ function renderTpmSettings(data) {
   }
   for (var i = 0; i < models.length; i++) {
     var m = models[i];
+    var rec = m.recommend || {};
+    var hasRec = rec.recommended !== null && rec.recommended !== undefined;
     var row = el("div", "tpm-row");
     var check = document.createElement("input");
     check.type = "checkbox";
@@ -4532,30 +4538,81 @@ function renderTpmSettings(data) {
     label.textContent = m.name;
     row.appendChild(check);
     row.appendChild(label);
-    if (m.recommend && m.recommend.choices && m.recommend.choices.length) {
-      var sel = document.createElement("select");
-      sel.id = "tpm-select-" + i;
-      sel.setAttribute("data-model", m.name);
-      sel.setAttribute("aria-label", "预算档位");
-      for (var j = 0; j < m.recommend.choices.length; j++) {
-        var opt = document.createElement("option");
-        opt.value = String(m.recommend.choices[j].value);
-        opt.textContent = m.recommend.choices[j].label + "（" +
-                          m.recommend.choices[j].value + "）";
-        if (m.budget !== null && m.budget !== undefined &&
-            m.recommend.choices[j].value === m.budget) {
-          opt.selected = true;
-        }
-        sel.appendChild(opt);
-      }
-      row.appendChild(sel);
+    // 二选一预算设置：radio「使用推荐值 N」/「自定义」+ 数字输入框
+    var modeGroup = "tpm-mode-" + i;
+    var radioRec = document.createElement("input");
+    radioRec.type = "radio";
+    radioRec.name = modeGroup;
+    radioRec.id = modeGroup + "-rec";
+    radioRec.setAttribute("data-model", m.name);
+    radioRec.value = "recommended";
+    if (!hasRec) {
+      radioRec.disabled = true;  // 无推荐值只能自定义（AC12④）
+    } else {
+      radioRec.setAttribute("data-rec-value", String(rec.recommended));
+      if (m.budget === rec.recommended) radioRec.checked = true;
     }
-    if (m.recommend && m.recommend.hint) {
-      row.appendChild(el("span", "hint", m.recommend.hint));
-    } else if (m.recommend && m.recommend.recommended !== null &&
-               m.recommend.recommended !== undefined) {
-      row.appendChild(el("span", "hint", "推荐 " + m.recommend.recommended +
-                         "（样本 " + m.recommend.samples + "）"));
+    var labelRec = el("label", "", "");
+    labelRec.setAttribute("for", modeGroup + "-rec");
+    labelRec.textContent = hasRec
+      ? "使用推荐值 " + rec.recommended : "使用推荐值（暂无）";
+    row.appendChild(radioRec);
+    row.appendChild(labelRec);
+    var radioCust = document.createElement("input");
+    radioCust.type = "radio";
+    radioCust.name = modeGroup;
+    radioCust.id = modeGroup + "-cust";
+    radioCust.setAttribute("data-model", m.name);
+    radioCust.value = "custom";
+    if (!hasRec || m.budget !== rec.recommended) radioCust.checked = true;
+    var labelCust = el("label", "", "");
+    labelCust.setAttribute("for", modeGroup + "-cust");
+    labelCust.textContent = "自定义";
+    row.appendChild(radioCust);
+    row.appendChild(labelCust);
+    var inputCust = document.createElement("input");
+    inputCust.type = "number";
+    inputCust.id = modeGroup + "-val";
+    inputCust.setAttribute("data-model", m.name);
+    inputCust.setAttribute("aria-label", "自定义预算值");
+    inputCust.setAttribute("min", "1");
+    inputCust.setAttribute("step", "1000");
+    if (m.budget !== null && m.budget !== undefined) {
+      inputCust.value = String(m.budget);
+    }
+    row.appendChild(inputCust);
+    // 校准测试按钮（事件由 #tpm-models 委托处理）
+    var caliBtn = el("button", "tpm-cali-btn", "校准测试");
+    caliBtn.setAttribute("type", "button");
+    caliBtn.setAttribute("data-cali-model", m.name);
+    caliBtn.title = "对 " + m.name + " 发起校准探测（约消耗一次上游限额的 token 配额）";
+    row.appendChild(caliBtn);
+    // 一键应用（仅 probe 源：校准刚完成，推荐值来自实测；AC13）
+    if (rec.source === "probe" && hasRec) {
+      (function (idx, recVal) {
+        var applyBtn = el("button", "tpm-apply-btn", "一键应用");
+        applyBtn.setAttribute("type", "button");
+        applyBtn.title = "将该模型预算设置为推荐值 " + recVal;
+        applyBtn.addEventListener("click", function () {
+          var radioRec = box.querySelector(
+            "input[name='tpm-mode-" + idx + "'][value='recommended']");
+          if (radioRec) {
+            radioRec.checked = true;
+            radioRec.setAttribute("data-rec-value", String(recVal));
+          }
+        });
+        row.appendChild(applyBtn);
+      })(i, rec.recommended);
+    }
+    // 提示文案：enabled_advice.reason 优先，回退 hint / 推荐值展示
+    if (rec.enabled_advice) {
+      row.appendChild(el("span", rec.enabled_advice.suggest ? "hint ok" : "hint",
+                         rec.enabled_advice.reason));
+    } else if (rec.hint) {
+      row.appendChild(el("span", "hint", rec.hint));
+    } else if (hasRec) {
+      row.appendChild(el("span", "hint", "推荐 " + rec.recommended +
+                         "（样本 " + (rec.samples || 0) + "）"));
     }
     box.appendChild(row);
   }
@@ -4568,8 +4625,26 @@ $("tpm-save").addEventListener("click", function () {
   for (var i = 0; i < checks.length; i++) {
     if (!checks[i].checked) continue;
     var model = checks[i].getAttribute("data-model");
-    var sel = box.querySelector("select[data-model='" + model + "']");
-    budgets[model] = sel ? parseInt(sel.value, 10) : 0;
+    var modeRec = box.querySelector(
+      "input[name='tpm-mode-" + i + "'][value='recommended']");
+    if (modeRec && modeRec.checked) {
+      var recVal = parseInt(modeRec.getAttribute("data-rec-value"), 10);
+      if (!recVal || recVal <= 0) {
+        msg.className = "msg err";
+        msg.textContent = "模型 " + model + " 暂无推荐值，请选择自定义预算";
+        return;
+      }
+      budgets[model] = recVal;
+    } else {
+      var input = box.querySelector("#tpm-mode-" + i + "-val");
+      var v = input ? parseInt(input.value, 10) : 0;
+      if (!v || v <= 0) {
+        msg.className = "msg err";
+        msg.textContent = "模型 " + model + " 自定义预算值需为正整数";
+        return;
+      }
+      budgets[model] = v;
+    }
   }
   msg.className = "msg wait";
   msg.textContent = "保存中……";
@@ -5149,6 +5224,76 @@ setInterval(function () {
   loadErrorEvents();
   loadProbeTrend();
 }, 5000);
+// --- TPM 校准交互（校准测试 / 轮询 / 中止；一键应用回填在 renderTpmSettings 内） ---
+var _calibModel = null;
+function calibStart(model) {
+  if (!confirm("对 " + model + " 发起校准探测？\\n\\n"
+             + "将发送多批大输入请求逐级加压实测上游 TPM 阈值，"
+             + "约消耗一次上游限额的 token 配额。\\n\\n"
+             + "将使用最近一次经过代理的真实请求的登录凭证发起探测。\\n\\n"
+             + "建议在低流量时段操作。")) {
+    return;
+  }
+  fetch("/api/tpm_calibrate", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: model })
+  }).then(function (resp) {
+    return resp.json().then(function (data) { return { status: resp.status, data: data }; });
+  }).then(function (r) {
+    if (r.status === 200) {
+      _calibModel = model;
+      $("tpm-cali-status").style.display = "";
+      $("tpm-cali-status-text").textContent = "校准 " + model + " 中…";
+      $("tpm-cali-abort").style.display = "";
+      calibPoll();
+    } else {
+      $("tpm-cali-status").style.display = "";
+      $("tpm-cali-status-text").textContent = "校准启动失败：" +
+        ((r.data && r.data.error) ? r.data.error : ("HTTP " + r.status));
+    }
+  }).catch(function (err) {
+    $("tpm-cali-status").style.display = "";
+    $("tpm-cali-status-text").textContent = "校准启动失败：" + String(err);
+  });
+}
+function calibPoll() {
+  fetch("/api/tpm_calibrate")
+    .then(function (resp) { return resp.json(); })
+    .then(function (snap) {
+      if (!snap.running) { calibDone(snap); return; }
+      var p = snap.progress || {};
+      $("tpm-cali-status-text").textContent =
+        "校准 " + (snap.model || _calibModel || "") + " 中… 批 " + (p.batch || 0) +
+        "，已消耗 " + (p.consumed || 0) + " tokens";
+      setTimeout(calibPoll, 1500);
+    })
+    .catch(function () { setTimeout(calibPoll, 3000); });
+}
+function calibDone(snap) {
+  var res = snap.result || {};
+  var txt = "校准完成：" + (res.outcome || "unknown");
+  if (res.threshold) {
+    txt += "，实测阈值 " + res.threshold + " tokens（推荐 " +
+           Math.floor(res.threshold * 0.9 / 1000) * 1000 + "）";
+  }
+  txt += "。";
+  $("tpm-cali-status-text").textContent = txt;
+  $("tpm-cali-abort").style.display = "none";
+  loadTpmSettings();  // 刷新 recommend.probe / enabled_advice / 一键应用按钮
+  _calibModel = null;
+}
+$("tpm-cali-abort").addEventListener("click", function () {
+  fetch("/api/tpm_calibrate_abort", { method: "POST", body: "{}" })
+    .then(function () {
+      $("tpm-cali-status-text").textContent = "已请求中止，等待当前批次结束…";
+    });
+});
+$("tpm-models").addEventListener("click", function (e) {
+  if (e.target && e.target.getAttribute("data-cali-model")) {
+    calibStart(e.target.getAttribute("data-cali-model"));
+  }
+});
 """
 
 DASHBOARD_HTML = ("".join([
