@@ -41,6 +41,7 @@ SSE_ERROR_FRAME = ('data: {"error":{"message":"模型请求 TPM 超限，请减�
 SSE_REASONING = b'data: {"choices":[{"delta":{"reasoning_content":"th"}}]}\n\n'
 SSE_FINISH = b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
 SSE_USAGE = b'data: {"id":"u","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}\n\n'
+SSE_USAGE_DISTINCT = b'data: {"id":"ud","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}}\n\n'
 SSE_FAULT_TAIL = SSE_REASONING + SSE_FINISH + SSE_DONE
 
 FAKE_SERVERS = []
@@ -8304,13 +8305,13 @@ class CalibrateSendTest(unittest.TestCase):
 class GenSpeedRecentEntryTest(unittest.TestCase):
     """生成速度修复：RECENT 条目含 tokens_completion + gen_ms 两键且口径正确。
 
-    黑盒子进程集成：scripted 上游回 SSE_USAGE(prompt=1,completion=1,total=2)
-    的流 → recent[-1] 的 tokens_completion 必须取 completion（=1 而非 total=2），
+    黑盒子进程集成：scripted 上游回 SSE_USAGE_DISTINCT(prompt=5,completion=3,total=8)
+    的流 → recent[-1] 的 tokens_completion 必须取 completion（=3 而非 prompt=5/total=8），
     gen_ms 为流式交付窗口毫秒数（float 且 >= 0）。"""
 
     def setUp(self) -> None:
         upstream_port, self.calls = make_scripted_upstream(
-            body_override=SSE_USAGE + SSE_A + SSE_B + SSE_DONE)
+            body_override=SSE_USAGE_DISTINCT + SSE_A + SSE_B + SSE_DONE)
         self.proxy_port = free_port()
         self.proc = start_proxy(upstream_port, self.proxy_port)
 
@@ -8320,7 +8321,7 @@ class GenSpeedRecentEntryTest(unittest.TestCase):
 
     def test_recent_entry_carries_completion_and_gen_ms(self) -> None:
         data = post_sse(self.proxy_port)
-        self.assertEqual(data, SSE_USAGE + SSE_A + SSE_B + SSE_DONE,
+        self.assertEqual(data, SSE_USAGE_DISTINCT + SSE_A + SSE_B + SSE_DONE,
                          "stream must relay byte-exact")
         _, body, _ = admin_get(self.proc.admin_port, "/api/stats")
         snap = json.loads(body.decode("utf-8"))
@@ -8330,9 +8331,9 @@ class GenSpeedRecentEntryTest(unittest.TestCase):
             self.assertIn(key, entry,
                           "recent entry must carry '%s' key; got keys %r"
                           % (key, sorted(entry.keys())))
-        self.assertEqual(entry["tokens_completion"], 1,
-                         "completion must be usage completion_tokens (=1), "
-                         "not total_tokens (=2)")
+        self.assertEqual(entry["tokens_completion"], 3,
+                         "completion must be usage completion_tokens (=3), "
+                         "not prompt_tokens (=5) or total_tokens (=8)")
         self.assertIsInstance(entry["gen_ms"], float,
                               "gen_ms must be a float ms window")
         self.assertGreaterEqual(entry["gen_ms"], 0,
