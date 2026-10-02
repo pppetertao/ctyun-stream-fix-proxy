@@ -3297,6 +3297,16 @@ class DashboardV2SkeletonTest(unittest.TestCase):
         # 健康卡 chip 挂 probe_alert 事件标记（hover 出 tooltip）
         self.assertIn('markEvents(chip, "probe_alert", null, null)', js)
 
+    def test_calib_done_error_display(self) -> None:
+        """校准异常态上 UI：calibDone 对 snap.error 展示"校准失败：<error>"，
+        走 textContent 赋值（XSS 门禁）。"""
+        js = self.mod._DASH_JS_V2
+        self.assertIn("function calibDone(snap)", js, "缺 calibDone 函数")
+        self.assertIn('"校准失败：" + snap.error', js,
+                      "calibDone 缺 error 展示分支")
+        self.assertIn('$("tpm-cali-status-text").textContent = "校准失败：', js,
+                      "校准失败文案必须 textContent 赋值，不得走 innerHTML")
+
 
 class DashboardV3CardsTest(unittest.TestCase):
     """v3 卡 7/8：新卡容器/函数/接线模块级断言（join 与 innerHTML 门禁沿用 6 段）。"""
@@ -4916,8 +4926,9 @@ class AdminIntegrationTest(unittest.TestCase):
         self.assertEqual(snap["result"]["outcome"], "aborted")
 
     def test_calibrate_api_validation_and_auth(self) -> None:
-        """AC5：缺 model → 400；非字符串 model → 400；无 _LAST_AUTH 且无 token → 400
-        （error 含'无可用凭证'）；请求体带 token → 200；随后 abort 收尾。"""
+        """AC5：缺 model → 400；非字符串 model → 400；非串 token → 400；
+        无 _LAST_AUTH 且无 token → 400（error 含'无可用凭证'）；
+        请求体带 token → 200；随后 abort 收尾。"""
         stop_proxy(self.proc)  # 重启前释放 self.proxy_port（同 class 既有重启写法）
         self.proc = start_proxy(self.upstream_port, self.proxy_port,
                                 extra_env={"CTYUN_CALIBRATE_BATCH_GAP_S": "0.1"})
@@ -4929,6 +4940,11 @@ class AdminIntegrationTest(unittest.TestCase):
         self.assertEqual(status, 400)
         status, _ = admin_post(self.proc.admin_port, "/api/tpm_calibrate",
                                b"not json")
+        self.assertEqual(status, 400)
+        # token 非字符串 → 400（类型校验补全）
+        status, _ = admin_post(self.proc.admin_port, "/api/tpm_calibrate",
+                               json.dumps({"model": "kimi-k3-oc",
+                                           "token": 123}).encode("utf-8"))
         self.assertEqual(status, 400)
         # 无凭证（代理刚启动、无真实流量）
         status, body = admin_post(self.proc.admin_port, "/api/tpm_calibrate",

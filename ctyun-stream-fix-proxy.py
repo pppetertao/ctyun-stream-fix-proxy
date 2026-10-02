@@ -3438,6 +3438,9 @@ class AdminHandler(http.server.BaseHTTPRequestHandler):
             return
         model = data.get("model") if isinstance(data, dict) else None
         token = data.get("token") if isinstance(data, dict) else None
+        if token is not None and not isinstance(token, str):
+            self._send_json(400, {"error": "token 必须为字符串"})
+            return
         status, payload = calibrate_start(model, token=token)
         self._send_json(status, payload)
 
@@ -5341,6 +5344,13 @@ function calibPoll() {
     .catch(function () { setTimeout(calibPoll, 3000); });
 }
 function calibDone(snap) {
+  if (snap.error) {
+    $("tpm-cali-status-text").textContent = "校准失败：" + snap.error;
+    $("tpm-cali-abort").style.display = "none";
+    loadTpmSettings();
+    _calibModel = null;
+    return;
+  }
   var res = snap.result || {};
   var txt = "校准完成：" + (res.outcome || "unknown");
   if (res.threshold) {
