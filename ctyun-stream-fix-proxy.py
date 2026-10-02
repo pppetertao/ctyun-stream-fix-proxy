@@ -1157,6 +1157,8 @@ def _calibrate_send(model, batch, est, auth_token):
     body 由 build_calibrate_body 按批次放大 input 填充：batch 1=INPUT_BYTES，
     每批 +_CALIBRATE_BYTES_PER_STEP 字节（使 estimate 增量 ≈ TPM_CALIBRATE_STEP_TOKENS）。
     Authorization = auth_token 或 _LAST_AUTH。
+    est 由 engine 传入（形参保留，签名与 send_one(batch, est) 契约一致），当前函数
+    体内不读，传入供未来观测/断言用。
     返回 (status, body_error)；连接异常（OSError / HTTPException，R6 显式分类）
     → (None, False) 并 _safe_log_stderr 留痕；engine 将连接异常判为
     CLASS_UPSTREAM_FAULT 走重试路径。
