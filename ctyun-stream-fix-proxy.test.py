@@ -4979,7 +4979,7 @@ class AdminIntegrationTest(unittest.TestCase):
         stop_proxy(self.proc)  # 重启前释放 self.proxy_port（同 class 既有重启写法）
         self.proc = start_proxy(self.upstream_port, self.proxy_port, extra_env={
             "CTYUN_CALIBRATE_BATCH_GAP_S": "0.1",
-            "CTYUN_CALIBRATE_HARD_CAP_TOKENS": "120000",  # 1-2 批即 capped，快速收尾
+            "CTYUN_CALIBRATE_HARD_CAP_TOKENS": "120000",  # 5 批累计 ~112k 后第 6 批越顶 capped，快速收尾
         })
         status, body = admin_post(
             self.proc.admin_port, "/api/tpm_calibrate",
