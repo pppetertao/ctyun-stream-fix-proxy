@@ -3366,6 +3366,14 @@ class DashboardV3CardsTest(unittest.TestCase):
         self.assertIn("var inp = Math.max(tp, cr);", js, "表B缺 inp 计算")
         for sub in ("fmtTok(inp)", "fmtTok(out)", "fmtTok(tot)"):
             self.assertIn(sub, js, "缺 fmtTok 合计列接线 %s" % sub)
+        self.assertIn("k.tokens_reasoning || 0", js, "表A输出需读 tokens_reasoning 兜底")
+
+    def test_v3_bykey_table_columns(self) -> None:
+        tables = self.mod._DASH_SECTIONS_TABLES
+        for th in ("<th>输入</th>", "<th>输出</th>", "<th>总用量</th>",
+                   "<th>缓存命中率</th>", "<th>提示</th>", "<th>补全</th>",
+                   "<th>缓存</th>", "<th>出流量</th>", "<th>流式</th>"):
+            self.assertIn(th, tables, "token 按 API Key 表缺列 %s" % th)
 
     def test_v3_js_functions_and_wiring(self) -> None:
         js = self.mod._DASH_JS_V2
@@ -3666,6 +3674,8 @@ class AdminIntegrationTest(unittest.TestCase):
         self.assertIn('colspan="7"', html)
         self.assertIn('<tbody id="token-daily-body"><tr><td class="empty" colspan="10">', html,
                       "表B空态 colspan 必须随 10 列同步")
+        self.assertIn('<tbody id="bykey-body"><tr><td class="empty" colspan="11">', html,
+                      "表A空态 colspan 必须随 11 列同步")
         self.assertIn("String(ent.errors_proxy || 0)", html)
         self.assertIn("String(ent.errors_upstream || 0)", html)
         self.assertIn("(ent.errors_proxy || 0) + (ent.errors_upstream || 0)", html)

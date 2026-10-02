@@ -3751,8 +3751,8 @@ _DASH_SECTIONS_TABLES = """  <section class="card">
     <div class="card-title">Token 用量按 API Key · <span id="bykey-title-day">--</span>（sha256 前 12 位，跨重启保留）</div>
     <div class="table-wrap">
     <table>
-      <thead><tr><th>密钥</th><th>请求</th><th>提示</th><th>补全</th><th>缓存</th><th>出流量</th><th>流式</th></tr></thead>
-      <tbody id="bykey-body"><tr><td class="empty" colspan="7">读取中……</td></tr></tbody>
+      <thead><tr><th>密钥</th><th>请求</th><th>输入</th><th>输出</th><th>提示</th><th>补全</th><th>缓存</th><th>缓存命中率</th><th>总用量</th><th>出流量</th><th>流式</th></tr></thead>
+      <tbody id="bykey-body"><tr><td class="empty" colspan="11">读取中……</td></tr></tbody>
     </table>
     </div>
   </section>
@@ -4829,7 +4829,7 @@ function renderByKey(snap) {
     var tr0 = el("tr");
     var td0 = el("td", "empty",
       "暂无 per-key 数据 —— 带 Authorization 的请求经代理后这里会出现按 key 用量");
-    td0.colSpan = 7;
+    td0.colSpan = 11;
     tr0.appendChild(td0);
     body.appendChild(tr0);
     $("bykey-title-day").textContent = "--";
@@ -4844,12 +4844,24 @@ function renderByKey(snap) {
   });
   for (var i = 0; i < names.length; i++) {
     var k = keys[names[i]];
+    var tp = k.tokens_prompt || 0;
+    var tc = k.tokens_completion || 0;
+    var cr = k.tokens_cache_read || 0;
+    var rn = k.tokens_reasoning || 0;
+    var inp = Math.max(tp, cr);
+    var out = Math.max(tc, rn);
+    var tot = inp + out;
+    var hit = inp > 0 ? (cr / inp * 100).toFixed(1) + "%" : "-";
     var tr = el("tr");
     tr.appendChild(el("td", "", names[i]));
     tr.appendChild(el("td", "num", String(k.requests || 0)));
-    tr.appendChild(el("td", "num", fmtTok(k.tokens_prompt || 0)));
-    tr.appendChild(el("td", "num", fmtTok(k.tokens_completion || 0)));
-    tr.appendChild(el("td", "num", fmtTok(k.tokens_cache_read || 0)));
+    tr.appendChild(el("td", "num", fmtTok(inp)));
+    tr.appendChild(el("td", "num", fmtTok(out)));
+    tr.appendChild(el("td", "num", fmtTok(tp)));
+    tr.appendChild(el("td", "num", fmtTok(tc)));
+    tr.appendChild(el("td", "num", fmtTok(cr)));
+    tr.appendChild(el("td", "num", hit));
+    tr.appendChild(el("td", "num", fmtTok(tot)));
     tr.appendChild(el("td", "num", String(k.bytes_out || 0)));
     tr.appendChild(el("td", "num", String(k.stream_requests || 0)));
     body.appendChild(tr);
