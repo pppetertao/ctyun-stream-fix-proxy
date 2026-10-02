@@ -3180,6 +3180,8 @@ class AdminHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(200, tpm_snapshot())
         elif path == "/api/tpm_settings":
             self._send_json(200, tpm_settings_snapshot())
+        elif path == "/api/tpm_calibrate":
+            self._send_json(200, calibrate_state_snapshot())
         elif path == "/api/config":
             with _CFG_LOCK:
                 payload = {"upstream_base": UPSTREAM_BASE, "source": _upstream_source,
@@ -3269,6 +3271,12 @@ class AdminHandler(http.server.BaseHTTPRequestHandler):
         if path == "/api/probe":
             self._handle_probe_post(raw)
             return
+        if path == "/api/tpm_calibrate":
+            self._handle_calibrate_post(raw)
+            return
+        if path == "/api/tpm_calibrate_abort":
+            self._handle_calibrate_abort_post(raw)
+            return
         if path != "/api/config":
             self._send(404, "text/plain; charset=utf-8", b"not found")
             return
@@ -3343,6 +3351,36 @@ class AdminHandler(http.server.BaseHTTPRequestHandler):
             return
         set_probe_enabled(enabled)
         self._send_json(200, {"ok": True, "probe_enabled": enabled})
+
+    def _handle_calibrate_post(self, raw: bytes) -> None:
+        """POST /api/tpm_calibrate：启动校准探测（鉴权同 /api/config 的 write_allowed）。"""
+        if not write_allowed(self.client_address[0],
+                             self.headers.get("X-Admin-Token") or "",
+                             os.environ.get("CTYUN_ADMIN_TOKEN", "")):
+            self._send_json(403, {"error": "非本机启动校准需要 X-Admin-Token 头"
+                                           "（值 = 服务器环境变量 CTYUN_ADMIN_TOKEN）"})
+            return
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            self._send_json(400, {"error": "请求体不是合法 JSON——"
+                                           "请发 {\"model\": \"...\"}"})
+            return
+        model = data.get("model") if isinstance(data, dict) else None
+        token = data.get("token") if isinstance(data, dict) else None
+        status, payload = calibrate_start(model, token=token)
+        self._send_json(status, payload)
+
+    def _handle_calibrate_abort_post(self, raw: bytes) -> None:
+        """POST /api/tpm_calibrate_abort：中止校准（鉴权同款；幂等——无任务也 200）。"""
+        if not write_allowed(self.client_address[0],
+                             self.headers.get("X-Admin-Token") or "",
+                             os.environ.get("CTYUN_ADMIN_TOKEN", "")):
+            self._send_json(403, {"error": "非本机中止校准需要 X-Admin-Token 头"
+                                           "（值 = 服务器环境变量 CTYUN_ADMIN_TOKEN）"})
+            return
+        aborted = calibrate_abort()
+        self._send_json(200, {"ok": True, "aborted": aborted})
 
     def _send(self, status: int, content_type: str, body: bytes) -> None:
         self.send_response(status)

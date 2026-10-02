@@ -4820,6 +4820,123 @@ class AdminIntegrationTest(unittest.TestCase):
         self.assertGreater(saved[1]["tpm"], 0)
         self.assertGreater(saved[1]["ts"], saved[0]["ts"])
 
+    def test_calibrate_api_start_poll_abort(self) -> None:
+        """AC5：先带 Authorization 的真实流量喂 _LAST_AUTH（R3a）→ POST 无 token 200+task_id；
+        二启 → 409；GET 轮询形态；POST abort → 轮询至 running=False 且 result.outcome=="aborted"。"""
+        stop_proxy(self.proc)  # 重启前释放 self.proxy_port（同 class 既有重启写法）
+        self.proc = start_proxy(self.upstream_port, self.proxy_port, extra_env={
+            "CTYUN_CALIBRATE_BATCH_GAP_S": "0.2",
+        })
+        # 真实流量喂 _LAST_AUTH（校准默认复用最近流量凭证）
+        post_sse_auth(self.proxy_port,
+                      b'{"model":"kimi-k3-oc","stream":true,'
+                      b'"messages":[{"role":"user","content":"hi"}]}',
+                      "Bearer test-cal-token")
+        status, body = admin_post(
+            self.proc.admin_port, "/api/tpm_calibrate",
+            json.dumps({"model": "kimi-k3-oc"}).encode("utf-8"))
+        self.assertEqual(status, 200, body)
+        payload = json.loads(body.decode("utf-8"))
+        self.assertIn("task_id", payload)
+        self.assertTrue(payload["task_id"])
+        # 同一时刻只允许一个校准任务
+        status, body = admin_post(
+            self.proc.admin_port, "/api/tpm_calibrate",
+            json.dumps({"model": "kimi-k3-oc"}).encode("utf-8"))
+        self.assertEqual(status, 409)
+        # 轮询形态
+        _, body, _ = admin_get(self.proc.admin_port, "/api/tpm_calibrate")
+        snap = json.loads(body.decode("utf-8"))
+        self.assertTrue(snap["running"])
+        self.assertEqual(snap["model"], "kimi-k3-oc")
+        self.assertIn("progress", snap)
+        self.assertIn("result", snap)
+        # abort → 轮询至 running=False 且结果标 aborted
+        status, _ = admin_post(self.proc.admin_port, "/api/tpm_calibrate_abort",
+                               b"{}")
+        self.assertEqual(status, 200)
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            _, body, _ = admin_get(self.proc.admin_port, "/api/tpm_calibrate")
+            snap = json.loads(body.decode("utf-8"))
+            if not snap["running"]:
+                break
+            time.sleep(0.2)
+        self.assertFalse(snap["running"], "abort must stop the calibration")
+        self.assertEqual(snap["result"]["outcome"], "aborted")
+
+    def test_calibrate_api_validation_and_auth(self) -> None:
+        """AC5：缺 model → 400；非字符串 model → 400；无 _LAST_AUTH 且无 token → 400
+        （error 含'无可用凭证'）；请求体带 token → 200；随后 abort 收尾。"""
+        stop_proxy(self.proc)  # 重启前释放 self.proxy_port（同 class 既有重启写法）
+        self.proc = start_proxy(self.upstream_port, self.proxy_port,
+                                extra_env={"CTYUN_CALIBRATE_BATCH_GAP_S": "0.1"})
+        status, _ = admin_post(self.proc.admin_port, "/api/tpm_calibrate",
+                               json.dumps({}).encode("utf-8"))
+        self.assertEqual(status, 400)
+        status, _ = admin_post(self.proc.admin_port, "/api/tpm_calibrate",
+                               json.dumps({"model": 123}).encode("utf-8"))
+        self.assertEqual(status, 400)
+        status, _ = admin_post(self.proc.admin_port, "/api/tpm_calibrate",
+                               b"not json")
+        self.assertEqual(status, 400)
+        # 无凭证（代理刚启动、无真实流量）
+        status, body = admin_post(self.proc.admin_port, "/api/tpm_calibrate",
+                                  json.dumps({"model": "kimi-k3-oc"}).encode("utf-8"))
+        self.assertEqual(status, 400)
+        self.assertIn("无可用凭证", json.loads(body.decode("utf-8"))["error"])
+        # 请求体带 token → 启动成功
+        status, body = admin_post(self.proc.admin_port, "/api/tpm_calibrate",
+                                  json.dumps({"model": "kimi-k3-oc",
+                                              "token": "Bearer t"}).encode("utf-8"))
+        self.assertEqual(status, 200)
+        # 收尾：abort 停止后台校准
+        admin_post(self.proc.admin_port, "/api/tpm_calibrate_abort", b"{}")
+
+    def test_calibrate_stats_not_polluted(self) -> None:
+        """AC7：一次完整校准（硬顶小值加速 capped）后 /api/stats 增量 == 0、
+        /api/logs 含 probe=1 行、/api/tpm_stats 桶不因校准增长。"""
+        stop_proxy(self.proc)  # 重启前释放 self.proxy_port（同 class 既有重启写法）
+        self.proc = start_proxy(self.upstream_port, self.proxy_port, extra_env={
+            "CTYUN_CALIBRATE_BATCH_GAP_S": "0.1",
+            "CTYUN_CALIBRATE_HARD_CAP_TOKENS": "120000",  # 1-2 批即 capped，快速收尾
+        })
+        status, body = admin_post(
+            self.proc.admin_port, "/api/tpm_calibrate",
+            json.dumps({"model": "kimi-k3-oc", "token": "Bearer t"}).encode("utf-8"))
+        self.assertEqual(status, 200, body)
+        # 轮询至完成
+        deadline = time.time() + 30
+        snap = None
+        while time.time() < deadline:
+            _, body, _ = admin_get(self.proc.admin_port, "/api/tpm_calibrate")
+            snap = json.loads(body.decode("utf-8"))
+            if not snap["running"]:
+                break
+            time.sleep(0.2)
+        self.assertIsNotNone(snap)
+        self.assertFalse(snap["running"], "calibration must finish (capped)")
+        # 统计零污染
+        _, body_bytes, _ = admin_get(self.proc.admin_port, "/api/stats")
+        stats = json.loads(body_bytes.decode("utf-8"))
+        self.assertEqual(stats["requests_total"], 0,
+                         "calibration must not pollute requests_total")
+        self.assertEqual(stats["daily_by_model"], {},
+                         "calibration must not pollute daily_by_model")
+        self.assertEqual(stats["recent"], [],
+                         "calibration must not pollute recent")
+        # 日志含 probe=1 标记
+        _, body_bytes, _ = admin_get(self.proc.admin_port, "/api/logs")
+        logs = json.loads(body_bytes.decode("utf-8"))
+        lines = [entry["line"] for entry in logs["lines"]]
+        self.assertTrue(any("probe=1" in line for line in lines),
+                        "calibration log line must carry probe=1")
+        # tpm_stats 桶不增（校准不调 tpm_admit）
+        _, body_bytes, _ = admin_get(self.proc.admin_port, "/api/tpm_stats")
+        tpm_snap = json.loads(body_bytes.decode("utf-8"))
+        self.assertEqual(tpm_snap["buckets"], [],
+                         "calibration must not touch tpm buckets")
+
 
 class BodyErrorTest(unittest.TestCase):
     """body error observability 集成测试（SSE error 帧 + 非流式 error JSON）。
