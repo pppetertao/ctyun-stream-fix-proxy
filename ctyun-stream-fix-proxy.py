@@ -2306,7 +2306,8 @@ def _record_request(method: str, path: str, status: int, dur_ms: float,
                     tokens_cache_read: int = 0, tokens_reasoning: int = 0,
                     qwait_ms=None, key_id12=None,
                     # v3.1：入方向字节（请求体 Content-Length）
-                    bytes_in: int = 0) -> None:
+                    bytes_in: int = 0,
+                    gen_ms=None) -> None:
     global _stats_dirty
     # v2 P4：outcome 兼容两形态——_Outcome namedtuple（落桶用 tri_state 字段）或
     # category 字符串（旧调用点/测试，回退 _outcome_tri_state 纯函数）。
@@ -2417,7 +2418,8 @@ def _record_request(method: str, path: str, status: int, dur_ms: float,
                                 "filtered": filtered, "model": model,
                                 "rid": rid, "upstream_host": upstream_host,
                                 "ttfb_ms": ttfb_ms, "stream": stream,
-                                "tokens": tokens, "bytes_out": bytes_out,
+                                "tokens": tokens, "tokens_completion": tokens_completion,
+                                "gen_ms": gen_ms, "bytes_out": bytes_out,
                                 "chunks": chunks, "outcome": outcome_category})
         # v2 P2：histogram 桶更新与 60s rates 窗口滚动（每请求一次，均在本锁内；R1/R4）
         if ttfb_ms is not None and model:
@@ -2908,6 +2910,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                       qwait_ms=tpm_qwait_ms,
                       tpm_used=tpm_final_used if tpm_key is not None else None)
             p3_tokens = self._p3_usage_tokens
+            gen_ms = (round((t_relay_done - self._t_first_byte_mark) * 1000, 1)
+                      if self._t_first_byte_mark is not None else None)
             _record_request(self.command, self.path, resp.status,
                             (time.time() - started) * 1000, filtered, model=model,
                             error=outcome.counts_error,
@@ -2922,6 +2926,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                             qwait_ms=tpm_qwait_ms,
                             key_id12=tpm_key[:12] if tpm_key else None,
                             bytes_in=length,
+                            gen_ms=gen_ms,
                             phase_ms={"connect": connect_ms, "headers": headers_ms,
                                       "body": body_ms})
         else:

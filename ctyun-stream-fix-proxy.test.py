@@ -8301,6 +8301,44 @@ class CalibrateSendTest(unittest.TestCase):
         self.assertIs(body_error, False)
 
 
+class GenSpeedRecentEntryTest(unittest.TestCase):
+    """生成速度修复：RECENT 条目含 tokens_completion + gen_ms 两键且口径正确。
+
+    黑盒子进程集成：scripted 上游回 SSE_USAGE(prompt=1,completion=1,total=2)
+    的流 → recent[-1] 的 tokens_completion 必须取 completion（=1 而非 total=2），
+    gen_ms 为流式交付窗口毫秒数（float 且 >= 0）。"""
+
+    def setUp(self) -> None:
+        upstream_port, self.calls = make_scripted_upstream(
+            body_override=SSE_USAGE + SSE_A + SSE_B + SSE_DONE)
+        self.proxy_port = free_port()
+        self.proc = start_proxy(upstream_port, self.proxy_port)
+
+    def tearDown(self) -> None:
+        stop_proxy(self.proc)
+        stop_fake_upstreams()
+
+    def test_recent_entry_carries_completion_and_gen_ms(self) -> None:
+        data = post_sse(self.proxy_port)
+        self.assertEqual(data, SSE_USAGE + SSE_A + SSE_B + SSE_DONE,
+                         "stream must relay byte-exact")
+        _, body, _ = admin_get(self.proc.admin_port, "/api/stats")
+        snap = json.loads(body.decode("utf-8"))
+        self.assertTrue(snap["recent"], "RECENT_REQUESTS must not be empty")
+        entry = snap["recent"][-1]
+        for key in ("tokens_completion", "gen_ms"):
+            self.assertIn(key, entry,
+                          "recent entry must carry '%s' key; got keys %r"
+                          % (key, sorted(entry.keys())))
+        self.assertEqual(entry["tokens_completion"], 1,
+                         "completion must be usage completion_tokens (=1), "
+                         "not total_tokens (=2)")
+        self.assertIsInstance(entry["gen_ms"], float,
+                              "gen_ms must be a float ms window")
+        self.assertGreaterEqual(entry["gen_ms"], 0,
+                                "gen_ms must be >= 0 (monotonic window)")
+
+
 if __name__ == "__main__":
     import atexit
     atexit.register(kill_registered)
