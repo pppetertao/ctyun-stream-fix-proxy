@@ -1086,7 +1086,6 @@ _CALIBRATE_STATE = {
     "running": False,       # bool：校准进行中
     "task_id": None,        # str：本次校准 uuid 短 hex（12 位）
     "model": None,          # str：校准目标模型名
-    "started_at": None,     # float：启动时间戳
     "progress": {"batch": 0, "consumed": 0},
     "result": None,         # dict：calibrate_engine 返回结果
     "error": None,          # str：异常消息（R6）
@@ -1133,7 +1132,6 @@ def calibrate_start(model, token=None) -> tuple:
         _CALIBRATE_STATE["running"] = True
         _CALIBRATE_STATE["task_id"] = task_id
         _CALIBRATE_STATE["model"] = model
-        _CALIBRATE_STATE["started_at"] = time.time()
         _CALIBRATE_STATE["progress"] = {"batch": 0, "consumed": 0}
         _CALIBRATE_STATE["result"] = None
         _CALIBRATE_STATE["error"] = None
@@ -1220,11 +1218,71 @@ def _calibrate_log(model, task_id, result, dur_s) -> None:
     _safe_log_stderr(line)
 
 
+_CALIBRATE_TS_PARSE_FMT = "%Y-%m-%dT%H:%M:%S%z"
+
+
+def tpm_last_success_ts(lines: list, model: str):
+    """从 REQ 行列表提取指定模型最近一次成功流量的 ts= 时间戳（R4 settle 依据）。
+
+    成功词表以代码实际为准：classify_outcome 中 CLASS_OK 与 CLASS_POISON_FIXED
+    的 log_result 均为字面 "ok"（:425-434），故匹配 result=ok\\b——含 poison-fixed
+    变体（毒修后对上游仍算成功）。字段序同 _log（result 在 model 前、ts 在行尾）：
+    `result=ok\\b.*\\bmodel=X\\b.*\\bts=(\\S+)`。ts= 值为 _log 落盘格式
+    %Y-%m-%dT%H:%M:%S%z（本地时区带偏移——finding 假定 \\d+ 与代码不符，
+    依实际格式解析为 epoch 秒后取最大）；解析失败行跳过。无命中 → None。纯函数。
+    """
+    pattern = re.compile(
+        r"result=ok\b.*\bmodel=%s\b.*\bts=(\S+)" % re.escape(model))
+    latest = None
+    for line in lines:
+        if not isinstance(line, str):
+            continue
+        match = pattern.search(line)
+        if not match:
+            continue
+        try:
+            ts = datetime.datetime.strptime(
+                match.group(1), _CALIBRATE_TS_PARSE_FMT).timestamp()
+        except ValueError:
+            continue
+        if latest is None or ts > latest:
+            latest = ts
+    return latest
+
+
+def _calibrate_settle_wait(model: str, task_id: str) -> bool:
+    """R4 settle：开跑前检测最近 TPM_WINDOW_S 秒内该模型是否有成功流量，有则等待。
+
+    返回 True 表示可以开跑（窗口已过 / 无成功流量 / abort 置位——aborted 判定
+    交由引擎首判，尚未开始不算 aborted）；返回 False 表示 task_id 已被新任务取代
+    （陈旧迭代应跳过引擎直接继续轮询，防占空闲槽）。
+    """
+    with LOG_LOCK:
+        line_snapshot = [entry["line"] for entry in LOG_RING]
+    last_ok_ts = tpm_last_success_ts(line_snapshot, model)
+    if last_ok_ts is None:
+        return True
+    deadline = min(last_ok_ts + TPM_WINDOW_S,
+                   time.time() + TPM_CALIBRATE_SETTLE_WAIT_S)
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return True
+        with CALIBRATE_LOCK:
+            if _CALIBRATE_STATE.get("task_id") != task_id:
+                return False
+            if _CALIBRATE_STATE["abort"]:
+                return True
+        time.sleep(min(1.0, remaining))
+
+
 def _calibrate_loop() -> None:
     """校准 daemon 线程（main() 恒启动一次；无待跑任务时轮询空转）。
 
-    检测 running=True → 取模型与凭证 → 构造 send_one 注入发送器
-    （_calibrate_send 直连 UPSTREAM_BASE，R2）→ 调 calibrate_engine 跑完整校准；
+    检测 running=True → 取模型与凭证 → settle 等待（R4：最近 60s 内有该模型
+    成功流量则等待至窗口滑过，上限 TPM_CALIBRATE_SETTLE_WAIT_S）→ 构造 send_one
+    注入发送器（_calibrate_send 直连 UPSTREAM_BASE，R2）→ 调 calibrate_engine
+    跑完整校准；
     结束后写 state.result、复位 running，rejected 时落探测结果（record_tpm_probe_result），
     写 probe=1 摘要日志（_calibrate_log）。
     顶层 except Exception：写 _CALIBRATE_STATE["error"] + _safe_log_stderr 后复位
@@ -1241,6 +1299,8 @@ def _calibrate_loop() -> None:
             token = _CALIBRATE_TOKEN
             _CALIBRATE_TOKEN = None
         auth_token = token or _LAST_AUTH
+        if not _calibrate_settle_wait(model, task_id):
+            continue  # task_id 失配：陈旧迭代跳过引擎，继续轮询
         started = time.time()
         consumed_est = 0  # 累计 est（与 engine consumed 同一进度口径）
 

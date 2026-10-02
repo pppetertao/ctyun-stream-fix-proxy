@@ -7878,7 +7878,7 @@ class TpmCalibrateStateTest(unittest.TestCase):
             mod._CALIBRATE_STATE.clear()
             mod._CALIBRATE_STATE.update({
                 "running": False, "task_id": None, "model": None,
-                "started_at": None, "progress": {"batch": 0, "consumed": 0},
+                "progress": {"batch": 0, "consumed": 0},
                 "result": None, "error": None, "abort": False,
                 "last_probe_ts": {},
             })
@@ -8060,6 +8060,179 @@ class TpmCalibrateStateTest(unittest.TestCase):
             progress_snapshots[1]["batch"], 1,
             "校准运行中 progress 未逐批更新：snapshots=%r" % progress_snapshots)
         self.assertEqual(result["outcome"], "rejected")
+
+    def test_tpm_last_success_ts(self) -> None:
+        """tpm_last_success_ts：扫描 REQ 行，提取指定模型最近 result=ok 的 ts。"""
+        mod = self.mod
+        ts1 = "2026-10-01T10:00:00+0800"
+        ts2 = "2026-10-01T11:00:00+0800"
+        ts3 = "2026-10-01T12:00:00+0800"
+        ts_parse_fmt = "%Y-%m-%dT%H:%M:%S%z"
+        lines = [
+            "REQ POST /chat/completions -> 200 dur=9.5s result=ok filtered=0 "
+            "model=kimi-k3-oc retried=0 retry_reason=- exc=- "
+            "rid=r-1 host=h ttfb=1.0ms stream=1 outcome=ok ts=" + ts1,
+            "REQ POST /chat/completions -> 200 dur=9.5s result=body-err filtered=0 "
+            "model=kimi-k3-oc retried=0 retry_reason=- exc=- "
+            "rid=r-2 host=h ttfb=1.0ms stream=1 outcome=body_error tpm=47850 ts=" + ts2,
+            "REQ POST /chat/completions -> 200 dur=9.5s result=ok filtered=0 "
+            "model=kimi-k3-oc retried=0 retry_reason=- exc=- "
+            "rid=r-3 host=h ttfb=1.0ms stream=1 outcome=ok ts=" + ts3,
+            "REQ POST /chat/completions -> 200 dur=9.5s result=ok filtered=0 "
+            "model=other-model retried=0 retry_reason=- exc=- "
+            "rid=r-4 host=h ttfb=1.0ms stream=1 outcome=ok ts=" + ts3,
+            "REQ POST /v1/chat/completions -> 200 dur=1.0s result=calibrate "
+            "filtered=0 model=kimi-k3-oc retried=0 retry_reason=- exc=- "
+            "rid=calibrate-abc host=h ttfb=- stream=0 outcome=rejected "
+            "consumed=60000 probe=1 ts=" + ts3,
+            "garbage", None,
+        ]
+        # 命中：result=ok 行中取最大 ts（ts3 > ts1）
+        result = mod.tpm_last_success_ts(lines, "kimi-k3-oc")
+        self.assertIsNotNone(result)
+        import datetime as _datetime
+        exp = _datetime.datetime.strptime(ts3, ts_parse_fmt).timestamp()
+        self.assertEqual(result, exp,
+                         "应为 ts3=%s 的 epoch，非 ts1" % ts3)
+        # 无命中
+        self.assertIsNone(mod.tpm_last_success_ts(lines, "absent"))
+        self.assertIsNone(mod.tpm_last_success_ts([], "kimi-k3-oc"))
+
+    def test_calibrate_loop_settle_waits_when_recent_ok(self) -> None:
+        """R4 settle 集成：LOG_RING 含模型 m-settle 的 result=ok（30s 前）
+        → SETTLE_WAIT_S=2 → 首调延迟 ≥~1.5s，outcome=rejected。"""
+        mod = self.mod
+        orig_gap = mod.TPM_CALIBRATE_BATCH_GAP_S
+        orig_interval = mod.TPM_CALIBRATE_MIN_INTERVAL_S
+        orig_settle = mod.TPM_CALIBRATE_SETTLE_WAIT_S
+        mod.TPM_CALIBRATE_BATCH_GAP_S = 0.05
+        mod.TPM_CALIBRATE_MIN_INTERVAL_S = 0
+        mod.TPM_CALIBRATE_SETTLE_WAIT_S = 2
+        self.addCleanup(setattr, mod, "TPM_CALIBRATE_BATCH_GAP_S", orig_gap)
+        self.addCleanup(setattr, mod, "TPM_CALIBRATE_MIN_INTERVAL_S", orig_interval)
+        self.addCleanup(setattr, mod, "TPM_CALIBRATE_SETTLE_WAIT_S", orig_settle)
+
+        # 预写 LOG_RING：模型 m-settle 在 30s 前有一次 result=ok 成功流量
+        t_past = time.time() - 30
+        ts_str = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(t_past))
+        with mod.LOG_LOCK:
+            mod.LOG_RING.append({"seq": 99999, "line":
+                "REQ POST /chat/completions -> 200 dur=1.2s result=ok filtered=0 "
+                "model=m-settle retried=0 retry_reason=- exc=- "
+                "rid=r-settle host=h ttfb=- stream=1 outcome=ok ts=" + ts_str})
+
+        first_call_ts = []
+
+        def fake_send_slow(model, batch, est, auth_token):
+            first_call_ts.append(time.time())
+            return 429, False
+
+        orig_send = mod._calibrate_send
+        mod._calibrate_send = fake_send_slow
+        self.addCleanup(setattr, mod, "_calibrate_send", orig_send)
+
+        thread = threading.Thread(target=mod._calibrate_loop, daemon=True)
+        thread.start()
+
+        def stop_loop():
+            with mod.CALIBRATE_LOCK:
+                mod._CALIBRATE_STATE["running"] = False
+            mod._CALIBRATE_TOKEN = None
+            thread.join(2)
+        self.addCleanup(stop_loop)
+
+        t_start = time.time()
+        status, _ = mod.calibrate_start("m-settle", token="Bearer t")
+        self.assertEqual(status, 200)
+
+        result = None
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            with mod.CALIBRATE_LOCK:
+                result = mod._CALIBRATE_STATE["result"]
+            if result is not None:
+                break
+            time.sleep(0.05)
+        self.assertIsNotNone(
+            result, "15s 内未产出 result（error=%r）"
+            % mod._CALIBRATE_STATE["error"])
+        self.assertEqual(result["outcome"], "rejected")
+        self.assertGreaterEqual(len(first_call_ts), 1,
+                                "首调未发生（settle 4s 超时？）")
+        delay = first_call_ts[0] - t_start
+        self.assertGreaterEqual(delay, 1.5,
+                                "settle 2s 后首调应延迟 ≥1.5s，实 %.3fs" % delay)
+
+    def test_calibrate_loop_settle_skips_when_no_recent_ok(self) -> None:
+        """R4 settle 跳过：无该模型 result=ok 流量 → 不等待，直接开跑（首调 <0.5s）。"""
+        mod = self.mod
+        orig_gap = mod.TPM_CALIBRATE_BATCH_GAP_S
+        orig_interval = mod.TPM_CALIBRATE_MIN_INTERVAL_S
+        orig_settle = mod.TPM_CALIBRATE_SETTLE_WAIT_S
+        mod.TPM_CALIBRATE_BATCH_GAP_S = 0.05
+        mod.TPM_CALIBRATE_MIN_INTERVAL_S = 0
+        mod.TPM_CALIBRATE_SETTLE_WAIT_S = 2
+        self.addCleanup(setattr, mod, "TPM_CALIBRATE_BATCH_GAP_S", orig_gap)
+        self.addCleanup(setattr, mod, "TPM_CALIBRATE_MIN_INTERVAL_S", orig_interval)
+        self.addCleanup(setattr, mod, "TPM_CALIBRATE_SETTLE_WAIT_S", orig_settle)
+
+        first_call_ts = []
+        daemon_tid = [None]
+
+        def fake_send_fast(model, batch, est, auth_token):
+            first_call_ts.append(time.time())
+            return 429, False
+
+        orig_send = mod._calibrate_send
+        mod._calibrate_send = fake_send_fast
+        self.addCleanup(setattr, mod, "_calibrate_send", orig_send)
+
+        # 缩短 daemon 线程睡眠，消除 pickup 延迟噪声（settle 0s 仍需可见首调 <0.5s）
+        real_sleep = mod.time.sleep
+        def short_sleep(secs):
+            if daemon_tid[0] is not None \
+                    and threading.current_thread().ident == daemon_tid[0]:
+                real_sleep(0.02)
+            else:
+                real_sleep(secs)
+        mod.time.sleep = short_sleep
+        self.addCleanup(setattr, mod.time, "sleep", real_sleep)
+
+        def loop_wrapper():
+            daemon_tid[0] = threading.current_thread().ident
+            mod._calibrate_loop()
+
+        thread = threading.Thread(target=loop_wrapper, daemon=True)
+        thread.start()
+
+        def stop_loop():
+            with mod.CALIBRATE_LOCK:
+                mod._CALIBRATE_STATE["running"] = False
+            mod._CALIBRATE_TOKEN = None
+            thread.join(2)
+        self.addCleanup(stop_loop)
+
+        t_start = time.time()
+        status, _ = mod.calibrate_start("m-fast", token="Bearer t")
+        self.assertEqual(status, 200)
+
+        result = None
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            with mod.CALIBRATE_LOCK:
+                result = mod._CALIBRATE_STATE["result"]
+            if result is not None:
+                break
+            time.sleep(0.05)
+        self.assertIsNotNone(
+            result, "10s 内未产出 result（error=%r）"
+            % mod._CALIBRATE_STATE["error"])
+        self.assertEqual(result["outcome"], "rejected")
+        self.assertGreaterEqual(len(first_call_ts), 1,
+                                "首调未发生")
+        delay = first_call_ts[0] - t_start
+        self.assertLess(delay, 0.5,
+                        "无 ok 流量应不等待，首调 %.3fs < 0.5s" % delay)
 
 
 class CalibrateSendTest(unittest.TestCase):
