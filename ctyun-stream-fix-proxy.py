@@ -2989,8 +2989,8 @@ _DASH_SECTIONS_V2 = """  <!-- pane perf 开 -->
     <div class="card-title">模型速度对比 · TTFB P50/P90（进程内累计，最快在上）</div>
     <div class="table-wrap">
     <table>
-      <thead><tr><th>模型</th><th>P50</th><th>P90</th></tr></thead>
-      <tbody id="perf-model-body"><tr><td class="empty" colspan="3">读取中……</td></tr></tbody>
+      <thead><tr><th>模型</th><th>P50</th><th>P90</th><th>生成 tok/s</th></tr></thead>
+      <tbody id="perf-model-body"><tr><td class="empty" colspan="4">读取中……</td></tr></tbody>
     </table>
     </div>
   </section>
@@ -3031,8 +3031,8 @@ _DASH_SECTIONS_V2 = """  <!-- pane perf 开 -->
     <div class="card-title">慢请求 Top 10 · 按耗时（最近 100 条内）</div>
     <div class="table-wrap">
     <table>
-      <thead><tr><th>时间</th><th>模型</th><th>路径</th><th>状态</th><th>耗时</th><th>TTFB</th><th>rid</th></tr></thead>
-      <tbody id="slow-body"><tr><td class="empty" colspan="7">读取中……</td></tr></tbody>
+      <thead><tr><th>时间</th><th>模型</th><th>路径</th><th>状态</th><th>耗时</th><th>TTFB</th><th>生成速度</th><th>rid</th></tr></thead>
+      <tbody id="slow-body"><tr><td class="empty" colspan="8">读取中……</td></tr></tbody>
     </table>
     </div>
   </section>
@@ -3067,6 +3067,7 @@ _DASH_SECTIONS_V2 = """  <!-- pane perf 开 -->
     <div class="card-title">实时流量画像 · 60s 窗口</div>
     <div class="stats-row">
       <div class="card stat"><div class="num" id="tp-bytes">--</div><div class="label">出流量/s</div></div>
+      <div class="card stat"><div class="num" id="tp-bytes-in">--</div><div class="label">入流量/s</div></div>
       <div class="card stat"><div class="num" id="tp-chunks">--</div><div class="label">chunks/s</div></div>
       <div class="card stat"><div class="num" id="tp-tokens">--</div><div class="label">tokens/s</div></div>
       <div class="card stat"><div class="num" id="tp-stream">--</div><div class="label">流式占比·累计</div></div>
@@ -3109,6 +3110,10 @@ _DASH_SECTIONS_V2 = """  <!-- pane perf 开 -->
   <section class="card">
     <div class="card-title">小时级 Token 曲线 · 最近 48h（进程内，重启清零）</div>
     <svg id="hourly-svg" viewBox="0 0 600 96" preserveAspectRatio="none" role="img" aria-label="小时级 token 柱状图"></svg>
+  </section>
+  <section class="card">
+    <div class="card-title">小时级吞吐 · 出流量（最近 48h，进程内，重启清零）</div>
+    <svg id="hourly-bytes-svg" viewBox="0 0 600 96" preserveAspectRatio="none" role="img" aria-label="小时级出流量柱状图"></svg>
   </section>
   <section class="card">
     <div class="card-title">上游探测延迟趋势 · 最近 7 天（30s 采样，抽稀 ≤200 点）</div>
@@ -3537,7 +3542,18 @@ function initTabs() {
 initTabs();
 """
 
-_DASH_JS_V2 = """function renderPerf(snap) {
+_DASH_JS_V2 = """// v3.1：单请求生成速度（流式且 tokens>0 且耗时>首字节时有效，tokens/s 综合）
+function genSpeed(r) {
+  if (!r || !r.stream || !r.tokens || !(r.dur_ms > 0) || r.ttfb_ms == null ||
+      r.dur_ms <= r.ttfb_ms) return null;
+  return r.tokens / ((r.dur_ms - r.ttfb_ms) / 1000);
+}
+function median(xs) {
+  if (!xs.length) return null;
+  var s = xs.slice().sort(function (a, b) { return a - b; });
+  return s[Math.floor(0.5 * (s.length - 1))];
+}
+function renderPerf(snap) {
   var perf = snap.perf || {};
   var p50 = perf.ttfb_p50_ms_by_model || {};
   var p90 = perf.ttfb_p90_ms_by_model || {};
@@ -3547,15 +3563,26 @@ _DASH_JS_V2 = """function renderPerf(snap) {
   if (names.length === 0) {
     var tr0 = el("tr");
     var td0 = el("td", "empty", "暂无速度数据 —— 有请求经过代理后这里会出现 P50/P90");
-    td0.colSpan = 3;
+    td0.colSpan = 4;
     tr0.appendChild(td0);
     body.appendChild(tr0);
+  }
+  var speeds = {};
+  var recent = snap.recent || [];
+  for (var k = 0; k < recent.length; k++) {
+    var v = genSpeed(recent[k]);
+    if (v == null) continue;
+    var mname = recent[k].model || "—";
+    if (!speeds[mname]) speeds[mname] = [];
+    speeds[mname].push(v);
   }
   for (var i = 0; i < names.length; i++) {
     var tr = el("tr");
     tr.appendChild(el("td", "", names[i]));
     tr.appendChild(el("td", "num", fmtDur(p50[names[i]])));
     tr.appendChild(el("td", "num", fmtDur(p90[names[i]])));
+    var med = median(speeds[names[i]] || []);
+    tr.appendChild(el("td", "num", med != null ? Math.round(med) + " t/s" : "—"));
     body.appendChild(tr);
   }
   renderLatencyDist(perf.phase_p50_ms || {});
@@ -4044,7 +4071,7 @@ function renderSlowTop(snap) {
   if (top.length === 0) {
     var tr0 = el("tr");
     var td0 = el("td", "empty", "暂无请求记录");
-    td0.colSpan = 7;
+    td0.colSpan = 8;
     tr0.appendChild(td0);
     body.appendChild(tr0);
     return;
@@ -4058,6 +4085,8 @@ function renderSlowTop(snap) {
     tr.appendChild(el("td", "num", String(r.status)));
     tr.appendChild(el("td", "num", fmtDur(r.dur_ms || 0)));
     tr.appendChild(el("td", "num", r.ttfb_ms != null ? fmtDur(r.ttfb_ms) : "—"));
+    var gs = genSpeed(r);
+    tr.appendChild(el("td", "num", gs != null ? Math.round(gs) + " t/s" : "—"));
     tr.appendChild(el("td", "", r.rid || "—"));
     body.appendChild(tr);
   }
@@ -4096,6 +4125,7 @@ function renderStability(snap) {
 }
 function renderTraffic(perf, snap) {
   $("tp-bytes").textContent = perf.bytes_per_s != null ? fmtBytes(perf.bytes_per_s) + "/s" : "--";
+  $("tp-bytes-in").textContent = perf.bytes_in_per_s != null ? fmtBytes(perf.bytes_in_per_s) + "/s" : "--";
   $("tp-chunks").textContent = perf.chunks_per_s != null ? String(Math.round(perf.chunks_per_s)) : "--";
   $("tp-tokens").textContent = perf.tokens_per_s != null ? String(Math.round(perf.tokens_per_s)) : "--";
   $("tp-stream").textContent = perf.stream_share != null
@@ -4241,6 +4271,59 @@ function renderHourly(snap) {
   svg.appendChild(tl);
   svg.appendChild(tr2);
 }
+function renderHourlyBytes(snap) {
+  var svg = $("hourly-bytes-svg");
+  while (svg.firstChild) svg.removeChild(svg.firstChild);
+  var data = snap.hourly_tokens || [];
+  var W = 600, H = 96;
+  var any = false;
+  for (var i = 0; i < data.length; i++) {
+    if ((data[i].bytes_out || 0) > 0) { any = true; break; }
+  }
+  if (!any) {
+    var t0 = svgEl("text");
+    t0.setAttribute("x", 0);
+    t0.setAttribute("y", 14);
+    t0.setAttribute("font-size", 12);
+    t0.style.fill = "var(--dim)";
+    t0.textContent = "暂无出流量数据 —— 有请求后按小时聚合出现";
+    svg.appendChild(t0);
+    return;
+  }
+  var max = 1;
+  for (var j = 0; j < data.length; j++) {
+    max = Math.max(max, data[j].bytes_out || 0);
+  }
+  var bw = W / data.length;
+  for (var k = 0; k < data.length; k++) {
+    var v = data[k].bytes_out || 0;
+    if (v <= 0) continue;
+    var h = Math.max(2, v / max * (H - 16));
+    var r = svgEl("rect");
+    r.setAttribute("x", (k * bw + 0.5).toFixed(1));
+    r.setAttribute("y", (H - h).toFixed(1));
+    r.setAttribute("width", Math.max(1, bw - 1).toFixed(1));
+    r.setAttribute("height", h.toFixed(1));
+    r.style.fill = "var(--ok)";
+    svg.appendChild(r);
+  }
+  var tl = svgEl("text");
+  tl.setAttribute("x", 0);
+  tl.setAttribute("y", 10);
+  tl.setAttribute("font-size", 11);
+  tl.style.fill = "var(--dim)";
+  tl.textContent = fmtHour(data[0].hour_start_ts);
+  var tr2 = svgEl("text");
+  tr2.setAttribute("x", W);
+  tr2.setAttribute("y", 10);
+  tr2.setAttribute("text-anchor", "end");
+  tr2.setAttribute("font-size", 11);
+  tr2.style.fill = "var(--dim)";
+  tr2.textContent = fmtHour(data[data.length - 1].hour_start_ts) +
+    " · 峰值 " + fmtBytes(max) + "/h";
+  svg.appendChild(tl);
+  svg.appendChild(tr2);
+}
 function renderPerfV3(snap) {
   var perf = snap.perf || {};
   renderTtfbHist(perf);
@@ -4252,6 +4335,7 @@ function renderPerfV3(snap) {
   renderQwait(perf);
   renderSettle(perf);
   renderHourly(snap);
+  renderHourlyBytes(snap);
 }
 function loadTpmObs() {
   fetch("/api/tpm_stats")

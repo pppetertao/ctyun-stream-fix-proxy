@@ -2932,7 +2932,8 @@ class DashboardV3CardsTest(unittest.TestCase):
                     "stability-body", "tpm-obs-body", "err-events-body",
                     "traffic-model-body", "stalls-body", "qwait-body",
                     "settle-body", "hourly-svg", "probe-trend",
-                    "tpm-queue-chip", "err-capture-chip"):
+                    "tpm-queue-chip", "err-capture-chip",
+                    "hourly-bytes-svg", "tp-bytes-in"):
             self.assertIn('id="%s"' % cid, v2, "perf 区缺 v3 容器 %s" % cid)
 
     def test_v3_token_table_columns(self) -> None:
@@ -2956,6 +2957,13 @@ class DashboardV3CardsTest(unittest.TestCase):
         self.assertIn("renderPerfV3(snap)", js, "poll 需接线 renderPerfV3")
         self.assertIn("renderByKey(snap)", js, "poll 需接线 renderByKey")
         self.assertIn("renderPerfV3(lastSnap || {})", js, "启动需首渲染 perf v3")
+        self.assertIn("function renderHourlyBytes(", js, "缺小时级出流量曲线")
+        self.assertIn("renderHourlyBytes(snap)", js, "renderPerfV3 需接线小时吞吐曲线")
+        self.assertIn("function genSpeed(", js, "缺生成速度计算")
+        self.assertIn("<th>生成速度</th>", self.mod._DASH_SECTIONS_V2,
+                      "慢请求表缺生成速度列")
+        self.assertIn("<th>生成 tok/s</th>", self.mod._DASH_SECTIONS_V2,
+                      "模型速度对比表缺生成速度列")
         core = self.mod._DASH_JS_CORE
         self.assertIn("renderZeroToken(lastSnap)", core,
                       "applyRange 需零请求重渲染 0-token 卡")

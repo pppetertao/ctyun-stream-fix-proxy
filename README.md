@@ -17,14 +17,15 @@
   - 「最近请求」最近 100 条（含模型列、耗时、剥行数；跨天时自动按日期分组显示）
   - 「剥行流带」最近 20 条毒 record 预览 + 累计 sparkline
   - 「按天统计」「按天 × 模型」随所选时间段过滤日期（上月最多 31 行；daily 分桶，双口径错误列）
-  - 「模型速度对比」各模型 TTFB P50/P90（进程内直方图分位数）+「延迟分布」连接/响应头/数据体三阶段 P50
+  - 「模型速度对比」各模型 TTFB P50/P90（进程内直方图分位数）+ 生成 tok/s（最近 100 条流式请求按模型中位生成速度）+「延迟分布」连接/响应头/数据体三阶段 P50
   - 「Token 用量按天 × 模型」prompt/completion/cache/reasoning tokens（usage 帧抽取，cache/reasoning 为 parse-if-present，上游不回传即为 0；随所选时间段过滤）
   - 「三态可用率」ok/degraded/failed 占比条（随所选时间段过滤）
   - 「上游健康」主动探测 HEAD 结果（最近探测时间/延迟/连续失败/开关；探测告警 hover 明细）
   - v3 观测扩展（按模型区分）：按模型 TTFB 9 桶分布、三阶段 P50/P90 按模型、慢请求 Top 10、按模型错误/重试率（今日）、
     TPM 限流观测（per key × 模型 60s 窗口 used/remaining/queued/rejected/timeouts）、错误事件流（最近 50 条）、
-    实时流量画像（60s 窗口 + 当日按模型流式占比）、SSE 停顿按模型、TPM 排队等待 P50/P90、
-    估算偏差 actual/est P50/P90、小时级 token 曲线（48h 内存环）、上游探测延迟趋势（7 天抽稀 ≤200 点折线）
+    实时流量画像（60s 窗口出/入方向字节与 chunks/tokens 速率 + 当日按模型流式占比）、SSE 停顿按模型、TPM 排队等待 P50/P90、
+    估算偏差 actual/est P50/P90、小时级 token 曲线与出流量吞吐（48h 内存环）、上游探测延迟趋势（7 天抽稀 ≤200 点折线）、
+    慢请求 Top 10 含单请求生成速度列
   - 「Token 用量按 API Key」当日 per-key 用量（sha256 前 12 位脱敏，≤64 key/日，跨重启保留）
   - 「0-token 请求」所选时段零 token 请求计数与占比（被 stall/错误打断的流信号）
   - 「月末 Token 投影」按本月日均速率预估全月 prompt+completion 总量（纯前端估算）
@@ -97,7 +98,7 @@ capture_errors 开关：
 /usr/bin/python3 ctyun-stream-fix-proxy.test.py
 ```
 
-299 个用例（含 v3 观测扩展：schema 迁移、daily_by_key、usage 五元组、per-model 分位、probe history、dashboard v3 卡）。**必须用 `/usr/bin/python3`**：Homebrew 的 Python 3.14 `http.server.HTTPServer` 构造会挂死（进程存活但不 LISTEN、零报错）。
+301 个用例（含 v3 观测扩展与 v3.1 吞吐：schema 迁移、daily_by_key、usage 五元组、per-model 分位、probe history、bytes_in 窗口、dashboard v3 卡）。**必须用 `/usr/bin/python3`**：Homebrew 的 Python 3.14 `http.server.HTTPServer` 构造会挂死（进程存活但不 LISTEN、零报错）。
 
 ## 计数口径
 
@@ -110,7 +111,8 @@ capture_errors 开关：
 | 「模型速度对比」「延迟分布」 | 进程内 TTFB 直方图（9 桶）分位数：按模型 P50/P90 + 三阶段全局 P50 | 否（重启清零） |
 | 「按模型 TTFB 分布」「三阶段按模型」「SSE 停顿按模型」 | 进程内直方图/计数（v3 per-model 双写） | 否（重启清零） |
 | 「TPM 排队等待」「估算偏差」分位 | 进程内 per-model 环形（500 样本/模型）最近秩分位 | 否（重启清零） |
-| 「小时级 Token 曲线」 | 48h 内存环（hourly_tokens，整点滚动） | 否（重启清零） |
+| 「小时级 Token 曲线」「小时级吞吐」 | 48h 内存环（hourly_tokens：tokens + bytes_out/chunks 同环滚动） | 否（重启清零） |
+| 「生成速度」列 | RECENT_REQUESTS 派生（流式且 tokens>0：tokens ÷（耗时−TTFB））；模型对比列=按模型中位，慢请求列=单请求值 | 否（内存窗口） |
 | 「TPM 限流观测」 | /api/tpm_stats 60s 窗口 per key × 模型桶 | 拒绝/超时计数随 stats 落盘 |
 | 「错误事件流」 | /api/errors 内存环最近 50 条（capture_errors 开关控制留痕） | 否（环内存态） |
 | 「上游探测延迟趋势」 | /api/probe_history 7 天 30s 采样抽稀 ≤200 点 | 否（内存 deque） |
