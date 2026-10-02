@@ -112,8 +112,15 @@ TPM_TOKEN_RATIO = float(os.environ.get("CTYUN_TPM_TOKEN_RATIO", "0.25"))
 TPM_KEY_CAP = int(os.environ.get("CTYUN_TPM_KEY_CAP", "64"))
 
 # TPM 校准常量（主动校准探测；全部 env seam 以便测试加速）
-TPM_CALIBRATE_INPUT_BYTES = int(os.environ.get("CTYUN_CALIBRATE_INPUT_BYTES", "240000"))
-TPM_CALIBRATE_STEP_TOKENS = int(os.environ.get("CTYUN_CALIBRATE_STEP_TOKENS", "5000"))
+# ramp-up（方案 B）：起步 START → ×RAMP_FACTOR 几何递增至 KNEE → 之后每批 +STEP_TOKENS；
+# 单批名义 est 超过 MAX_PROBE_TOKENS 即终止（capped）。旧 CTYUN_CALIBRATE_INPUT_BYTES
+# 与 _CALIBRATE_BYTES_PER_STEP 已删除（env 失效），输入字节由 calibrate_input_bytes 单一调度。
+TPM_CALIBRATE_START_TOKENS = int(os.environ.get("CTYUN_CALIBRATE_START_TOKENS", "4000"))
+TPM_CALIBRATE_RAMP_FACTOR = float(os.environ.get("CTYUN_CALIBRATE_RAMP_FACTOR", "2.0"))
+TPM_CALIBRATE_KNEE_TOKENS = int(os.environ.get("CTYUN_CALIBRATE_KNEE_TOKENS", "32000"))
+TPM_CALIBRATE_STEP_TOKENS = int(os.environ.get("CTYUN_CALIBRATE_STEP_TOKENS", "20000"))
+TPM_CALIBRATE_MAX_PROBE_TOKENS = int(os.environ.get("CTYUN_CALIBRATE_MAX_PROBE_TOKENS", "160000"))
+TPM_CALIBRATE_TIMEOUT_S = float(os.environ.get("CTYUN_CALIBRATE_TIMEOUT_S", "60"))
 TPM_CALIBRATE_MAX_TOKENS = int(os.environ.get("CTYUN_CALIBRATE_MAX_TOKENS", "1"))
 TPM_CALIBRATE_BATCH_GAP_S = float(os.environ.get("CTYUN_CALIBRATE_BATCH_GAP_S", "2.0"))
 TPM_CALIBRATE_MAX_DURATION_S = float(os.environ.get("CTYUN_CALIBRATE_MAX_DURATION_S", "240"))
@@ -1002,14 +1009,50 @@ def build_calibrate_body(model: str, input_bytes: int) -> dict:
     }
 
 
-def calibrate_engine(model, send_one, should_abort=None, sleep=None,
-                     estimate=estimate_request_tokens):
-    """校准引擎（决策 4/5 纯逻辑；发送器/abort/sleep/estimate 全部注入）。
+def calibrate_target_est(batch: int) -> int:
+    """第 batch 批（1-based）名义目标 est：几何 ×RAMP_FACTOR 至 KNEE，之后线性 +STEP。
 
-    线性逐批加压：第 batch 批名义 est = base + (batch-1) * TPM_CALIBRATE_STEP_TOKENS，
-    base = estimate(序列化后的 build_calibrate_body(model, TPM_CALIBRATE_INPUT_BYTES))——
-    首批 est 由准入口径 estimate 实测，保证逐级加压真实作用于限流判定（AC9）；
-    序列化口径与真发送器（卡 5）共享：json.dumps(..., ensure_ascii=False).encode("utf-8")。
+    纯函数；batch ≤ 1 返回起步值（fail-open，不抛出）。
+    """
+    est = TPM_CALIBRATE_START_TOKENS
+    for _ in range(1, max(1, int(batch))):
+        if est < TPM_CALIBRATE_KNEE_TOKENS:
+            est = min(int(est * TPM_CALIBRATE_RAMP_FACTOR),
+                      TPM_CALIBRATE_KNEE_TOKENS)
+        else:
+            est += TPM_CALIBRATE_STEP_TOKENS
+    return est
+
+
+def calibrate_input_bytes(batch: int) -> int:
+    """第 batch 批的 content 填充字节数：由名义目标 est 反推
+    （(target - max_tokens) / TPM_TOKEN_RATIO，下限 1）。
+
+    与 calibrate_est_for_batch 共用 calibrate_target_est 单一调度源（R5），
+    保证引擎 est 判定与实际发送字节不漂移。纯函数。
+    """
+    return max(1, int((calibrate_target_est(batch) - TPM_CALIBRATE_MAX_TOKENS)
+                      / max(TPM_TOKEN_RATIO, 0.01)))
+
+
+def calibrate_est_for_batch(model: str, batch: int) -> int:
+    """第 batch 批按发送器同源体计算的实际 est（准入口径 estimate_request_tokens）。
+
+    序列化口径与 _calibrate_send 一致：json.dumps(..., ensure_ascii=False).encode("utf-8")。
+    纯函数（仅依赖入参与模块常量）。
+    """
+    body = build_calibrate_body(model, calibrate_input_bytes(batch))
+    return estimate_request_tokens(
+        json.dumps(body, ensure_ascii=False).encode("utf-8"))
+
+
+def calibrate_engine(model, send_one, should_abort=None, sleep=None):
+    """校准引擎（决策 4/5 纯逻辑；发送器/abort/sleep 全部注入）。
+
+    阶梯递增（方案 B ramp-up）：第 batch 批实际 est 由 calibrate_est_for_batch
+    （与发送器同源的单一调度源）给出——起步 TPM_CALIBRATE_START_TOKENS，
+    几何段 ×TPM_CALIBRATE_RAMP_FACTOR 递增至 TPM_CALIBRATE_KNEE_TOKENS，
+    之后线性 +TPM_CALIBRATE_STEP_TOKENS（R1/R2 小步逼近阈值）。
     每批经 send_one(batch, est) 发送，返回 (status, body_error)；status=None 表示
     连接级异常（无 HTTP 响应）。判定复用 classify_outcome：CLASS_BODY_ERROR /
     CLASS_REQUEST_FAULT（status>=400）→ 拒绝；CLASS_OK / CLASS_POISON_FIXED →
@@ -1017,14 +1060,13 @@ def calibrate_engine(model, send_one, should_abort=None, sleep=None,
     → 中止标 upstream_error（不把上游故障误判为阈值，R5）。
     首拒即停（不追加确认批次）。安全阀：下一批 est 将超过
     TPM_CALIBRATE_HARD_CAP_TOKENS → capped 且不超发，batches 记已成功发送的批次数
-    （被判超顶那一批未发送，不计入）；墙钟超
-    TPM_CALIBRATE_MAX_DURATION_S → timeout；should_abort() 为真（批间隙检查）
-    → aborted。返回 {"threshold", "batches", "consumed", "outcome", "status", "ts"}：
-    threshold = 拒绝批 est（rejected）或最后成功批 est（timeout/aborted），其余 None。
+    （被判超顶那一批未发送，不计入）；墙钟超 TPM_CALIBRATE_MAX_DURATION_S → timeout；
+    should_abort() 为真（批间隙检查）→ aborted。返回
+    {"threshold", "batches", "consumed", "outcome", "status", "ts"}：
+    threshold = 拒绝批 est（rejected）或最后成功批 est（timeout/aborted），
+    其余 None。
     """
     started = time.monotonic()
-    base = estimate(json.dumps(build_calibrate_body(model, TPM_CALIBRATE_INPUT_BYTES),
-                               ensure_ascii=False).encode("utf-8"))
     batch = 0
     consumed = 0
     last_ok_est = None
@@ -1050,7 +1092,7 @@ def calibrate_engine(model, send_one, should_abort=None, sleep=None,
         if time.monotonic() - started >= TPM_CALIBRATE_MAX_DURATION_S:
             return _result("timeout", last_ok_est, None)
         batch += 1
-        est = base + (batch - 1) * TPM_CALIBRATE_STEP_TOKENS
+        est = calibrate_est_for_batch(model, batch)
         if consumed + est > TPM_CALIBRATE_HARD_CAP_TOKENS:
             # 本批未发送：batches 只报已成功发送的批次数（batch - 1）
             return _result("capped", None, None, batches=batch - 1)
@@ -1076,8 +1118,6 @@ def calibrate_engine(model, send_one, should_abort=None, sleep=None,
 
 
 # v2 P5：校准 daemon 与发送器（决策 9/10）
-_CALIBRATE_BYTES_PER_STEP = max(1, int(TPM_CALIBRATE_STEP_TOKENS
-                                       / max(TPM_TOKEN_RATIO, 0.01)))
 CALIBRATE_LOCK = threading.Lock()
 _LAST_AUTH = None   # 最近一次真实流量的 Authorization 头（R3 凭证来源 a；仅内存）
 _CALIBRATE_TOKEN = None  # calibrate_start 注入的 Bearer token（None=回落 _LAST_AUTH）
@@ -1152,8 +1192,9 @@ def calibrate_abort() -> bool:
 def _calibrate_send(model, batch, est, auth_token):
     """单次校准探测发送（R2：http.client 直连 UPSTREAM_BASE，不经 _proxy_relay）。
 
-    body 由 build_calibrate_body 按批次放大 input 填充：batch 1=INPUT_BYTES，
-    每批 +_CALIBRATE_BYTES_PER_STEP 字节（使 estimate 增量 ≈ TPM_CALIBRATE_STEP_TOKENS）。
+    body 由 build_calibrate_body 按批次放大 input 填充：input_bytes 取自
+    calibrate_input_bytes(batch)（与引擎 est 同源的单一调度源，R5——ramp-up 起步
+    ~4k est，不再首批灌 240KB）。
     Authorization = auth_token 或 _LAST_AUTH。
     est 由 engine 传入（形参保留，签名与 send_one(batch, est) 契约一致），当前函数
     体内不读，传入供未来观测/断言用。
@@ -1161,8 +1202,7 @@ def _calibrate_send(model, batch, est, auth_token):
     → (None, False) 并 _safe_log_stderr 留痕；engine 将连接异常判为
     CLASS_UPSTREAM_FAULT 走重试路径。
     """
-    input_bytes = TPM_CALIBRATE_INPUT_BYTES \
-        + (batch - 1) * _CALIBRATE_BYTES_PER_STEP
+    input_bytes = calibrate_input_bytes(batch)
     body = build_calibrate_body(model, input_bytes)
     body_bytes = json.dumps(body, ensure_ascii=False).encode("utf-8")
     parsed = urllib.parse.urlparse(UPSTREAM_BASE)
