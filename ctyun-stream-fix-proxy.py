@@ -249,23 +249,30 @@ def hist_percentile(buckets, edges, q):
     return float(edges[-1])  # 数学不可达（rank<=total 且末桶已 return）；防御性兜底
 
 
-def sse_data_line_kind(line: bytes) -> str:
+def sse_data_line_kind(line: bytes, parsed=None) -> str:
     """SSE data 行归类："done" / "content" / "finish" / "noise"。判定序：
     非 data: 前缀（注释行/event:/id:）→ noise；[DONE] → done；
     JSON 解析失败 → content（fail-open：宁可不重试，不误判合法流）；
     dict 且顶层 error 对象 → content（body error 帧视为 content，触发 priming flush 不重试）；
     dict + choices 非空 list 时：delta.content 非空 str / delta.tool_calls 真值 →
     content；choice.finish_reason 非 None（且无前两者）→ finish；
-    其余（reasoning-only、空 delta、choices 为空的 usage 帧、data:null、非 dict JSON）→ noise。"""
+    其余（reasoning-only、空 delta、choices 为空的 usage 帧、data:null、非 dict JSON）→ noise。
+    parsed 非 None 时复用调用方预解析结果跳过 json.loads（sentinel _SSE_PARSE_FAILED
+    等价解析失败 → content）；None（默认）保持原自行解析路径。"""
     stripped = line.rstrip(b"\r\n")
     if not stripped.startswith(b"data:"):
         return "noise"
     if DONE_RE.match(stripped):
         return "done"
-    try:
-        data = json.loads(stripped[5:].strip().decode("utf-8", "replace"))
-    except ValueError:
+    if parsed is _SSE_PARSE_FAILED:
         return "content"
+    if parsed is None:
+        try:
+            data = json.loads(stripped[5:].strip().decode("utf-8", "replace"))
+        except ValueError:
+            return "content"
+    else:
+        data = parsed
     if not isinstance(data, dict):
         return "noise"
     if body_has_error(data):
@@ -286,6 +293,9 @@ def sse_data_line_kind(line: bytes) -> str:
     return "noise"
 
 
+_SSE_PARSE_FAILED = object()  # sentinel：_relay_sse 预解析失败的行（区别于未传 parsed=None）
+
+
 def body_has_error(parsed) -> bool:
     """判 JSON 解析值是否含顶层 error 对象（OpenAI 错误 schema）。
     isinstance(parsed, dict) 且 isinstance(parsed.get("error"), dict) → True；
@@ -297,36 +307,48 @@ def body_has_error(parsed) -> bool:
     return isinstance(error_val, dict)
 
 
-def sse_line_has_usage(line: bytes) -> bool:
+def sse_line_has_usage(line: bytes, parsed=None) -> bool:
     """判 SSE data 行是否携带非空 usage 帧（独立 usage 帧 choices=[] 与 ride-on finish
-    帧都覆盖）；DONE/非 JSON/非 data 行 → False。"""
+    帧都覆盖）；DONE/非 JSON/非 data 行 → False。
+    parsed 非 None 时复用预解析结果跳过 json.loads；sentinel/None+解析失败 → False。"""
     stripped = line.rstrip(b"\r\n")
     if not stripped.startswith(b"data:") or DONE_RE.match(stripped):
         return False
-    try:
-        data = json.loads(stripped[5:].strip().decode("utf-8", "replace"))
-    except ValueError:
+    if parsed is _SSE_PARSE_FAILED:
         return False
+    if parsed is None:
+        try:
+            data = json.loads(stripped[5:].strip().decode("utf-8", "replace"))
+        except ValueError:
+            return False
+    else:
+        data = parsed
     if not isinstance(data, dict):
         return False
     usage = data.get("usage")
     return isinstance(usage, dict) and bool(usage)
 
 
-def sse_line_usage(line: bytes):
+def sse_line_usage(line: bytes, parsed=None):
     """返回 SSE data 行中的 usage dict，无 usage 帧返回 None。
 
     解析逻辑与 sse_line_has_usage 同序：非 data: 前缀/[DONE]/非 JSON/非 dict →
     None；usage 非空 dict → 返回该 dict；其余 → None。
     独立 usage 帧（choices=[]）与 ride-on finish 帧均覆盖。
+    parsed 非 None 时复用预解析结果跳过 json.loads；sentinel → None（同解析失败）。
     """
     stripped = line.rstrip(b"\r\n")
     if not stripped.startswith(b"data:") or DONE_RE.match(stripped):
         return None
-    try:
-        data = json.loads(stripped[5:].strip().decode("utf-8", "replace"))
-    except ValueError:
+    if parsed is _SSE_PARSE_FAILED:
         return None
+    if parsed is None:
+        try:
+            data = json.loads(stripped[5:].strip().decode("utf-8", "replace"))
+        except ValueError:
+            return None
+    else:
+        data = parsed
     if not isinstance(data, dict):
         return None
     usage = data.get("usage")
@@ -395,17 +417,22 @@ def sse_line_extract_usage(line: bytes):
     return usage_dict_tokens(usage)
 
 
-def sse_line_body_error(line: bytes) -> bool:
+def sse_line_body_error(line: bytes, parsed=None) -> bool:
     """判 SSE data 行是否为 body error 帧。rstrip → 非 data: 前缀或 [DONE] →
     False；json.loads ValueError → False（fail-open 同 sse_line_has_usage）；
-    否则 return body_has_error(data)。"""
+    否则 return body_has_error(data)。
+    parsed 非 None 时复用预解析结果跳过 json.loads；sentinel 经 body_has_error
+    非 dict 判定 → False（与原 ValueError→False 一致）。"""
     stripped = line.rstrip(b"\r\n")
     if not stripped.startswith(b"data:") or DONE_RE.match(stripped):
         return False
-    try:
-        data = json.loads(stripped[5:].strip().decode("utf-8", "replace"))
-    except ValueError:
-        return False
+    if parsed is None:
+        try:
+            data = json.loads(stripped[5:].strip().decode("utf-8", "replace"))
+        except ValueError:
+            return False
+    else:
+        data = parsed  # dict 或 sentinel；body_has_error 对非 dict 恒 False
     return body_has_error(data)
 
 
@@ -3173,17 +3200,34 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 line = resp.readline()
                 if line in (b"\n", b"\r\n", b""):
                     # b"\n"/b"\r\n" = record 终结；b"" = EOF（残留 record 同规则收尾）
-                    kinds = [sse_data_line_kind(buf_line) for buf_line in pending]
+                    # 预解析（D 单次解析）：每 data 行全程恰 1 次 json.loads，四消费者
+                    # 复用 pre_parsed；非 data/[DONE] 行存 None（helper 前缀分支自决，
+                    # 零 loads）；parse 失败存 _SSE_PARSE_FAILED（等价原 ValueError 路径）
+                    pre_parsed = []
+                    for buf_line in pending:
+                        stripped = buf_line.rstrip(b"\r\n")
+                        if not stripped.startswith(b"data:") or DONE_RE.match(stripped):
+                            pre_parsed.append(None)
+                            continue
+                        try:
+                            pre_parsed.append(json.loads(
+                                stripped[5:].strip().decode("utf-8", "replace")))
+                        except ValueError:
+                            pre_parsed.append(_SSE_PARSE_FAILED)
+                    kinds = [sse_data_line_kind(buf_line, parsed=pre_parsed[i])
+                             for i, buf_line in enumerate(pending)]
                     saw_done = saw_done or ("done" in kinds)
                     # TPM usage 捕获：本 record 内所有行取最后非空 usage 帧；
-                    # v2 P3 同循环顺手消费已解析 dict——零额外 json.loads（R1）
-                    for buf_line in pending:
-                        usage_hit = sse_line_usage(buf_line)
+                    # 复用预解析 dict（D）——全程每 data 行恰 1 次 json.loads（R1）
+                    for i, buf_line in enumerate(pending):
+                        usage_hit = sse_line_usage(buf_line, parsed=pre_parsed[i])
                         if usage_hit is not None:
                             self._tpm_usage = usage_hit
                             self._p3_usage_tokens = usage_dict_tokens(usage_hit)
                     if self._body_err_line is None:
-                        hit = next((l for l in pending if sse_line_body_error(l)), None)
+                        hit = next((l for i, l in enumerate(pending)
+                                    if sse_line_body_error(l, parsed=pre_parsed[i])),
+                                   None)
                         if hit is not None:
                             self._body_err_line = hit
                     if poisoned:
@@ -3196,7 +3240,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                         if pending or line:
                             self._relay_chunks += 1  # v2 P2：每非毒 record 计一 chunk（毒 record 已在 filtered 分支；纯 EOF 迭代不计——fix-loop-1）
                         if not saw_usage:
-                            saw_usage = any(sse_line_has_usage(l) for l in pending)
+                            saw_usage = any(sse_line_has_usage(l, parsed=pre_parsed[i])
+                                            for i, l in enumerate(pending))
                         if finish_hold:
                             hold_bytes += sum(len(l) for l in pending) + len(line)
                             if "content" in kinds:              # fail-open：finish 后反常 content

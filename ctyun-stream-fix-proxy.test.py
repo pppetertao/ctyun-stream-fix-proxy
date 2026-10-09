@@ -6227,15 +6227,17 @@ class RelaySseV3Test(unittest.TestCase):
         def getheaders(self):
             return [("Content-Type", "text/event-stream")]
 
-    def _drive(self, lines):
-        """统一驱动：STALL_THRESHOLD_S=0.0 下走完 [SSE_A, b"\\n", SSE_DONE, b"\\n"] 流。"""
+    def _drive(self, lines, final=True):
+        """统一驱动：STALL_THRESHOLD_S=0.0 下走完 [SSE_A, b"\\n", SSE_DONE, b"\\n"] 流。
+
+        final 可覆盖：空流计数测试用 final=False 触发 _EmptyStream 路径。"""
         mod = self.mod
         orig_thresh = mod.STALL_THRESHOLD_S
         try:
             mod.STALL_THRESHOLD_S = 0.0
             handler = self._StubHandler()
             resp = self._FakeSseResp(lines)
-            return (mod.ProxyHandler._relay_sse(handler, resp, final=True,
+            return (mod.ProxyHandler._relay_sse(handler, resp, final=final,
                                                 model="m1"), handler)
         finally:
             mod.STALL_THRESHOLD_S = orig_thresh
@@ -6316,6 +6318,77 @@ class RelaySseV3Test(unittest.TestCase):
         self.assertEqual(by_key["tokens_reasoning"], 1)
         # qwait 落 m2 环
         self.assertIn(8, list(mod.STATS["qwait_ms_by_model"].get("m2", [])))
+
+    def test_relay_sse_json_loads_once_per_data_line_normal(self) -> None:
+        """D：常态流每条 data 行全程恰 1 次 json.loads（mock 计数）。
+
+        修复前 kind/usage/body-error 三处消费各 1 次 + priming 期 has_usage
+        +1 = ≥3 次/行；修复后主循环预解析 1 次、四消费者复用 parsed。
+        本流含 content（首 record 触发 priming flush）+ usage + finish + done。"""
+        mod = self.mod
+        lines = [SSE_A, b"\n", SSE_USAGE, b"\n", SSE_FINISH, b"\n", SSE_DONE, b"\n"]
+        raw = b"".join(lines)
+        data_line_count = 0
+        # [DONE] 命中 DONE_RE 永不 parse，不计入可解析 data 行
+        for l in raw.split(b"\n"):
+            s = l.rstrip(b"\r\n")
+            if (s.startswith(b"data:")
+                    and not mod.DONE_RE.match(s)):
+                data_line_count += 1
+        self.assertEqual(data_line_count, 3)
+        with mock.patch.object(mod.json, "loads",
+                               wraps=mod.json.loads) as spy:
+            (filtered, truncated), handler = self._drive(lines)
+        self.assertEqual(filtered, 0)
+        self.assertFalse(truncated)
+        self.assertEqual(spy.call_count, data_line_count,
+                         "每条 data 行必须恰 1 次 json.loads（修复前本流 10 次）")
+        # 行为等价哨兵：usage 捕获与五元组抽取语义不变
+        self.assertEqual(handler._tpm_usage,
+                         {"prompt_tokens": 1, "completion_tokens": 1,
+                          "total_tokens": 2})
+        self.assertEqual(handler._p3_usage_tokens[:3], (1, 1, 2))
+
+    def test_relay_sse_json_loads_priming_finish_hold(self) -> None:
+        """D：priming 期 finish-hold 流每行恰 1 次 json.loads。
+
+        finish record 触发 finish_hold，尾段 usage 帧经 has_usage 判 saw_usage——
+        修复前 priming 期每行 kind+usage+body-error+has_usage 共 8 次；
+        修复后恰 2 次（2 条 data 行各 1 次）。"""
+        mod = self.mod
+        lines = [SSE_FINISH, b"\n", SSE_USAGE, b"\n"]
+        raw = b"".join(lines)
+        data_line_count = 0
+        # [DONE] 命中 DONE_RE 永不 parse，不计入可解析 data 行（同常态流口径）
+        for l in raw.split(b"\n"):
+            s = l.rstrip(b"\r\n")
+            if (s.startswith(b"data:")
+                    and not mod.DONE_RE.match(s)):
+                data_line_count += 1
+        self.assertEqual(data_line_count, 2)
+        with mock.patch.object(mod.json, "loads",
+                               wraps=mod.json.loads) as spy:
+            (filtered, truncated), handler = self._drive(lines)
+        self.assertEqual(filtered, 0)
+        self.assertFalse(truncated)
+        self.assertEqual(spy.call_count, data_line_count,
+                         "priming/finish-hold 期同样恰 1 次/行（修复前本流 8 次）")
+        self.assertEqual(handler._tpm_usage,
+                         {"prompt_tokens": 1, "completion_tokens": 1,
+                          "total_tokens": 2})
+
+    def test_relay_sse_json_loads_empty_stream_zero(self) -> None:
+        """D：空流（零 record，EOF 直入 _EmptyStream）解析次数为 0。
+
+        纯 EOF 迭代 pending 为空，预解析循环零迭代——守卫预解析不得引入
+        空流额外 loads。"""
+        mod = self.mod
+        with mock.patch.object(mod.json, "loads",
+                               wraps=mod.json.loads) as spy:
+            with self.assertRaises(mod._EmptyStream):
+                self._drive([], final=False)
+        self.assertEqual(spy.call_count, 0,
+                         "空流路径不得产生任何 json.loads 调用")
 
 
 class SettlePersistV3Test(unittest.TestCase):
