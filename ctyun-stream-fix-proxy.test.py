@@ -4001,6 +4001,102 @@ class AdminIntegrationTest(unittest.TestCase):
             json.dumps({"upstream_base": "http://127.0.0.1:%d" % upstream_port}).encode("utf-8"))
         self.assertEqual(status, 200)
 
+    def test_admin_get_read_gate_non_loopback(self) -> None:
+        """E3：CTYUN_ADMIN_TOKEN 已配时，非 loopback GET 读端点 无/错 token → 403、
+        对 token → 200（无/带/错三形态）；loopback 无 token → 200（读门禁直通）。"""
+        stop_proxy(self.proc)  # setUp 默认 127.0.0.1 绑定；本测需 0.0.0.0 + token，重建
+        stop_fake_upstreams()
+        upstream_port = make_fake_upstream(False)
+        self.proc = start_proxy(self.upstream_port, free_port(),
+                                extra_env={"CTYUN_ADMIN_HOST": "0.0.0.0",
+                                           "CTYUN_ADMIN_TOKEN": "sekret"})
+        # 本机候选地址枚举（gethostbyname_ex 不发包、不依赖默认路由——弃用 UDP
+        # connect 探测：VPN 全流量代理会把默认路由压在 TUN 段，取到的是黑洞地址），
+        # 按序过滤丢弃：
+        #   ① 127.0.0.0/8 loopback；② 169.254.0.0/16 链路本地；
+        #   ③ 198.18.0.0/15 —— VPN/TUN 默认路由基准段（RFC 2544 benchmarking 段），
+        #     对 0.0.0.0 监听是 TCP 黑洞：SYN 进 TUN 有去无回、只超时不拒绝，
+        #     连上它本用例恒红且无法 SkipTest（本卡执行期实测坑），必须显式排除。
+        try:
+            candidates = list(socket.gethostbyname_ex(socket.gethostname())[2])
+        except socket.gaierror:
+            # 吞 socket.gaierror（沙箱/离线机本机主机名不可解析）：枚举失败等价于
+            # 无候选、走末尾 skipTest；单测环境内无其他主机名解析路径可达。
+            candidates = []
+        candidates = [ip for ip in candidates
+                      if not ip.startswith("127.")
+                      and not ip.startswith("169.254.")
+                      and not (ip.startswith("198.18.") or ip.startswith("198.19."))]
+        lan_ip = None
+        for ip in candidates:  # 优先取私网段第一个（按枚举序）：192.168/16、10/8、172.16/12
+            if (ip.startswith("192.168.") or ip.startswith("10.")
+                    or (ip.startswith("172.") and 16 <= int(ip.split(".")[1]) <= 31)):
+                lan_ip = ip
+                break
+        if lan_ip is None:
+            self.skipTest("no routable LAN IP in sandbox")
+        # 无 token → 403
+        conn = http.client.HTTPConnection(lan_ip, self.proc.admin_port, timeout=10)
+        conn.request("GET", "/api/stats")
+        resp = conn.getresponse()
+        self.assertEqual(resp.status, 403)
+        resp.read()
+        conn.close()
+        # 错 token → 403
+        conn = http.client.HTTPConnection(lan_ip, self.proc.admin_port, timeout=10)
+        conn.request("GET", "/api/stats", headers={"X-Admin-Token": "wrong"})
+        resp = conn.getresponse()
+        self.assertEqual(resp.status, 403)
+        resp.read()
+        conn.close()
+        # 对 token → 200
+        conn = http.client.HTTPConnection(lan_ip, self.proc.admin_port, timeout=10)
+        conn.request("GET", "/api/stats", headers={"X-Admin-Token": "sekret"})
+        resp = conn.getresponse()
+        self.assertEqual(resp.status, 200)
+        resp.read()
+        conn.close()
+        # loopback 无 token → 200（admin_get 固定连 127.0.0.1，读门禁直通）
+        status, _, _ = admin_get(self.proc.admin_port, "/api/stats")
+        self.assertEqual(status, 200)
+
+    def test_admin_get_read_allowed_no_token_env(self) -> None:
+        """E3：未配 CTYUN_ADMIN_TOKEN 时读端点保持开放（loopback 200，不受门禁影响）。
+        非 loopback 行为不在此测（依赖网络拓扑），由 test_read_allowed_matrix 兜底。"""
+        stop_proxy(self.proc)
+        stop_fake_upstreams()
+        upstream_port = make_fake_upstream(False)
+        self.proc = start_proxy(self.upstream_port, free_port(),
+                                extra_env={"CTYUN_ADMIN_HOST": "0.0.0.0"})
+        status, _, _ = admin_get(self.proc.admin_port, "/api/stats")
+        self.assertEqual(status, 200)
+        status, _, _ = admin_get(self.proc.admin_port, "/api/health")
+        self.assertEqual(status, 200)
+
+    def test_startup_log_warns_exposure(self) -> None:
+        """E3：ADMIN_HOST 非 loopback 且未配 token → 启动 stderr 含 WARNING +
+        CTYUN_ADMIN_TOKEN 指引；loopback 绑定 → 不含 WARNING。"""
+        stop_proxy(self.proc)
+        stop_fake_upstreams()
+        upstream_port = make_fake_upstream(False)
+        self.proc = start_proxy(self.upstream_port, free_port(),
+                                extra_env={"CTYUN_ADMIN_HOST": "0.0.0.0"})
+        # stderr 异步 drain：轮询等 WARNING 行（同 test_listen_host_env_binds_lan while/else 模式）
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if "WARNING" in stderr_text(self.proc):
+                break
+            time.sleep(0.05)
+        else:
+            self.fail("0.0.0.0 绑定未配 token，stderr 未见暴露面 WARNING: %s"
+                      % stderr_text(self.proc))
+        self.assertIn("CTYUN_ADMIN_TOKEN", stderr_text(self.proc))
+        # 反例：loopback 绑定不告警（start_proxy 默认钉死 CTYUN_ADMIN_HOST=127.0.0.1）
+        stop_proxy(self.proc)
+        stop_fake_upstreams()
+        self.proc = start_proxy(self.upstream_port, free_port())
+        self.assertNotIn("WARNING", stderr_text(self.proc))
+
     def test_daily_bucket_via_sse_and_persist(self) -> None:
         today = time.strftime("%Y-%m-%d")
         post_sse(self.proxy_port)
