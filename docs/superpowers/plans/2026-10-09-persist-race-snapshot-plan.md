@@ -142,7 +142,8 @@ class PersistSingleWriterTest(unittest.TestCase):
         orig_source = mod._upstream_source
         try:
             mod.PERSIST_PATH = path
-            mod._record_request("POST", "/x", 200, 1.0, 0)
+            # 末参 filtered=1：_record_request :2392 按 filtered 增量，既有造数口径见测试 :1740/:1864/:1888
+            mod._record_request("POST", "/x", 200, 1.0, 1)
             self.assertGreaterEqual(mod.STATS["filtered_total"], 1)
             mod.save_stats_counters(path)
             with open(path, encoding="utf-8") as fh:
