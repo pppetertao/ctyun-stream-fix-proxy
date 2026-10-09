@@ -12,6 +12,7 @@
 import collections
 import hashlib
 import contextlib
+import glob
 import http.client
 import importlib.util
 import io
@@ -28,6 +29,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -6318,6 +6320,7 @@ class PersistSingleWriterTest(unittest.TestCase):
             with open(path, encoding="utf-8") as fh:
                 data = json.load(fh)
             self.assertIn("stats", data)
+            self.assertEqual(data["upstream_base"], "http://127.0.0.1:1/")
             self.assertEqual(data["stats"]["filtered_total"], filtered_before)
         finally:
             mod.PERSIST_PATH = orig_path
@@ -6369,9 +6372,9 @@ class PersistSingleWriterTest(unittest.TestCase):
             except Exception as exc:
                 errors.append(exc)
 
-        threads = [threading.Thread(target=sigterm_writer),
-                   threading.Thread(target=admin_toggle),
-                   threading.Thread(target=flush_writer)]
+        threads = [threading.Thread(target=sigterm_writer, daemon=True),
+                   threading.Thread(target=admin_toggle, daemon=True),
+                   threading.Thread(target=flush_writer, daemon=True)]
         try:
             for t in threads:
                 t.start()
@@ -6402,6 +6405,27 @@ class PersistSingleWriterTest(unittest.TestCase):
         finally:
             mod.PERSIST_PATH = orig_path
             mod.CAPTURE_ERRORS = orig_capture
+
+    def test_write_failure_cleans_tmp_and_propagates(self) -> None:
+        # 守护 save_stats_counters 写段失败语义：os.replace 失败时原异常向上抛
+        # （调用方 SIGTERM / set_* 语义不变），且 tmp 文件不留残留。
+        mod = self.mod
+        tmpdir = tempfile.mkdtemp(prefix="ctyun-psw-fail-")
+        self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
+        path = os.path.join(tmpdir, "settings.json")
+        orig_path = mod.PERSIST_PATH
+        mod.PERSIST_PATH = path
+        try:
+            with mock.patch("os.replace", side_effect=OSError("disk full")):
+                with self.assertRaises(OSError):
+                    mod.save_stats_counters(path)
+            self.assertEqual(glob.glob(os.path.join(tmpdir, "*.tmp*")), [])  # 无 tmp 残留
+            mod.save_stats_counters(path)  # 恢复后正常写
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+            self.assertIn("stats", data)
+        finally:
+            mod.PERSIST_PATH = orig_path
 
     def test_load_stats_counters_corrupt_or_missing_falls_back_to_zero(self) -> None:
         # 损坏/缺失回落全零（对齐既有 :1727-1732 口径）。

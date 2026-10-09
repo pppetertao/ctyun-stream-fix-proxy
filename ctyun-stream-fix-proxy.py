@@ -1749,18 +1749,25 @@ def save_stats_counters(path: str) -> None:
         if directory:
             os.makedirs(directory, exist_ok=True)
         tmp = "%s.tmp.%d" % (path, os.getpid())
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump({"upstream_base": base,
-                       "capture_errors": capture_enabled,
-                       "probe_enabled": probe_enabled,
-                       "model_pricing": MODEL_PRICING,
-                       "tpm_model_budgets": budgets,
-                       "tpm_body_err_samples": body_err_samples,
-                       "tpm_probe_results": probe_results,
-                       "stats": dict(counters, daily=daily, daily_by_model=daily_by_model,
-                                     daily_by_key=daily_by_key, events=events)},
-                      fh, ensure_ascii=False)
-        os.replace(tmp, path)
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump({"upstream_base": base,
+                           "capture_errors": capture_enabled,
+                           "probe_enabled": probe_enabled,
+                           "model_pricing": MODEL_PRICING,
+                           "tpm_model_budgets": budgets,
+                           "tpm_body_err_samples": body_err_samples,
+                           "tpm_probe_results": probe_results,
+                           "stats": dict(counters, daily=daily, daily_by_model=daily_by_model,
+                                         daily_by_key=daily_by_key, events=events)},
+                          fh, ensure_ascii=False)
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass  # replace 已成功时 tmp 不存在（FileNotFoundError）；清理失败时保留原异常优先
+            raise
 
 
 def _load_persist_file(path: str) -> dict:
