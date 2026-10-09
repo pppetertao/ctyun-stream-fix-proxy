@@ -474,7 +474,7 @@ class _TpmBucket(collections.deque):
 
 TPM_LOCK = threading.Condition()
 TPM_BUCKETS: dict = {}                 # (key_id, model) -> _TpmBucket（deque 条目 + 附加属性 .used）
-TPM_WAITERS: collections.deque = collections.deque()  # FIFO 排队（of _TpmWaiter）
+TPM_WAITERS: dict = {}  # (key_id, model) -> collections.deque[_TpmWaiter]；每桶独立 FIFO，空 deque 即删
 _tpm_rejected: dict = {}               # (key_id, model) -> queue-full 拒绝计数（快照用）
 _tpm_timeouts: dict = {}               # (key_id, model) -> queue-timeout 计数（快照用）
 
@@ -554,7 +554,7 @@ def _tpm_get_bucket(key_id: str, model):
             # 惰性驱逐：窗口空且无排队的桶（窗口自动过期，最旧优先）
             idle = [bkey for bkey, b in TPM_BUCKETS.items()
                     if b.used <= 0
-                    and not any((w.key_id, w.model) == bkey for w in TPM_WAITERS)]
+                    and bkey not in TPM_WAITERS]
             for bkey in idle:
                 del TPM_BUCKETS[bkey]
         bucket = _TpmBucket()
@@ -564,16 +564,22 @@ def _tpm_get_bucket(key_id: str, model):
 
 
 def _tpm_remove_waiter(waiter) -> None:
-    """把 waiter 从 TPM_WAITERS 中按**同一性**摘除（不在队列时为 no-op）。
+    """把 waiter 从其 (key_id, model) 桶队列按**同一性**摘除（不在队列时为 no-op）。
 
     必须同一性而非值相等删除：_TpmWaiter 是 namedtuple，值全等的两个 waiter
-    同队列时，deque.remove 会摘掉别人的那份（超时 waiter 误删仍在排队的请求）。
+    同队列时，值匹配删除会摘掉别人的那份（超时 waiter 误删仍在排队的请求）。
+    摘后桶队列空即删键（不变量：TPM_WAITERS 无空队列键）。
     仅可在持 TPM_LOCK 时调用。
     """
-    for i, w in enumerate(TPM_WAITERS):
+    q = TPM_WAITERS.get((waiter.key_id, waiter.model))
+    if q is None:
+        return
+    for i, w in enumerate(q):
         if w is waiter:
-            del TPM_WAITERS[i]
-            return
+            del q[i]
+            break
+    if not q:
+        del TPM_WAITERS[(waiter.key_id, waiter.model)]
 
 
 def tpm_admit(key_id: str, est: int, model):
@@ -588,10 +594,10 @@ def tpm_admit(key_id: str, est: int, model):
       放行（超大请求占满窗口，后续排队至窗口滚过属预期）；否则 ("full", 0)
       并计 rejected（先 touch 建桶，拒绝计数可见）。
     - 窗口内充足 → 入桶 ("ok", 0)。
-    - 否则入队 FIFO；仅队首 waiter 可被准入（严格 FIFO 防惊群）；
+    - 否则入本桶 FIFO；仅本桶队首 waiter 可被准入（按桶 FIFO 防惊群，桶间互不阻塞）；
       wait 循环 TPM_LOCK.wait(timeout=min(1.0, remaining)) + deadline 检查
       （窗口过期靠 1s 粒度轮询，settle 时 notify_all 提前唤醒）。
-    - 队满（len(TPM_WAITERS) >= TPM_QUEUE_MAX）→ ("full", 0) 不入队。
+    - 队满（本桶排队数 >= TPM_QUEUE_MAX，按桶上限）→ ("full", 0) 不入队。
     - deadline 到仍未准入 → ("timeout", 0) 并自队列移除。
     排队期间不持有任何上游连接（hook 点在 _open_upstream 之前）。
     """
@@ -607,8 +613,7 @@ def tpm_admit(key_id: str, est: int, model):
         if est > budget:
             # 超大请求唯一例外：窗口空闲（used<=0）且无同桶排队 → 放行（决策 3）；
             # 否则硬拒并计 rejected（决策 4：先 touch 建桶，拒绝计数可见）。
-            if bucket.used <= 0 and not any(
-                    (w.key_id, w.model) == (key_id, model) for w in TPM_WAITERS):
+            if bucket.used <= 0 and not TPM_WAITERS.get((key_id, model)):
                 bucket.append((started, est))
                 bucket.used += est
                 return ("ok", 0)
@@ -619,13 +624,13 @@ def tpm_admit(key_id: str, est: int, model):
             bucket.append((started, est))
             bucket.used += est
             return ("ok", 0)
-        if len(TPM_WAITERS) >= TPM_QUEUE_MAX:
+        if len(TPM_WAITERS.get((key_id, model), ())) >= TPM_QUEUE_MAX:
             _tpm_rejected[(key_id, model)] = \
                 _tpm_rejected.get((key_id, model), 0) + 1
             return ("full", 0)
         waiter = _TpmWaiter(key_id=key_id, est=est, enqueued_at=started,
                             model=model)
-        TPM_WAITERS.append(waiter)
+        TPM_WAITERS.setdefault((key_id, model), collections.deque()).append(waiter)
         deadline = started + TPM_QUEUE_TIMEOUT_S
         try:
             while True:
@@ -634,13 +639,16 @@ def tpm_admit(key_id: str, est: int, model):
                     _tpm_timeouts[(key_id, model)] = \
                         _tpm_timeouts.get((key_id, model), 0) + 1
                     return ("timeout", 0)
-                head = TPM_WAITERS[0] if TPM_WAITERS else None
+                q = TPM_WAITERS.get((key_id, model))
+                head = q[0] if q else None
                 if head is waiter:
                     now = time.time()
                     bucket = _tpm_get_bucket(key_id, model)
                     _tpm_prune(bucket, now)
                     if bucket.used + est <= budget:
-                        TPM_WAITERS.popleft()
+                        q.popleft()
+                        if not q:
+                            del TPM_WAITERS[(key_id, model)]
                         bucket.append((now, est))
                         bucket.used += est
                         return ("ok", (now - started) * 1000)
@@ -701,8 +709,7 @@ def tpm_snapshot() -> dict:
         buckets = []
         for (key_id, model), bucket in TPM_BUCKETS.items():
             _tpm_prune(bucket, now)
-            if bucket.used <= 0 and not any(
-                    (w.key_id, w.model) == (key_id, model) for w in TPM_WAITERS) \
+            if bucket.used <= 0 and not TPM_WAITERS.get((key_id, model)) \
                     and not _tpm_rejected.get((key_id, model)) \
                     and not _tpm_timeouts.get((key_id, model)):
                 continue  # 空桶不展示（噪声）；有拒绝/超时计数的桶保留（观测价值）
@@ -711,8 +718,7 @@ def tpm_snapshot() -> dict:
                 "model": model,
                 "used": max(0, bucket.used),
                 "remaining": max(0, tpm_limit_for(model) - bucket.used),
-                "queued": sum(1 for w in TPM_WAITERS
-                              if (w.key_id, w.model) == (key_id, model)),
+                "queued": len(TPM_WAITERS.get((key_id, model), ())),
                 "rejected": _tpm_rejected.get((key_id, model), 0),
                 "timeouts": _tpm_timeouts.get((key_id, model), 0),
             })
@@ -724,7 +730,7 @@ def tpm_snapshot() -> dict:
                 "model_budgets": dict(TPM_MODEL_BUDGETS),
                 "enabled_models": sorted(TPM_MODEL_BUDGETS.keys()),
             },
-            "queue_total": len(TPM_WAITERS),
+            "queue_total": sum(len(q) for q in TPM_WAITERS.values()),
             "buckets": buckets,
         }
 

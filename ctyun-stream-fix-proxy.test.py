@@ -1331,6 +1331,83 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         self.assertEqual(len(mod.TPM_WAITERS), 0)
         self._tpm_cleanup(mod)
 
+    def test_tpm_per_bucket_fifo_no_cross_bucket_block(self) -> None:
+        mod = self.mod
+        self._tpm_cleanup(mod)
+        mod.TPM_MODEL_BUDGETS["m:cross"] = mod.TPM_LIMIT
+        mod.TPM_QUEUE_TIMEOUT_S = 3.0
+        try:
+            mod.tpm_admit("key:A", mod.TPM_LIMIT, "m:cross")  # 桶A 占满预算
+            mod.tpm_admit("key:B", mod.TPM_LIMIT, "m:cross")  # 桶B 占满预算
+            results = {}
+            ta = threading.Thread(target=lambda: results.setdefault(
+                "A2", mod.tpm_admit("key:A", 10, "m:cross")))
+            ta.start()
+            time.sleep(0.3)  # 结构性断言兜底（下两行），非 sleep 猜时序
+            self.assertEqual(sum(len(q) for q in mod.TPM_WAITERS.values()), 1,
+                             "A2 must be enqueued (bucket A full)")
+            tb = threading.Thread(target=lambda: results.setdefault(
+                "B1", mod.tpm_admit("key:B", 10, "m:cross")))
+            tb.start()
+            time.sleep(0.3)
+            self.assertEqual(sum(len(q) for q in mod.TPM_WAITERS.values()), 2,
+                             "B1 must be enqueued (bucket B full)")
+            mod.tpm_settle("key:B", mod.TPM_LIMIT, 0, "m:cross")  # 只释放 B
+            tb.join(timeout=2)
+            self.assertFalse(tb.is_alive(), "B1 must admit without waiting for A2")
+            self.assertEqual(results["B1"][0], "ok")
+            self.assertLess(results["B1"][1] / 1000.0, 1.5,
+                            "B1 qwait must not be dragged by bucket A head "
+                            "(pre-fix: ~2.7s = A2 full timeout)")
+            mod.tpm_settle("key:A", mod.TPM_LIMIT, 0, "m:cross")  # 收尾释放 A
+            ta.join(timeout=5)
+            self.assertFalse(ta.is_alive())
+            self.assertEqual(results["A2"][0], "ok")
+        finally:
+            mod.TPM_QUEUE_TIMEOUT_S = 120
+            self._tpm_cleanup(mod)
+
+    def test_tpm_queue_full_per_bucket(self) -> None:
+        """队满按桶：QUEUE_MAX=2 时桶A 队满→同桶第 3 个立即 full 且计 rejected；
+        桶B（已占满预算）首个排队请求不受桶A 队满影响——照常入队并在 settle 后准入。
+        （修复前全局 cap：桶A 的 2 个假 waiter 占满全局队列，桶B 请求直接 "full"。）"""
+        mod = self.mod
+        self._tpm_cleanup(mod)
+        mod.TPM_MODEL_BUDGETS["m:pf"] = mod.TPM_LIMIT
+        mod.TPM_QUEUE_MAX = 2
+        mod.TPM_QUEUE_TIMEOUT_S = 5.0
+        try:
+            mod.tpm_admit("key:A", mod.TPM_LIMIT, "m:pf")  # 桶A 占满预算
+            # 桶A 预插 2 个假 waiter（同 test_tpm_admit_queue_full 手法，QUEUE_MAX=2）
+            with mod.TPM_LOCK:
+                qA = mod.TPM_WAITERS.setdefault(("key:A", "m:pf"),
+                                                collections.deque())
+                qA.append(mod._TpmWaiter("key:A", 1, 0, "m:pf"))
+                qA.append(mod._TpmWaiter("key:A", 1, 0, "m:pf"))
+            # 同桶第 3 个：队满立即 full + rejected 计数
+            status3, qwait3 = mod.tpm_admit("key:A", 1, "m:pf")
+            self.assertEqual(status3, "full")
+            self.assertEqual(qwait3, 0)
+            self.assertEqual(mod._tpm_rejected.get(("key:A", "m:pf")), 1)
+            # 桶B 占满预算；其首个排队请求必须入本桶队列，而非被桶A 队满连坐 429
+            mod.tpm_admit("key:B", mod.TPM_LIMIT, "m:pf")
+            results = {}
+            tb = threading.Thread(target=lambda: results.setdefault(
+                "B1", mod.tpm_admit("key:B", 10, "m:pf")))
+            tb.start()
+            time.sleep(0.3)  # 结构性断言兜底（下两行），非 sleep 猜时序
+            self.assertTrue(tb.is_alive(), "B1 must queue, not be rejected full")
+            self.assertEqual(len(mod.TPM_WAITERS.get(("key:B", "m:pf"), ())), 1,
+                             "B1 must be enqueued in its own bucket")
+            mod.tpm_settle("key:B", mod.TPM_LIMIT, 0, "m:pf")  # 全额退款释放 B
+            tb.join(timeout=5)
+            self.assertFalse(tb.is_alive())
+            self.assertEqual(results["B1"][0], "ok")
+        finally:
+            mod.TPM_QUEUE_MAX = 20
+            mod.TPM_QUEUE_TIMEOUT_S = 120
+            self._tpm_cleanup(mod)
+
     def test_tpm_snapshot_shape_and_masking(self) -> None:
         mod = self.mod
         self._tpm_cleanup(mod)
