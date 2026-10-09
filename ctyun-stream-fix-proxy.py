@@ -2733,11 +2733,25 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
     def do_PATCH(self) -> None:
         self._proxy()
 
+    def do_HEAD(self) -> None:
+        self._proxy()
+
+    def do_OPTIONS(self) -> None:
+        self._proxy()
+
     def log_message(self, format: str, *args: object) -> None:
         # 吞掉的是 BaseHTTPRequestHandler 默认访问日志行（send_response 每请求触发一次）：
         # spec 固定单行日志由 _log 输出，默认行属重复噪音。handler 内异常 traceback 走
         # socketserver.handle_error 直接打 stderr，不经本方法，不会被吞。
         pass
+
+    def _diag_log(self) -> None:
+        # 请求入口诊断行：与 _log 的 REQ 行配对（每请求 DIAG IN → REQ 两行），消除
+        # 异常路径与无 handler 方法之外的观察盲区。字段仅 method/path/客户端 IP/rid，
+        # 不含 Authorization、body 等敏感信息；经 _safe_log_stderr 同 print+LOG_RING 通道。
+        _safe_log_stderr("DIAG IN %s %s from=%s rid=%s"
+                         % (self.command, self.path, self.client_address[0],
+                            getattr(self, "_req_id", "-")))
 
     def _proxy(self) -> None:
         started = time.time()
@@ -2750,6 +2764,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             upstream_host = urllib.parse.urlparse(UPSTREAM_BASE).netloc
         self._req_id = rid
         self._upstream_host = upstream_host
+        self._diag_log()
         try:
             self._proxy_relay(started)
         except (ConnectionError, socket.timeout):
@@ -2766,6 +2781,15 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                             (time.time() - started) * 1000, 0, model=None,
                             rid=self._req_id, upstream_host=self._upstream_host,
                             outcome=outcome)
+        except Exception as exc:
+            # 捕获的是 relay 阶段非连接类异常（BadStatusLine/AttributeError 等）：旧行为
+            # 直接漏到 socketserver.handle_error 只打 traceback、REQ 行缺失形成观察盲区。
+            # 此处先落 REQ 行（499 沿用 nginx "未正常 relay 完成"语义）再重抛——栈不吞，
+            # traceback 仍由 handle_error 输出，errors_total 口径不变（不计）。
+            self._log(started, 499, "proxy-error", 0,
+                      rid=self._req_id, upstream_host=self._upstream_host,
+                      exc=exc)
+            raise
         finally:
             with STATS_LOCK:
                 STATS["active"] -= 1
