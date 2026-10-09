@@ -1214,13 +1214,15 @@ class ProxyDashboardUnitTest(unittest.TestCase):
             mod.tpm_admit("key:qfull", mod.TPM_LIMIT, "m:qfull")  # 占满预算
             # 两个 waiter 已在队（绕过 wait 循环用私有结构直接入队，验证队满拒绝分支）
             with mod.TPM_LOCK:
-                mod.TPM_WAITERS.append(mod._TpmWaiter("key:qfull", 1, 0, "m:qfull"))
-                mod.TPM_WAITERS.append(mod._TpmWaiter("key:qfull", 1, 0, "m:qfull"))
+                q = mod.TPM_WAITERS.setdefault(("key:qfull", "m:qfull"),
+                                               collections.deque())
+                q.append(mod._TpmWaiter("key:qfull", 1, 0, "m:qfull"))
+                q.append(mod._TpmWaiter("key:qfull", 1, 0, "m:qfull"))
             status3, qwait3 = mod.tpm_admit("key:qfull", 1, "m:qfull")
             self.assertEqual(status3, "full")
             self.assertEqual(qwait3, 0)
             self.assertEqual(mod._tpm_rejected.get(("key:qfull", "m:qfull")), 1)
-            self.assertEqual(len(mod.TPM_WAITERS), 2)  # 第三个未入队
+            self.assertEqual(len(q), 2)  # 第三个未入队
         finally:
             mod.TPM_QUEUE_MAX = 20
             self._tpm_cleanup(mod)
@@ -1276,7 +1278,7 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         t = threading.Thread(target=waiter)
         t.start()
         time.sleep(0.2)  # 给 waiter 入队时间（确定性：settle 后立即 notify）
-        self.assertEqual(len(mod.TPM_WAITERS), 1)
+        self.assertEqual(sum(len(q) for q in mod.TPM_WAITERS.values()), 1)
         mod.tpm_settle("key:wake", mod.TPM_LIMIT, 0, "m:wake")  # 全额退款唤醒
         t.join(timeout=5)
         self.assertFalse(t.is_alive())
@@ -1314,21 +1316,22 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         w2 = mod._TpmWaiter("k", 10, 123.5, "m:ident")
         self.assertEqual(w1, w2)      # namedtuple 值相等
         self.assertIsNot(w1, w2)      # 但非同一对象
-        mod.TPM_WAITERS.append(w1)
-        mod.TPM_WAITERS.append(w2)
+        q = mod.TPM_WAITERS.setdefault(("k", "m:ident"), collections.deque())
+        q.append(w1)
+        q.append(w2)
         # 值相等实现（deque.remove(waiter)）在摘 w2 时会误删队首 w1 —— 本用例必红。
         with mod.TPM_LOCK:
             mod._tpm_remove_waiter(w2)
-        self.assertEqual(len(mod.TPM_WAITERS), 1,
+        self.assertEqual(len(q), 1,
                          "identity removal must drop exactly one entry, got %d"
-                         % len(mod.TPM_WAITERS))
-        self.assertTrue(any(w is w1 for w in mod.TPM_WAITERS),
+                         % len(q))
+        self.assertTrue(any(w is w1 for w in q),
                         "head twin w1 must survive removal of w2")
-        self.assertFalse(any(w is w2 for w in mod.TPM_WAITERS),
+        self.assertFalse(any(w is w2 for w in q),
                          "removed waiter w2 must be gone from the queue")
         with mod.TPM_LOCK:
             mod._tpm_remove_waiter(w1)
-        self.assertEqual(len(mod.TPM_WAITERS), 0)
+        self.assertEqual(len(q), 0)
         self._tpm_cleanup(mod)
 
     def test_tpm_per_bucket_fifo_no_cross_bucket_block(self) -> None:
