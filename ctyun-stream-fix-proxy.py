@@ -1440,9 +1440,10 @@ STRIP_HEADERS = HOP_HEADERS | {"host", "content-length", "accept-encoding"}
 _CFG_LOCK = threading.Lock()
 PROBE_LOCK = threading.Lock()
 STATS_LOCK = threading.Lock()
-# E1-A 持久化单写者锁：必须 RLock——SIGTERM 处理器 _on_signal 在 main 线程执行，
-# 若恰逢 main 线程正持锁跑 save_stats_counters 写段（如启动迁移），同线程重入
-# 需放行，普通 Lock 自死锁挂死退出路径；RLock 同线程重入安全，跨线程互斥不变。
+# E1-A 持久化单写者锁。RLock 为防御选型：_on_signal 在 main 线程执行，而信号可在
+# 任意字节码边界打断 main 线程；当前 main 线程注册信号后只进 serve_forever（:5607），
+# 同线程重入暂无现实路径，但 main 线程一旦新增 save_stats_counters 调用路径，普通
+# Lock 会自死锁挂死退出路径，RLock 则同线程重入安全（跨线程互斥语义不变）。
 # 锁序纪律：_PERSIST_LOCK 只包写段；持锁块内禁取 STATS_LOCK/_CFG_LOCK/TPM_LOCK；
 # copy 阶段两段锁不并入本锁。
 _PERSIST_LOCK = threading.RLock()
