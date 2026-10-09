@@ -6503,6 +6503,33 @@ class SnapshotV3Test(unittest.TestCase):
         finally:
             mod.STATS["ttfb_hist"] = orig
 
+    def test_snapshot_v3_hist_keys_are_frozen(self) -> None:
+        # E1-B：5 个直方图键写回冻结副本，响应内不再混合快照+活读。
+        # 造数：_record_request(model="m", ttfb_ms=120.0) → STATS["ttfb_hist"]["m"]
+        # 第 2 桶（bisect_right(HIST_BUCKETS_MS, 120.0)=1）+1。
+        mod = self.mod
+        orig_hist = mod.STATS["ttfb_hist"]
+        orig_rates = mod.STATS["rates"]
+        mod.STATS["ttfb_hist"] = {}
+        try:
+            mod._record_request("POST", "/t", 200, 1.0, 0, model="m", ttfb_ms=120.0)
+            snap = mod.stats_snapshot()
+            for key in ("ttfb_hist", "phase_ms", "phase_ms_by_model",
+                        "stalls_by_model", "rates"):
+                self.assertIsNot(snap[key], mod.STATS[key],
+                                 "%s 仍是活引用，未写回冻结副本" % key)
+            self.assertEqual(snap["ttfb_hist"]["m"],
+                             list(mod.STATS["ttfb_hist"]["m"]))
+            baseline_bytes = mod.STATS["rates"]["bytes_out_total"]
+            baseline_bucket0 = mod.STATS["ttfb_hist"]["m"][0]
+            snap["rates"]["bytes_out_total"] += 999
+            snap["ttfb_hist"]["m"][0] += 1
+            self.assertEqual(mod.STATS["rates"]["bytes_out_total"], baseline_bytes)
+            self.assertEqual(mod.STATS["ttfb_hist"]["m"][0], baseline_bucket0)
+        finally:
+            mod.STATS["ttfb_hist"] = orig_hist
+            mod.STATS["rates"] = orig_rates
+
     def test_daily_by_key_snapshot_is_deep_copy(self) -> None:
         mod = self.mod
         orig = mod.STATS["daily_by_key"]
