@@ -1441,7 +1441,7 @@ _CFG_LOCK = threading.Lock()
 PROBE_LOCK = threading.Lock()
 STATS_LOCK = threading.Lock()
 # E1-A 持久化单写者锁。RLock 为防御选型：_on_signal 在 main 线程执行，而信号可在
-# 任意字节码边界打断 main 线程；当前 main 线程注册信号后只进 serve_forever（:5607），
+# 任意字节码边界打断 main 线程；当前 main 线程注册信号后只进 serve_forever（:5608），
 # 同线程重入暂无现实路径，但 main 线程一旦新增 save_stats_counters 调用路径，普通
 # Lock 会自死锁挂死退出路径，RLock 则同线程重入安全（跨线程互斥语义不变）。
 # 锁序纪律：_PERSIST_LOCK 只包写段；持锁块内禁取 STATS_LOCK/_CFG_LOCK/TPM_LOCK；
