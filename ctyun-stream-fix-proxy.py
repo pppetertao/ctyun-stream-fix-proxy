@@ -1440,6 +1440,12 @@ STRIP_HEADERS = HOP_HEADERS | {"host", "content-length", "accept-encoding"}
 _CFG_LOCK = threading.Lock()
 PROBE_LOCK = threading.Lock()
 STATS_LOCK = threading.Lock()
+# E1-A 持久化单写者锁：必须 RLock——SIGTERM 处理器 _on_signal 在 main 线程执行，
+# 若恰逢 main 线程正持锁跑 save_stats_counters 写段（如启动迁移），同线程重入
+# 需放行，普通 Lock 自死锁挂死退出路径；RLock 同线程重入安全，跨线程互斥不变。
+# 锁序纪律：_PERSIST_LOCK 只包写段；持锁块内禁取 STATS_LOCK/_CFG_LOCK/TPM_LOCK；
+# copy 阶段两段锁不并入本锁。
+_PERSIST_LOCK = threading.RLock()
 STATS = {"requests_total": 0, "filtered_total": 0, "errors_total": 0,
          "empty_retries_total": 0, "eof_without_done_total": 0,
          "finish_retries_total": 0, "header_retries_total": 0,
@@ -1519,25 +1525,6 @@ def resolve_upstream_base(env_base: str, persist_path: str) -> tuple:
         if isinstance(base, str) and valid_upstream_url(base):
             return base, "file"
     return DEFAULT_UPSTREAM_BASE, "default"
-
-
-def persist_upstream(base: str, path: str, capture_errors: bool = False,
-                     tpm_model_budgets: dict = None) -> None:
-    """持久化上游端点 + capture_errors + tpm_model_budgets（窄出口原子替换）。
-
-    注意：本函数不持 _CFG_LOCK——调用方（set_upstream_base / set_capture_errors /
-    set_tpm_model_budgets）在各自的 _CFG_LOCK 区内调用，由调用方保证 TPM_MODEL_BUDGETS
-    读一致性。避免嵌套获取非重入锁的死锁（决策：_CFG_LOCK 是 threading.Lock）。
-    """
-    directory = os.path.dirname(path)
-    if directory:
-        os.makedirs(directory, exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump({"upstream_base": base, "capture_errors": capture_errors,
-                   "tpm_model_budgets": tpm_model_budgets or {}},
-                  fh, ensure_ascii=False)
-    os.replace(tmp, path)  # 同目录原子替换，读侧不会见到半截文件
 
 
 def extract_model(body):
@@ -1756,22 +1743,23 @@ def save_stats_counters(path: str) -> None:
                             for m, items in PERSISTED_BODY_ERR_SAMPLES.items()}
         probe_results = {m: [dict(r) for r in items]
                          for m, items in PROBE_RESULTS.items()}
-    directory = os.path.dirname(path)
-    if directory:
-        os.makedirs(directory, exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump({"upstream_base": base,
-                   "capture_errors": capture_enabled,
-                   "probe_enabled": probe_enabled,
-                   "model_pricing": MODEL_PRICING,
-                   "tpm_model_budgets": budgets,
-                   "tpm_body_err_samples": body_err_samples,
-                   "tpm_probe_results": probe_results,
-                   "stats": dict(counters, daily=daily, daily_by_model=daily_by_model,
-                                 daily_by_key=daily_by_key, events=events)},
-                  fh, ensure_ascii=False)
-    os.replace(tmp, path)
+    with _PERSIST_LOCK:
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        tmp = "%s.tmp.%d" % (path, os.getpid())
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"upstream_base": base,
+                       "capture_errors": capture_enabled,
+                       "probe_enabled": probe_enabled,
+                       "model_pricing": MODEL_PRICING,
+                       "tpm_model_budgets": budgets,
+                       "tpm_body_err_samples": body_err_samples,
+                       "tpm_probe_results": probe_results,
+                       "stats": dict(counters, daily=daily, daily_by_model=daily_by_model,
+                                     daily_by_key=daily_by_key, events=events)},
+                      fh, ensure_ascii=False)
+        os.replace(tmp, path)
 
 
 def _load_persist_file(path: str) -> dict:
@@ -2333,8 +2321,6 @@ def set_upstream_base(base: str) -> None:
     with _CFG_LOCK:
         UPSTREAM_BASE = base
         _upstream_source = "api"
-        persist_upstream(base, PERSIST_PATH, capture_errors=CAPTURE_ERRORS,
-                         tpm_model_budgets=TPM_MODEL_BUDGETS)
     # save_stats_counters 内部也要拿 _CFG_LOCK：必须在锁外调用，否则同线程
     # 非重入死锁（admin 线程挂死且 SIGTERM 退出时同样卡锁）。
     save_stats_counters(PERSIST_PATH)
@@ -2344,8 +2330,6 @@ def set_capture_errors(enabled: bool) -> None:
     global CAPTURE_ERRORS
     with _CFG_LOCK:
         CAPTURE_ERRORS = enabled
-        persist_upstream(UPSTREAM_BASE, PERSIST_PATH, capture_errors=enabled,
-                         tpm_model_budgets=TPM_MODEL_BUDGETS)
     # save_stats_counters 内部也要拿 _CFG_LOCK：必须在锁外调用（同 :449-451 死锁注释）
     save_stats_counters(PERSIST_PATH)
 
@@ -2354,8 +2338,6 @@ def set_tpm_model_budgets(budgets: dict) -> None:
     global TPM_MODEL_BUDGETS
     with _CFG_LOCK:
         TPM_MODEL_BUDGETS = dict(budgets)
-        persist_upstream(UPSTREAM_BASE, PERSIST_PATH, capture_errors=CAPTURE_ERRORS,
-                         tpm_model_budgets=TPM_MODEL_BUDGETS)
     # save_stats_counters 内部也要拿 _CFG_LOCK：必须在锁外调用（同 :1335-1337 死锁注释）
     save_stats_counters(PERSIST_PATH)
 
