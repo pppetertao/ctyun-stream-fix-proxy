@@ -86,9 +86,15 @@ new_string：
         本流含 content（首 record 触发 priming flush）+ usage + finish + done。"""
         mod = self.mod
         lines = [SSE_A, b"\n", SSE_USAGE, b"\n", SSE_FINISH, b"\n", SSE_DONE, b"\n"]
-        data_line_count = sum(
-            1 for l in lines if l.rstrip(b"\r\n").startswith(b"data:"))
-        self.assertEqual(data_line_count, 4)
+        raw = b"".join(lines)
+        data_line_count = 0
+        # [DONE] 命中 DONE_RE 永不 parse，不计入可解析 data 行
+        for l in raw.split(b"\n"):
+            s = l.rstrip(b"\r\n")
+            if (s.startswith(b"data:")
+                    and not mod.DONE_RE.match(s)):
+                data_line_count += 1
+        self.assertEqual(data_line_count, 3)
         with mock.patch.object(mod.json, "loads",
                                wraps=mod.json.loads) as spy:
             (filtered, truncated), handler = self._drive(lines)
@@ -110,8 +116,14 @@ new_string：
         修复后恰 2 次（2 条 data 行各 1 次）。"""
         mod = self.mod
         lines = [SSE_FINISH, b"\n", SSE_USAGE, b"\n"]
-        data_line_count = sum(
-            1 for l in lines if l.rstrip(b"\r\n").startswith(b"data:"))
+        raw = b"".join(lines)
+        data_line_count = 0
+        # [DONE] 命中 DONE_RE 永不 parse，不计入可解析 data 行（同常态流口径）
+        for l in raw.split(b"\n"):
+            s = l.rstrip(b"\r\n")
+            if (s.startswith(b"data:")
+                    and not mod.DONE_RE.match(s)):
+                data_line_count += 1
         self.assertEqual(data_line_count, 2)
         with mock.patch.object(mod.json, "loads",
                                wraps=mod.json.loads) as spy:
@@ -141,7 +153,7 @@ new_string：
 class SettlePersistV3Test(unittest.TestCase):
 ```
 
-**依赖事实**（已实测）：`from unittest import mock` 已在测试文件 :32；`SSE_A`/:38、`SSE_DONE`/:41、`SSE_FINISH`/:44、`SSE_USAGE`/:45 为模块级常量；`mod._EmptyStream` 为源模块 :1424 顶层类。
+**依赖事实**（已实测）：`from unittest import mock` 已在测试文件 :32；`SSE_A`/:38、`SSE_DONE`/:41、`SSE_FINISH`/:44、`SSE_USAGE`/:45 为模块级常量；`mod._EmptyStream` 为源模块 :1424 顶层类；`mod.DONE_RE` 为源模块 :58 模块级正则（`^data:\s*\[DONE\]\s*$`，已实测命中 `data: [DONE]`）。
 
 **验证（红，预期输出）**：
 ```
@@ -149,14 +161,14 @@ $ /usr/bin/python3 ctyun-stream-fix-proxy.test.py RelaySseV3Test
 ...
 FAIL: test_relay_sse_json_loads_once_per_data_line_normal (__main__.RelaySseV3Test)
 AssertionError: 每条 data 行必须恰 1 次 json.loads（修复前本流 10 次）
-10 != 4
+10 != 3
 FAIL: test_relay_sse_json_loads_priming_finish_hold (__main__.RelaySseV3Test)
 AssertionError: priming/finish-hold 期同样恰 1 次/行（修复前本流 8 次）
 8 != 2
 Ran 8 tests in ...s
 FAILED (failures=2)
 ```
-（`test_relay_sse_json_loads_empty_stream_zero` 修复前后均 0 次 = 绿，属回归守卫；其余 5 个既有测试保持绿。**若红值不是 10/8 或失败数不是 2 → STOP 报告主代理，不得继续卡 2。**）
+（`test_relay_sse_json_loads_empty_stream_zero` 修复前后均 0 次 = 绿，属回归守卫；其余 5 个既有测试保持绿。红值口径：断言目标是"可解析 data 行"数——常态流 4 条 data 前缀行中 `data: [DONE]` 命中 DONE_RE 永不 parse，不计入，绿值为 3（修复前 10 != 3）；finish-hold 流无 [DONE]，绿值 2（修复前 8 != 2）。**若红值不是 10/8 或失败数不是 2 → STOP 报告主代理，不得继续卡 2。**）
 
 Exit code: 1（unittest 有 failure 时的正常退出码，此为预期红）。
 
@@ -555,9 +567,10 @@ Exit code: 0（35 = 卡 2 的 34 + 本卡新测试 1；BodyErrorTest 5 用例端
 1. **spec coverage**：spec Files 1-4（四 helper `parsed` 参数）→ Edit 2.2/2.5/2.6/2.7；spec 5（sentinel）→ Edit 2.1；spec 6（_relay_sse 预解析 + 四处消费者）→ Edit 2.8/2.9；spec 7（死守卫）→ Edit 3.2；spec 8（解析计数测试三流）→ Edit 1.1/1.2；spec 9（既有矩阵/UsageExtract 零改）→ Global Constraint 2 + 卡 2/卡 3 定向回归命令。Acceptance 1→卡 3 绿 + whole-branch 留全量；AC2→卡 1 三测试；AC3→Edit 3.1 断言 + BodyErrorTest；AC4→卡 1 等价哨兵断言 + 卡 2 回归 34 绿。全覆盖，无遗漏。
 2. **placeholder scan**：三卡全部 Edit 均为完整 old/new 代码对，无 "略"/"同上"/伪码；0 命中。
 3. **type consistency**：`pre_parsed: list[dict | None | object]`，与四 helper `parsed=None` 默认参数、`_SSE_PARSE_FAILED = object()` 的 `is` 判定一致；`mod._EmptyStream`（源 :1424 顶层类）、`mod.json`、`from unittest import mock`（测试 :32）、`inspect.getsource` 对 importlib 载入模块可用——均已现场实测（一次性脚本实跑通过，含 mock.patch.object 拦截计数）。
-4. **可落盘性**：所有 old_string 均为当前 worktree 文件逐字摘录（本 session Read/grep 实测）；唯一性已逐条核对（各 helper 签名全文唯一；各解析块以独特尾行锚定；`_drive`/测试插入点/`_proxy_relay` guard 锚点唯一）；验证命令三条均已在本机实跑过等价形式（26 tests OK / BodyErrorTest 5 OK / 红值 10 与 8 实测）。
+4. **可落盘性**：所有 old_string 均为当前 worktree 文件逐字摘录（本 session Read/grep 实测）；唯一性已逐条核对（各 helper 签名全文唯一；各解析块以独特尾行锚定；`_drive`/测试插入点/`_proxy_relay` guard 锚点唯一）；验证命令三条均已在本机实跑过等价形式（26 tests OK / BodyErrorTest 5 OK / 修复前红值 10 与 8 实测；计数口径修正后绿值 3 与 2 已按真实 DONE_RE（源 :58）脚本复核）。
 5. **锚点实测 spot-check**（≥3）：① 四 helper 签名与解析块 ：252/:300/:316/:398 逐字核对；② `_relay_sse` 四消费者 :3162/:3166-3170/:3171-3174/:3184-3185 逐字核对（spec 写 :3185，实际 `saw_usage = any(...)` 在 :3185、`if not saw_usage:` 在 :3184，Edit 锚点取两行整体，无偏差）；③ `_proxy_relay` guard :2798-2800 逐字核对（两行 guard + def 行）；④ `RelaySseV3Test` :6026/`SettlePersistV3Test` :6173/`_EmptyStream` :1424/矩阵 :843/:884/:931/:958 全命中。
 
-**spec 偏差记录（2 处，均为实现细节级，不动 spec 语义）**：
+**spec 偏差记录（3 处，均为实现细节级，不动 spec 语义）**：
 - 卡 1 对 `_drive` 增加 `final=True` 默认参数：spec 只说"新增测试方法"，未提及 driver 扩展；默认值保证既有 5 个调用方零改动，空流测试需 `final=False` 触发 `_EmptyStream` 路径（spec 要求该流覆盖）。
 - `sse_line_body_error` 对 sentinel 不再尝试解析、直接经 `body_has_error(sentinel)`→False：spec item 4 明示 "`parsed=None` 或 `_SSE_PARSE_FAILED` 均返回 False（与原 ValueError→False 一致）"，此实现取其等价出口且避免 sentinel 行的冗余二次 loads（性能正确读法）；对外行为与 spec 完全一致。
+- 卡1 计数口径修正（E4 卡2 执行 blocked 裁定回写）：原 `data_line_count` 统计含 `data: [DONE]` 行（常态流断言 4），而 [DONE] 命中 DONE_RE 按设计永不 json.loads——实现已达理论下限（3 次 = 3 条可解析 data 行）仍无法转绿，根因在测试计数口径而非实现。两个计数测试收紧为"可解析 data 行"口径（startswith `data:` 且非 DONE_RE 命中）；生产实现零改动，绿值 3==3 / 2==2 已按真实 DONE_RE（源 :58）脚本复核可达。
