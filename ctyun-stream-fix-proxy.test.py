@@ -1078,6 +1078,19 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         mod._tpm_timeouts.clear()
         mod.TPM_MODEL_BUDGETS.clear()
 
+    @staticmethod
+    def _wait_bucket_enqueued(mod, key_model_tuple, timeout: float = 2.0) -> bool:
+        """有界轮询直到某桶队列非空；deadline 到返回 False。"""
+        deadline = time.time() + timeout
+        while True:
+            with mod.TPM_LOCK:
+                n = len(mod.TPM_WAITERS.get(key_model_tuple, ()))
+            if n >= 1:
+                return True
+            if time.time() >= deadline:
+                return False
+            time.sleep(0.015)
+
     def test_tpm_key_id(self) -> None:
         f = self.mod.tpm_key_id
         self.assertIsNone(f(None))
@@ -1332,6 +1345,7 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         with mod.TPM_LOCK:
             mod._tpm_remove_waiter(w1)
         self.assertEqual(len(q), 0)
+        self.assertNotIn(("k", "m:ident"), mod.TPM_WAITERS)
         self._tpm_cleanup(mod)
 
     def test_tpm_per_bucket_fifo_no_cross_bucket_block(self) -> None:
@@ -1346,13 +1360,15 @@ class ProxyDashboardUnitTest(unittest.TestCase):
             ta = threading.Thread(target=lambda: results.setdefault(
                 "A2", mod.tpm_admit("key:A", 10, "m:cross")))
             ta.start()
-            time.sleep(0.3)  # 结构性断言兜底（下两行），非 sleep 猜时序
+            self.assertTrue(self._wait_bucket_enqueued(mod, ("key:A", "m:cross")),
+                            "A2 must be enqueued in bucket A")
             self.assertEqual(sum(len(q) for q in mod.TPM_WAITERS.values()), 1,
                              "A2 must be enqueued (bucket A full)")
             tb = threading.Thread(target=lambda: results.setdefault(
                 "B1", mod.tpm_admit("key:B", 10, "m:cross")))
             tb.start()
-            time.sleep(0.3)
+            self.assertTrue(self._wait_bucket_enqueued(mod, ("key:B", "m:cross")),
+                            "B1 must be enqueued in bucket B")
             self.assertEqual(sum(len(q) for q in mod.TPM_WAITERS.values()), 2,
                              "B1 must be enqueued (bucket B full)")
             mod.tpm_settle("key:B", mod.TPM_LIMIT, 0, "m:cross")  # 只释放 B
@@ -1398,10 +1414,12 @@ class ProxyDashboardUnitTest(unittest.TestCase):
             tb = threading.Thread(target=lambda: results.setdefault(
                 "B1", mod.tpm_admit("key:B", 10, "m:pf")))
             tb.start()
-            time.sleep(0.3)  # 结构性断言兜底（下两行），非 sleep 猜时序
+            self.assertTrue(self._wait_bucket_enqueued(mod, ("key:B", "m:pf")),
+                            "B1 must be enqueued in its own bucket")
+            with mod.TPM_LOCK:
+                self.assertEqual(len(mod.TPM_WAITERS.get(("key:B", "m:pf"), ())), 1,
+                                 "桶B 应恰有 1 个 waiter 入队（无重复入队）")
             self.assertTrue(tb.is_alive(), "B1 must queue, not be rejected full")
-            self.assertEqual(len(mod.TPM_WAITERS.get(("key:B", "m:pf"), ())), 1,
-                             "B1 must be enqueued in its own bucket")
             mod.tpm_settle("key:B", mod.TPM_LIMIT, 0, "m:pf")  # 全额退款释放 B
             tb.join(timeout=5)
             self.assertFalse(tb.is_alive())
