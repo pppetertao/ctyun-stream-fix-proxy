@@ -788,6 +788,31 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         self.assertTrue(f("192.168.1.5", "tok", "tok"))
         self.assertFalse(f("192.168.1.5", "wrong", "tok"))
 
+    def test_dashboard_js_token_bootstrap(self) -> None:
+        """E3 dashboard JS token 引导（主代理裁定纳入本期）：页面含 ?token= →
+        localStorage 持久化引导与 adminFetch 包裹；7 个 GET 端点全部经 adminFetch
+        发出（服务端配置 token 后 LAN dashboard 轮询不失能）。JS 运行时行为无法在
+        python unittest 内执行，按既有 dashboard 测试惯例做 DASHBOARD_HTML 子串断言；
+        服务端 403/200 行为由 Card 2 集成测试锁定。"""
+        html = self.mod.DASHBOARD_HTML.decode("utf-8")
+        # 引导与包裹函数落地
+        self.assertIn('localStorage.setItem("ctyun-admin-token"', html)
+        self.assertIn('function adminFetch(url, opts)', html)
+        self.assertIn('"X-Admin-Token"', html)
+        # 7 个 GET 端点全部经 adminFetch 发出
+        for ep in ("/api/health", "/api/stats", "/api/tpm_settings", "/api/tpm_stats",
+                   "/api/errors", "/api/probe_history", "/api/tpm_calibrate"):
+            self.assertIn('adminFetch("%s"' % ep, html)
+        # 旧裸 fetch 形态零残留（tpm_calibrate 以 `")` 收尾，与同端点 POST 形态 `", {` 区分）
+        for stale in ('fetch("/api/health")',
+                      'fetch("/api/stats", { signal: ctrl.signal })',
+                      'fetch("/api/tpm_settings")',
+                      'fetch("/api/tpm_stats")',
+                      'fetch("/api/errors")',
+                      'fetch("/api/probe_history")',
+                      'fetch("/api/tpm_calibrate")'):
+            self.assertNotIn(stale, html)
+
     def test_extract_model(self) -> None:
         f = self.mod.extract_model
         self.assertEqual(f(b'{"model":"deepseek-v4-pro-0813-oc","stream":true}'),

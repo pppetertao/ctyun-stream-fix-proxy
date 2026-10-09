@@ -4044,6 +4044,33 @@ var RANGE_LABELS = { "3d": "近3天", "7d": "近7天", "mtd": "本月", "last_mo
 var selectedRange = "7d";  // 刷新不记忆（无 localStorage），默认近7天
 var lastSnap = null;       // poll 缓存：tab 点击零请求重渲染
 
+// ===== E3 读门禁 token 引导：URL ?token= 一次性写入 localStorage，此后所有 admin GET
+// fetch 经 adminFetch 自动带 X-Admin-Token；未引导过 token 时保持裸 fetch——服务端未配
+// CTYUN_ADMIN_TOKEN 时 LAN 可读不受影响（写端点行为与此前一致，不由本段改动）。
+function adminToken() {
+  try { return localStorage.getItem("ctyun-admin-token") || ""; }
+  catch (e) { return ""; }  // SecurityError：localStorage 读被禁（隐私模式），按无 token 降级
+}
+try {
+  var urlToken = new URL(window.location.href).searchParams.get("token");
+  if (urlToken) {
+    localStorage.setItem("ctyun-admin-token", urlToken);
+    if (history.replaceState) history.replaceState(null, "",
+        window.location.pathname + window.location.hash);  // 地址栏抹掉 token，防误存误转发（hash 保留防丢 tab 态）
+  }
+} catch (e) { /* 单语句引导块：URL/localStorage 不可用时跳过引导，按无 token 裸请求 */ }
+function adminFetch(url, opts) {
+  var tok = adminToken();
+  var o = opts || {};
+  if (tok) {
+    var h = {};
+    for (var k in (o.headers || {})) h[k] = o.headers[k];
+    h["X-Admin-Token"] = tok;
+    o.headers = h;
+  }
+  return fetch(url, o);
+}
+
 function fmtTime(ts) {
   return new Date(ts * 1000).toLocaleTimeString("zh-CN", { hour12: false });
 }
@@ -4649,7 +4676,7 @@ function renderHealth(h) {
   markEvents(chip, "probe_alert", null, null);
 }
 function pollHealth() {
-  fetch("/api/health")
+  adminFetch("/api/health")
     .then(function (resp) {
       if (!resp.ok) throw new Error("HTTP " + resp.status);
       return resp.json();
@@ -4664,7 +4691,7 @@ function pollHealth() {
 function poll() {
   var ctrl = new AbortController();
   var timer = setTimeout(function () { ctrl.abort(); }, 4000);
-  fetch("/api/stats", { signal: ctrl.signal })
+  adminFetch("/api/stats", { signal: ctrl.signal })
     .then(function (resp) {
       clearTimeout(timer);
       if (!resp.ok) throw new Error("HTTP " + resp.status);
@@ -4705,7 +4732,7 @@ $("upstream-form").addEventListener("submit", function (e) {
   }
   msg.className = "msg wait";
   msg.textContent = "保存中……";
-  fetch("/api/config", {
+  adminFetch("/api/config", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ upstream_base: value })
@@ -4738,7 +4765,7 @@ applyRange();
 poll();
 setInterval(poll, 2000);
 function loadTpmSettings() {
-  fetch("/api/tpm_settings")
+  adminFetch("/api/tpm_settings")
     .then(function (resp) {
       if (!resp.ok) throw new Error("HTTP " + resp.status);
       return resp.json();
@@ -4883,7 +4910,7 @@ $("tpm-save").addEventListener("click", function () {
   }
   msg.className = "msg wait";
   msg.textContent = "保存中……";
-  fetch("/api/config", {
+  adminFetch("/api/config", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ tpm_model_budgets: budgets })
@@ -5329,7 +5356,7 @@ function renderPerfV3(snap) {
   renderHourlyBytes(snap);
 }
 function loadTpmObs() {
-  fetch("/api/tpm_stats")
+  adminFetch("/api/tpm_stats")
     .then(function (resp) {
       if (!resp.ok) throw new Error("HTTP " + resp.status);
       return resp.json();
@@ -5364,7 +5391,7 @@ function loadTpmObs() {
     .catch(function () { $("tpm-queue-chip").textContent = "读取失败"; });
 }
 function loadErrorEvents() {
-  fetch("/api/errors")
+  adminFetch("/api/errors")
     .then(function (resp) {
       if (!resp.ok) throw new Error("HTTP " + resp.status);
       return resp.json();
@@ -5398,7 +5425,7 @@ function loadErrorEvents() {
     .catch(function () { $("err-capture-chip").textContent = "读取失败"; });
 }
 function loadProbeTrend() {
-  fetch("/api/probe_history")
+  adminFetch("/api/probe_history")
     .then(function (resp) {
       if (!resp.ok) throw new Error("HTTP " + resp.status);
       return resp.json();
@@ -5486,7 +5513,7 @@ function calibStart(model) {
              + "建议在低流量时段操作。")) {
     return;
   }
-  fetch("/api/tpm_calibrate", {
+  adminFetch("/api/tpm_calibrate", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ model: model })
@@ -5510,7 +5537,7 @@ function calibStart(model) {
   });
 }
 function calibPoll() {
-  fetch("/api/tpm_calibrate")
+  adminFetch("/api/tpm_calibrate")
     .then(function (resp) { return resp.json(); })
     .then(function (snap) {
       if (!snap.running) { calibDone(snap); return; }
@@ -5543,7 +5570,7 @@ function calibDone(snap) {
   _calibModel = null;
 }
 $("tpm-cali-abort").addEventListener("click", function () {
-  fetch("/api/tpm_calibrate_abort", { method: "POST", body: "{}" })
+  adminFetch("/api/tpm_calibrate_abort", { method: "POST", body: "{}" })
     .then(function () {
       $("tpm-cali-status-text").textContent = "已请求中止，等待当前批次结束…";
     });
