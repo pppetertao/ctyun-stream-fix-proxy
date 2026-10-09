@@ -6390,6 +6390,17 @@ class RelaySseV3Test(unittest.TestCase):
         self.assertEqual(spy.call_count, 0,
                          "空流路径不得产生任何 json.loads 调用")
 
+    def test_calibrate_probe_dead_guard_removed(self) -> None:
+        """F：_proxy_relay 的 _calibrate_probe 恒假守卫已删除。
+
+        该属性全仓零赋值（grep 仅源 :2799 一处 getattr 引用）→ getattr 恒 False
+        → return 不可达；真校准走 _calibrate_send 直连上游。源级断言防回归：
+        守卫不得再现于 _proxy_relay。"""
+        import inspect
+        src = inspect.getsource(self.mod.ProxyHandler._proxy_relay)
+        self.assertNotIn("_calibrate_probe", src,
+                         "_calibrate_probe 死守卫必须保持删除（不可达代码）")
+
 
 class SettlePersistV3Test(unittest.TestCase):
     """v3 tpm_settle 比率 + daily_by_key save/load roundtrip（决策 2/4）。"""

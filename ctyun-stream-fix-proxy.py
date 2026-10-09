@@ -2837,8 +2837,6 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 STATS["active"] -= 1
 
     def _proxy_relay(self, started: float) -> None:
-        if getattr(self, "_calibrate_probe", False):
-            return
         length = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(length) if length > 0 else None
         model = extract_model(body)
