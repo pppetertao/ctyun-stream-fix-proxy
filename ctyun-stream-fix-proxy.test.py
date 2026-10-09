@@ -3462,7 +3462,7 @@ class DashboardV2SkeletonTest(unittest.TestCase):
         for fn in ("renderPerf", "renderTokens", "renderHealth", "renderTriState"):
             self.assertIn("function %s(" % fn, js, "V2 JS 缺函数 %s" % fn)
         self.assertIn("pollHealth", js)
-        self.assertIn('fetch("/api/health")', js)
+        self.assertIn('adminFetch("/api/health")', js)
         core = self.mod._DASH_JS_CORE
         # probe_alert 进标签（EVT_KIND_LABELS）与 tooltip 明细（reason 展示）
         self.assertIn('probe_alert: "上游探测告警"', core)
@@ -3545,9 +3545,9 @@ class DashboardV3CardsTest(unittest.TestCase):
                    "renderQwait", "renderSettle", "renderHourly",
                    "loadTpmObs", "loadErrorEvents", "loadProbeTrend"):
             self.assertIn("function %s(" % fn, js, "V3 JS 缺函数 %s" % fn)
-        self.assertIn('fetch("/api/tpm_stats")', js, "P3 需消费 /api/tpm_stats")
-        self.assertIn('fetch("/api/errors")', js, "P4 需消费 /api/errors")
-        self.assertIn('fetch("/api/probe_history")', js, "P10 需消费 /api/probe_history")
+        self.assertIn('adminFetch("/api/tpm_stats")', js, "P3 需消费 /api/tpm_stats")
+        self.assertIn('adminFetch("/api/errors")', js, "P4 需消费 /api/errors")
+        self.assertIn('adminFetch("/api/probe_history")', js, "P10 需消费 /api/probe_history")
         self.assertIn("renderPerfV3(snap)", js, "poll 需接线 renderPerfV3")
         self.assertIn("renderByKey(snap)", js, "poll 需接线 renderByKey")
         self.assertIn("renderPerfV3(lastSnap || {})", js, "启动需首渲染 perf v3")
@@ -3876,7 +3876,7 @@ class AdminIntegrationTest(unittest.TestCase):
         for cid in ("perf-model-body", "token-daily-body", "upstream-health",
                     "tri-state-card", "latency-dist"):
             self.assertIn('id="%s"' % cid, html)
-        self.assertIn('fetch("/api/health")', html)
+        self.assertIn('adminFetch("/api/health")', html)
         self.assertIn("function renderPerf(", html)
         self.assertIn("function renderTokens(", html)
         self.assertIn("function renderHealth(", html)
