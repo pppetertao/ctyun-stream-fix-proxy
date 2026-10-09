@@ -21,7 +21,7 @@
 2. **锁序纪律（A 卡核心约束）**：`_PERSIST_LOCK` 只包 `save_stats_counters` 的写段（`directory`/`makedirs`/`tmp`/`open`+`json.dump`/`os.replace`）；持锁块内**零**其他锁获取（禁 STATS_LOCK/_CFG_LOCK/TPM_LOCK）；copy 阶段两段锁（:1735-1747 STATS_LOCK、:1748-1758 _CFG_LOCK）保持原状、不并入持久化锁——违反则与 `tpm_settle` :674-684 的 TPM_LOCK→STATS_LOCK 链形成潜在死锁。**必须 RLock**：SIGTERM 处理器 `_on_signal` :5577 在 main 线程执行，若恰逢 main 线程正持锁写段（如启动迁移 :5542）时同线程重入 `save_stats_counters`，普通 Lock 自死锁挂死退出路径；RLock 同线程重入安全，跨线程互斥语义与 Lock 相同。
 3. **磁盘 schema 逐字不动**：顶层 8 键 `{upstream_base, capture_errors, probe_enabled, model_pricing, tpm_model_budgets, tpm_body_err_samples, tpm_probe_results, stats}` 与 stats 子树 11 键（7 计数器 + daily/daily_by_model/daily_by_key/events）键集合与字面顺序均不变——load_* 白名单（:1792-1795 等）与升级历史依赖它。**口径注记**：spec 写"11 个顶层键"，实测 :1764-1773 顶层为 8 键，11 恰为 stats 子树键数；卡 1 测试对**两层键集合都断死**（严格强于 spec 断言，意图不变）。
 4. **B 口径纠偏**：本次是**快照一致性**修复，不是崩溃修复（现状 json.dumps 无 indent 走 C encoder，不抛 RuntimeError 不 500）。验收只设"5 键冻结副本"断言，**禁止**写"响应不再 500"类断言。
-5. **竞态测试构造纪律**：损坏窗口是竞态、非确定性——并发用例全部为"必过性断言 + Barrier(3)×50 轮放大"，不承诺修复前必红；确定性的 red 由卡 1 重写的 `test_persist_upstream_carries_tpm_model_budgets` 承担（窄 schema 文件缺 `stats` 键，修复前必红）。
+5. **竞态测试构造纪律（2026-10-09 主代理决策转写，修订原"必过性"口径）**：`set_*` 三函数窄写后**紧接着** `save_stats_counters` 全量写，落盘终态从无窄 schema 中间态；卡1 的 red 由并发用例承担（确定性 FileNotFoundError——`persist_upstream` :1535 与 `save_stats_counters` :1762 共用 `path + ".tmp"`，并发下 `os.replace` 互摘 tmp 抛 FileNotFoundError，即 finding A 的确定性表现，非 flaky），另两用例为回归守卫（修复前后均绿）。
 6. **不加依赖、不加 env seam**；不动 FLUSH_INTERVAL_S 与 flush 触发策略、不动 `_stats_dirty` 语义（`flush_stats_if_dirty` :2307-2320 原样）、不删 `sse_line_extract_usage`（test-only seam）。
 7. **tmp 残留边界**：kill -9 于写段中会留 `.tmp.<pid>` 残留（不损坏主文件），可接受，不加启动清理逻辑。
 8. 只改本计划列出的文件与锚点；禁止顺手改其它代码/注释/格式。
@@ -31,8 +31,8 @@
 ## 卡1【tier A】测试先行：PersistSingleWriterTest + 重写 :1633 用例 + 修 :744 fixture
 
 - **文件**：`ctyun-stream-fix-proxy.test.py`
-- **目标**：为卡 2 提供确定性 red（窄 schema 缺 `stats` 键）+ 竞态必过性回归网。
-- **预期 red 形态**：卡 2 未做时，`test_persist_upstream_carries_tpm_model_budgets` **必 FAIL**（`'stats' not found`）；`PersistSingleWriterTest` 3 用例为必过性回归（可能全绿，见 Global Constraints #5，属预期）。
+- **目标**（2026-10-09 主代理决策转写）：为卡 2 提供确定性 red（并发用例：共享 `.tmp` 被 `os.replace` 互摘 → 确定性 FileNotFoundError）+ 回归守卫网（崩溃窗口 + 计数不丢）。
+- **预期 red 形态**：卡 2 未做时，**唯一 red** 是 `test_three_way_concurrent_writes_produce_valid_full_schema`——确定性 FAIL（`errors` 捕获 2 条 FileNotFoundError，finding A 的确定性表现，非 flaky）；`test_persist_upstream_carries_tpm_model_budgets` 与 `test_set_upstream_base_keeps_stats_counters` 为回归守卫，修复前后均绿（`set_*` 窄写后紧接着全量写，落盘终态从无窄 schema 中间态）。
 
 ### Edit 1a：重写 `ProxyDashboardUnitTest.test_persist_upstream_carries_tpm_model_budgets`（现 :1633）
 
@@ -62,9 +62,9 @@ new_string（逐字替换）：
 
 ```python
     def test_persist_upstream_carries_tpm_model_budgets(self) -> None:
-        # E1-A：persist_upstream 已删，窄出口改走 set_tpm_model_budgets →
-        # save_stats_counters 全量 schema。回归点：预算读回相等 + 文件含 stats
-        # 键（不再存在窄 schema 中间态；卡 2 前本用例必红）。
+        # E1-A 回归守卫（修复前后均绿）：persist_upstream 已删，窄出口改走
+        # set_tpm_model_budgets → save_stats_counters 全量 schema；预算读回相等 +
+        # 文件含 stats 键，防止再引入窄 schema 中间态落盘（崩溃窗口回归）。
         mod = self.mod
         tmpdir = tempfile.mkdtemp(prefix="ctyun-tpm-pu-")
         path = os.path.join(tmpdir, "s.json")
@@ -119,15 +119,20 @@ new_string：
 ```python
 class PersistSingleWriterTest(unittest.TestCase):
     """E1-finding A：save_stats_counters 单写者（_PERSIST_LOCK 串行 + tmp 带 pid
-    + set_* 去窄写）。竞态窗口非确定性（spec Risk#4），本类断言全为必过性——
-    修复后必过，不承诺修复前必红；确定性 red 由
-    test_persist_upstream_carries_tpm_model_budgets 重写用例承担。"""
+    + set_* 去窄写）。test_three_way_concurrent_writes_produce_valid_full_schema
+    为本卡唯一 red-before-green 用例（修复前确定性 FAIL：共享 .tmp 被 os.replace
+    互摘 → 2 条 FileNotFoundError，finding A 的确定性表现，非 flaky）；另两用例
+    为回归守卫（修复前后均绿）。"""
 
     def setUp(self) -> None:
         self.mod = load_proxy_module()
 
     def test_set_upstream_base_keeps_stats_counters(self) -> None:
-        # 窄覆盖回归：set_upstream_base 后计数不被 3 键窄 schema 清零。
+        # 回归守卫（修复前后均绿）：set_* 窄写后紧接着 save_stats_counters 全量写，
+        # 落盘终态从无窄 schema 中间态——本用例守护"崩溃窗口 + 计数不丢"，
+        # 而非确定性丢失。造数用 filtered_total：_record_request（:2363 起）只加
+        # STATS["filtered_total"]（:2392），requests_total 仅 _proxy（:2759）自增，
+        # 单测造不出 requests_total。
         mod = self.mod
         tmpdir = tempfile.mkdtemp(prefix="ctyun-psw-")
         self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
@@ -138,20 +143,32 @@ class PersistSingleWriterTest(unittest.TestCase):
         try:
             mod.PERSIST_PATH = path
             mod._record_request("POST", "/x", 200, 1.0, 0)
+            self.assertGreaterEqual(mod.STATS["filtered_total"], 1)
             mod.save_stats_counters(path)
-            before = mod.load_stats_counters(path)
-            self.assertGreaterEqual(before["requests_total"], 1)
-            mod.set_upstream_base("https://replacement.example.com/v1")
-            self.assertEqual(mod.load_stats_counters(path), before)  # 旧窄写路径此处置 0
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+            self.assertGreaterEqual(data["stats"]["filtered_total"], 1)
+            filtered_before = data["stats"]["filtered_total"]
+            mod.set_upstream_base("http://127.0.0.1:1/")
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+            self.assertIn("stats", data)
+            self.assertEqual(data["stats"]["filtered_total"], filtered_before)
         finally:
             mod.PERSIST_PATH = orig_path
             mod.UPSTREAM_BASE = orig_base
             mod._upstream_source = orig_source
 
     def test_three_way_concurrent_writes_produce_valid_full_schema(self) -> None:
-        # 三路并发：SIGTERM :5577 替身 / admin POST :3486-3491 替身（set_capture_errors）
-        # / flush :5602 替身；Barrier(3) 同步后各 50 轮。修复后文件恒为全量 schema、
-        # filtered_total 单调不减、无 tmp 残留。
+        """三路并发：SIGTERM :5577 替身 / admin POST :3486-3491 替身
+        （set_capture_errors）/ flush :5602 替身；Barrier(3) 同步后各 50 轮。
+
+        卡 1 唯一 red-before-green 用例：修复前确定性 FAIL——persist_upstream :1535
+        与 save_stats_counters :1762 共用 path + ".tmp"，并发下 os.replace 互摘 tmp
+        抛 FileNotFoundError（errors 捕获 2 条），即 finding A 的确定性表现，
+        非 flaky；卡 2 后必须全过：文件恒为全量 schema、filtered_total 单调不减、
+        无 tmp 残留。
+        """
         mod = self.mod
         tmpdir = tempfile.mkdtemp(prefix="ctyun-psw-conc-")
         self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
@@ -247,7 +264,8 @@ cd /Users/peter/Documents/project/ctyun-stream-fix-proxy/.worktrees/persist-race
 /usr/bin/python3 ctyun-stream-fix-proxy.test.py ProxyDashboardUnitTest.test_persist_upstream_carries_tpm_model_budgets PersistSingleWriterTest
 ```
 
-预期：`test_persist_upstream_carries_tpm_model_budgets` FAIL（`AssertionError: 'stats' not found`，窄 schema 文件无 stats 键）；`PersistSingleWriterTest` 3 用例 PASS（必过性回归，修复前绿属预期）。整体 exit code 1。
+预期：`test_three_way_concurrent_writes_produce_valid_full_schema` FAIL（`errors` 非空、捕获 2 条 FileNotFoundError——确定性，非 flaky，本卡唯一 red）；`test_persist_upstream_carries_tpm_model_budgets`、`test_set_upstream_base_keeps_stats_counters`、`test_load_stats_counters_corrupt_or_missing_falls_back_to_zero` 均 PASS（回归守卫，修复前后均绿）。整体 exit code 1。
+Baseline 后测试总数按 372 + 4 计（1 重写 + 3 新增）。
 
 ---
 
