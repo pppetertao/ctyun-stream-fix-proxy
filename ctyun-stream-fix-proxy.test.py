@@ -4098,8 +4098,10 @@ class AdminIntegrationTest(unittest.TestCase):
         stop_proxy(self.proc)
         stop_fake_upstreams()
         upstream_port = make_fake_upstream(False)
+        # 防 shell env 泄漏（开发者已导出 CTYUN_ADMIN_TOKEN）把本例变成配了 token 的门禁用例
         self.proc = start_proxy(self.upstream_port, free_port(),
-                                extra_env={"CTYUN_ADMIN_HOST": "0.0.0.0"})
+                                extra_env={"CTYUN_ADMIN_HOST": "0.0.0.0",
+                                           "CTYUN_ADMIN_TOKEN": ""})
         status, _, _ = admin_get(self.proc.admin_port, "/api/stats")
         self.assertEqual(status, 200)
         status, _, _ = admin_get(self.proc.admin_port, "/api/health")
@@ -4111,8 +4113,10 @@ class AdminIntegrationTest(unittest.TestCase):
         stop_proxy(self.proc)
         stop_fake_upstreams()
         upstream_port = make_fake_upstream(False)
+        # 防 shell env 泄漏（开发者已导出 CTYUN_ADMIN_TOKEN）抑制本例的启动 WARNING
         self.proc = start_proxy(self.upstream_port, free_port(),
-                                extra_env={"CTYUN_ADMIN_HOST": "0.0.0.0"})
+                                extra_env={"CTYUN_ADMIN_HOST": "0.0.0.0",
+                                           "CTYUN_ADMIN_TOKEN": ""})
         # stderr 异步 drain：轮询等 WARNING 行（同 test_listen_host_env_binds_lan while/else 模式）
         deadline = time.time() + 5
         while time.time() < deadline:

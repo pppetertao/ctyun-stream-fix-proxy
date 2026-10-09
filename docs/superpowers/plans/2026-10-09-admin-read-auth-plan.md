@@ -559,7 +559,7 @@ $ /usr/bin/python3 ctyun-stream-fix-proxy.test.py ProxyDashboardUnitTest
 ### 3c. 验收
 
 - 7 个 GET fetch 全走 `adminFetch`；token 未引导时不改任何请求头（`adminFetch` 直通 `fetch`）。
-- POST fetch 4 处（:4643 / :4821 / :5424 / :5481）与布局/CSS 零改动。
+- POST fetch 4 处（:4643 / :4821 / :5424 / :5481）同样包 `adminFetch`（主代理执行期裁定纳入），布局/CSS 零改动。
 - AC9（全量绿）归入下方 Whole-branch 收尾，不计入卡内验证。
 
 ---
@@ -580,3 +580,4 @@ $ /usr/bin/python3 ctyun-stream-fix-proxy.test.py
 3. **行号漂移**：spec 写 AdminIntegrationTest 新增方法「约 ：3890 区域」，实测类定义在 ：3499、插入锚点在 ：3890（`test_config_post_localhost_allowed_even_with_token_env` 之后）——语义一致，文本锚点吸收，不回 PLAN。
 4. 其余 spec 锚点全部实测命中：`write_allowed` :2319、do_GET :3330-3420 九端点、POST 门禁 ：3442/:3495/:3516/:3538、listening :5612-5613、`stderr_text` :420、`start_proxy` :490、`admin_get` :649、`test_write_allowed_matrix` :765、JS fetch :4587/:4602/:4676/:5267/:5302/:5336/:5448、`ADMIN_HOST` :37。
 5. **卡 2 LAN IP 探测环境缺陷回补（2026-10-09 执行期，PLAN 修订）**：卡 2 测试落盘后实测发现，原 UDP connect（192.0.2.1）探测在本机（VPN 环境）取到 TUN 段地址 198.18.0.1——198.18.0.0/15 是 VPN 默认路由基准段，对 0.0.0.0 监听为 TCP 黑洞（SYN 进 TUN 有去无回、只超时不拒绝），导致 `test_admin_get_read_gate_non_loopback` 恒红且无法走 SkipTest 口径。本修订仅改该测试的 `lan_ip` 探测代码块：`socket.gethostbyname_ex(socket.gethostname())[2]` 枚举候选 → 按序过滤 127/8、169.254/16、198.18/15 → 私网段（192.168/16、10/8、172.16/12）优先取第一个 → 无私网候选 `self.skipTest("no routable LAN IP in sandbox")`。实现本身已带外实证正确（真实 LAN 192.168.5.234 下：9 端点 无 token→403、错 token→403、对 token→200、loopback→200），不需回改生产代码。另两条卡 2 测试（`test_admin_get_read_allowed_no_token_env` / `test_startup_log_warns_exposure`）不经 LAN IP 探测（纯 loopback `admin_get` / 纯 stderr 断言，无真实 LAN 依赖），无需共用探测 helper，保持原状。
+6. **dashboard JS 的 4 处 POST fetch 纳入 `adminFetch` 包装（Card 3b，超出原卡范围）**：原 Card 3 只要求包装 7 处 GET fetch，实现期主代理裁定把 4 处 POST fetch（:4643 / :4821 / :5424 / :5481）一并包进 `adminFetch`——理由：ADMIN 配 token 后 LAN 浏览器发起写操作必须带 `X-Admin-Token`，否则被 POST 门禁 403；仅包 GET 会留下「读通了、写全挂」的半截状态。token 未引导时 `adminFetch` 直通 `fetch`，行为零变化。该行为已由 `ProxyDashboardUnitTest.test_dashboard_js_token_bootstrap` 锁定。
