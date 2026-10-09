@@ -799,10 +799,17 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         self.assertIn('localStorage.setItem("ctyun-admin-token"', html)
         self.assertIn('function adminFetch(url, opts)', html)
         self.assertIn('"X-Admin-Token"', html)
+        # token 落 localStorage 后从 URL 剥离（防泄漏主措施）
+        self.assertIn('history.replaceState', html)
         # 7 个 GET 端点全部经 adminFetch 发出
         for ep in ("/api/health", "/api/stats", "/api/tpm_settings", "/api/tpm_stats",
                    "/api/errors", "/api/probe_history", "/api/tpm_calibrate"):
             self.assertIn('adminFetch("%s"' % ep, html)
+        # 3 个 POST 端点同样经 adminFetch 发出（形如 `adminFetch("<ep>", {`；
+        # `adminFetch` 尾为大写 `Fetch`，故小写 `fetch("<ep>", {` 即裸 POST 残留）
+        for ep in ("/api/config", "/api/tpm_calibrate", "/api/tpm_calibrate_abort"):
+            self.assertIn('adminFetch("%s", {' % ep, html)
+            self.assertNotIn('fetch("%s", {' % ep, html)
         # 旧裸 fetch 形态零残留（tpm_calibrate 以 `")` 收尾，与同端点 POST 形态 `", {` 区分）
         for stale in ('fetch("/api/health")',
                       'fetch("/api/stats", { signal: ctrl.signal })',
