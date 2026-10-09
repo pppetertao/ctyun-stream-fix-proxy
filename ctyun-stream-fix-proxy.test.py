@@ -262,6 +262,13 @@ class FakeUpstreamHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.close_connection = True
 
+    def do_OPTIONS(self) -> None:
+        # 诊断日志测试假上游：OPTIONS 回 200 空体（缺省 do_* → 501 会污染 relay 断言）。
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+        self.close_connection = True
+
     def log_message(self, format: str, *args: object) -> None:
         pass
 
@@ -8671,6 +8678,106 @@ class GenSpeedDashJSV2Test(unittest.TestCase):
         for sub in ("fmtTok(tp)", "fmtTok(tc)", "fmtTok(cr)", "fmtTok(rn)",
                     "fmtTok(mtd)", 'fmtTok(max) + " tokens/h"'):
             self.assertIn(sub, js, "缺 fmtTok 接线 %s" % sub)
+
+
+class DiagLogTest(unittest.TestCase):
+    """全路径诊断日志（AC1/AC2/AC3/AC4/AC5）：
+
+    黑盒进程用例（setUp/tearDown 同 RequestIdTest 模式）覆盖 DIAG IN 行格式与
+    HEAD/OPTIONS 委托；in-process 用例（object.__new__ 模式，同
+    test_log_exc_field_single_line_and_placeholder）覆盖非连接异常 499 落行。
+    """
+
+    def setUp(self) -> None:
+        self.upstream_port = make_fake_upstream(False)
+        self.proxy_port = free_port()
+        self.proc = start_proxy(self.upstream_port, self.proxy_port)
+
+    def tearDown(self) -> None:
+        stop_proxy(self.proc)
+        stop_fake_upstreams()
+
+    def _stderr_after_stop(self) -> str:
+        self.proc.terminate()
+        self.proc.wait(timeout=10)
+        return stderr_text(self.proc)
+
+    def test_diag_in_precedes_req_line_for_get(self) -> None:
+        """AC1/AC5：GET 请求 stderr 必有 DIAG IN 行（method/path/ip/rid 齐全）且先于 REQ 行。"""
+        get_plain(self.proxy_port)
+        stderr = self._stderr_after_stop()
+        self.assertIn("DIAG IN GET /plain from=127.0.0.1 rid=r-1", stderr,
+                      "入口 DIAG IN 行格式必须为 'DIAG IN <METHOD> <path> from=<ip> rid=<rid>'，"
+                      "stderr:\n" + stderr)
+        m_diag = re.search(r"^DIAG IN GET /plain ", stderr, re.M)
+        m_req = re.search(r"^REQ GET /plain -> 200 ", stderr, re.M)
+        self.assertIsNotNone(m_diag, "DIAG IN 行必须独立成行，stderr:\n" + stderr)
+        self.assertIsNotNone(m_req, "REQ 行必须存在，stderr:\n" + stderr)
+        self.assertLess(m_diag.start(), m_req.start(),
+                        "DIAG IN 必须先于 REQ 行，stderr:\n" + stderr)
+
+    def test_head_relays_and_logs(self) -> None:
+        """AC2：HEAD 委托 _proxy relay（上游 do_HEAD 回 200 空体），DIAG IN + REQ HEAD 行落地。"""
+        conn = http.client.HTTPConnection("127.0.0.1", self.proxy_port, timeout=10)
+        conn.request("HEAD", "/plain")
+        resp = conn.getresponse()
+        status = resp.status
+        body = resp.read()
+        conn.close()
+        self.assertEqual(status, 200,
+                         "HEAD 必须委托 relay 拿到上游 200（旧行为为代理 501）")
+        self.assertEqual(body, b"", "HEAD 响应不得含 body")
+        stderr = self._stderr_after_stop()
+        self.assertIn("DIAG IN HEAD /plain from=127.0.0.1 rid=r-1", stderr,
+                      "stderr:\n" + stderr)
+        m = re.search(r"^REQ HEAD /plain -> 200 ", stderr, re.M)
+        self.assertIsNotNone(m, "REQ HEAD 行必须落地，stderr:\n" + stderr)
+
+    def test_options_relays_and_logs(self) -> None:
+        """AC3：OPTIONS 委托 _proxy relay（上游 do_OPTIONS 回 200 空体），DIAG IN + REQ OPTIONS 行落地。"""
+        conn = http.client.HTTPConnection("127.0.0.1", self.proxy_port, timeout=10)
+        conn.request("OPTIONS", "/plain")
+        resp = conn.getresponse()
+        status = resp.status
+        body = resp.read()
+        conn.close()
+        self.assertEqual(status, 200,
+                         "OPTIONS 必须委托 relay 拿到上游 200（旧行为为代理 501）")
+        self.assertEqual(body, b"")
+        stderr = self._stderr_after_stop()
+        self.assertIn("DIAG IN OPTIONS /plain from=127.0.0.1 rid=r-1", stderr,
+                      "stderr:\n" + stderr)
+        m = re.search(r"^REQ OPTIONS /plain -> 200 ", stderr, re.M)
+        self.assertIsNotNone(m, "REQ OPTIONS 行必须落地，stderr:\n" + stderr)
+
+    def test_proxy_internal_error_logs_499_and_reraises(self) -> None:
+        """AC4：relay 内非连接异常 → 落 REQ 499 result=proxy-error 行后重抛（栈不吞）。"""
+        mod = load_proxy_module()
+        handler = object.__new__(mod.ProxyHandler)
+        handler.command = "POST"
+        handler.path = "/v1/chat/completions"
+        handler.client_address = ("127.0.0.1", 51000)
+
+        def _boom(started: float) -> None:
+            raise ValueError("boom")
+
+        handler._proxy_relay = _boom
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            with self.assertRaises(ValueError,
+                                   msg="宽 except 落行后必须重抛保留 traceback"):
+                handler._proxy()
+        err = buf.getvalue()
+        self.assertIn("DIAG IN POST /v1/chat/completions from=127.0.0.1 rid=r-1", err,
+                      "异常路径入口 DIAG IN 行必须已落地，stderr:\n" + err)
+        self.assertIn("REQ POST /v1/chat/completions -> 499", err,
+                      "非连接异常必须落 499 REQ 行，stderr:\n" + err)
+        self.assertIn("result=proxy-error", err, "stderr:\n" + err)
+        self.assertIn("exc=ValueError:_boom", err, "stderr:\n" + err)
+        ring = [e["line"] for e in mod.LOG_RING]
+        diag_idx = next(i for i, ln in enumerate(ring) if ln.startswith("DIAG IN POST"))
+        req_idx = next(i for i, ln in enumerate(ring) if ln.startswith("REQ POST"))
+        self.assertLess(diag_idx, req_idx, "DIAG IN 必须先于 REQ 行")
 
 
 if __name__ == "__main__":
