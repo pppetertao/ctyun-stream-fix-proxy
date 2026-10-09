@@ -741,7 +741,8 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         tmp = tempfile.mkdtemp(prefix="ctyun-proxy-unit-")
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         good = os.path.join(tmp, "good.json")
-        mod.persist_upstream("http://127.0.0.1:9999", good)
+        with open(good, "w", encoding="utf-8") as fh:
+            json.dump({"upstream_base": "http://127.0.0.1:9999"}, fh)
         self.assertEqual(mod.resolve_upstream_base("http://env:1", good),
                          ("http://env:1", "env"))
         self.assertEqual(mod.resolve_upstream_base("", good),
@@ -1631,22 +1632,28 @@ class ProxyDashboardUnitTest(unittest.TestCase):
             shutil.rmtree(os.path.dirname(path), ignore_errors=True)
 
     def test_persist_upstream_carries_tpm_model_budgets(self) -> None:
+        # E1-A 回归守卫（修复前后均绿）：persist_upstream 已删，窄出口改走
+        # set_tpm_model_budgets → save_stats_counters 全量 schema；预算读回相等 +
+        # 文件含 stats 键，防止再引入窄 schema 中间态落盘（崩溃窗口回归）。
         mod = self.mod
-        path = os.path.join(tempfile.mkdtemp(prefix="ctyun-tpm-pu-"), "s.json")
+        tmpdir = tempfile.mkdtemp(prefix="ctyun-tpm-pu-")
+        path = os.path.join(tmpdir, "s.json")
+        orig_path = mod.PERSIST_PATH
         orig = dict(mod.TPM_MODEL_BUDGETS)
         try:
+            mod.PERSIST_PATH = path
             mod.TPM_MODEL_BUDGETS.clear()
-            mod.TPM_MODEL_BUDGETS["kimi-k3-oc"] = 1000
-            mod.persist_upstream("https://example.com/v1", path, capture_errors=True,
-                                 tpm_model_budgets=mod.TPM_MODEL_BUDGETS)
+            mod.set_tpm_model_budgets({"kimi-k3-oc": 1000})
+            self.assertEqual(mod.load_tpm_model_budgets(path),
+                             {"kimi-k3-oc": 1000})
             with open(path, encoding="utf-8") as fh:
                 saved = json.load(fh)
-            self.assertEqual(saved["tpm_model_budgets"], {"kimi-k3-oc": 1000})
-            self.assertEqual(saved["upstream_base"], "https://example.com/v1")
+            self.assertIn("stats", saved)  # 全量 schema 直写，无窄 schema 窗口
         finally:
+            mod.PERSIST_PATH = orig_path
             mod.TPM_MODEL_BUDGETS.clear()
             mod.TPM_MODEL_BUDGETS.update(orig)
-            shutil.rmtree(os.path.dirname(path), ignore_errors=True)
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
     def test_set_tpm_model_budgets_atomic_replace(self) -> None:
         mod = self.mod
@@ -6272,6 +6279,143 @@ class ProbeHistoryV3Test(unittest.TestCase):
         finally:
             stop_proxy(proc)
             stop_fake_upstreams()
+
+
+class PersistSingleWriterTest(unittest.TestCase):
+    """E1-finding A：save_stats_counters 单写者（_PERSIST_LOCK 串行 + tmp 带 pid
+    + set_* 去窄写）。test_three_way_concurrent_writes_produce_valid_full_schema
+    为本卡唯一 red-before-green 用例（修复前确定性 FAIL：共享 .tmp 被 os.replace
+    互摘 → 2 条 FileNotFoundError，finding A 的确定性表现，非 flaky）；另两用例
+    为回归守卫（修复前后均绿）。"""
+
+    def setUp(self) -> None:
+        self.mod = load_proxy_module()
+
+    def test_set_upstream_base_keeps_stats_counters(self) -> None:
+        # 回归守卫（修复前后均绿）：set_* 窄写后紧接着 save_stats_counters 全量写，
+        # 落盘终态从无窄 schema 中间态——本用例守护"崩溃窗口 + 计数不丢"，
+        # 而非确定性丢失。造数用 filtered_total：_record_request（:2363 起）只加
+        # STATS["filtered_total"]（:2392），requests_total 仅 _proxy（:2759）自增，
+        # 单测造不出 requests_total。
+        mod = self.mod
+        tmpdir = tempfile.mkdtemp(prefix="ctyun-psw-")
+        self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
+        path = os.path.join(tmpdir, "settings.json")
+        orig_path = mod.PERSIST_PATH
+        orig_base = mod.UPSTREAM_BASE
+        orig_source = mod._upstream_source
+        try:
+            mod.PERSIST_PATH = path
+            # 末参 filtered=1：_record_request :2392 按 filtered 增量，既有造数口径见测试 :1740/:1864/:1888
+            mod._record_request("POST", "/x", 200, 1.0, 1)
+            self.assertGreaterEqual(mod.STATS["filtered_total"], 1)
+            mod.save_stats_counters(path)
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+            self.assertGreaterEqual(data["stats"]["filtered_total"], 1)
+            filtered_before = data["stats"]["filtered_total"]
+            mod.set_upstream_base("http://127.0.0.1:1/")
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+            self.assertIn("stats", data)
+            self.assertEqual(data["stats"]["filtered_total"], filtered_before)
+        finally:
+            mod.PERSIST_PATH = orig_path
+            mod.UPSTREAM_BASE = orig_base
+            mod._upstream_source = orig_source
+
+    def test_three_way_concurrent_writes_produce_valid_full_schema(self) -> None:
+        """三路并发：SIGTERM :5577 替身 / admin POST :3486-3491 替身
+        （set_capture_errors）/ flush :5602 替身；Barrier(3) 同步后各 50 轮。
+
+        卡 1 唯一 red-before-green 用例：修复前确定性 FAIL——persist_upstream :1535
+        与 save_stats_counters :1762 共用 path + ".tmp"，并发下 os.replace 互摘 tmp
+        抛 FileNotFoundError（errors 捕获 2 条），即 finding A 的确定性表现，
+        非 flaky；卡 2 后必须全过：文件恒为全量 schema、filtered_total 单调不减、
+        无 tmp 残留。
+        """
+        mod = self.mod
+        tmpdir = tempfile.mkdtemp(prefix="ctyun-psw-conc-")
+        self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
+        path = os.path.join(tmpdir, "settings.json")
+        orig_path = mod.PERSIST_PATH
+        orig_capture = mod.CAPTURE_ERRORS
+        mod.PERSIST_PATH = path
+        mod.save_stats_counters(path)  # 先落一次全量文件
+        barrier = threading.Barrier(3)
+        errors = []
+
+        def sigterm_writer():  # SIGTERM 处理器替身：直调 save
+            try:
+                barrier.wait()
+                for _ in range(50):
+                    mod.save_stats_counters(path)
+            except Exception as exc:
+                errors.append(exc)
+
+        def admin_toggle():  # admin POST set_capture_errors 替身
+            try:
+                barrier.wait()
+                for i in range(50):
+                    mod.set_capture_errors(bool(i % 2))
+            except Exception as exc:
+                errors.append(exc)
+
+        def flush_writer():  # flush 定时器替身：直调 save
+            try:
+                barrier.wait()
+                for _ in range(50):
+                    mod.save_stats_counters(path)
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=sigterm_writer),
+                   threading.Thread(target=admin_toggle),
+                   threading.Thread(target=flush_writer)]
+        try:
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(60)
+            for t in threads:
+                self.assertFalse(t.is_alive(), "线程 60s 未结束：疑似锁自死锁")
+            self.assertEqual(errors, [])
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)  # 写坏 JSON 在此抛 ValueError
+            self.assertEqual(
+                set(data),
+                {"upstream_base", "capture_errors", "probe_enabled", "model_pricing",
+                 "tpm_model_budgets", "tpm_body_err_samples", "tpm_probe_results",
+                 "stats"})
+            self.assertEqual(
+                set(data["stats"]),
+                {"requests_total", "filtered_total", "errors_total",
+                 "empty_retries_total", "eof_without_done_total",
+                 "finish_retries_total", "header_retries_total",
+                 "daily", "daily_by_model", "daily_by_key", "events"})
+            before = mod.load_stats_counters(path)
+            mod.save_stats_counters(path)
+            after = mod.load_stats_counters(path)
+            self.assertGreaterEqual(after["filtered_total"], before["filtered_total"])
+            self.assertEqual(
+                [n for n in os.listdir(tmpdir) if ".tmp" in n], [])  # 无 tmp 残留
+        finally:
+            mod.PERSIST_PATH = orig_path
+            mod.CAPTURE_ERRORS = orig_capture
+
+    def test_load_stats_counters_corrupt_or_missing_falls_back_to_zero(self) -> None:
+        # 损坏/缺失回落全零（对齐既有 :1727-1732 口径）。
+        mod = self.mod
+        tmpdir = tempfile.mkdtemp(prefix="ctyun-psw-bad-")
+        self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
+        path = os.path.join(tmpdir, "settings.json")
+        zeros = {"requests_total": 0, "filtered_total": 0, "errors_total": 0,
+                 "empty_retries_total": 0, "eof_without_done_total": 0,
+                 "finish_retries_total": 0, "header_retries_total": 0}
+        self.assertEqual(mod.load_stats_counters(path), zeros)  # 文件缺失
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("{corrupt")
+        self.assertEqual(mod.load_stats_counters(path), zeros)  # 损坏 JSON
 
 
 class SnapshotV3Test(unittest.TestCase):
