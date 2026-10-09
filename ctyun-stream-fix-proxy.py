@@ -4049,14 +4049,14 @@ var lastSnap = null;       // poll 缓存：tab 点击零请求重渲染
 // CTYUN_ADMIN_TOKEN 时 LAN 可读不受影响（写端点行为与此前一致，不由本段改动）。
 function adminToken() {
   try { return localStorage.getItem("ctyun-admin-token") || ""; }
-  catch (e) { return ""; }  // SecurityError：localStorage 读被禁（隐私模式），按无 token 降级
+  catch (e) { console.warn("admin token read failed:", e); return ""; }  // SecurityError：localStorage 读被禁（隐私模式），按无 token 降级
 }
 try {
   var urlToken = new URL(window.location.href).searchParams.get("token");
   if (urlToken) {
-    localStorage.setItem("ctyun-admin-token", urlToken);
     if (history.replaceState) history.replaceState(null, "",
         window.location.pathname + window.location.hash);  // 地址栏抹掉 token，防误存误转发（hash 保留防丢 tab 态）
+    localStorage.setItem("ctyun-admin-token", urlToken);
   }
 } catch (e) { /* 单语句引导块：URL/localStorage 不可用时跳过引导，按无 token 裸请求 */ }
 function adminFetch(url, opts) {
@@ -5538,7 +5538,10 @@ function calibStart(model) {
 }
 function calibPoll() {
   adminFetch("/api/tpm_calibrate")
-    .then(function (resp) { return resp.json(); })
+    .then(function (resp) {
+      if (!resp.ok) throw new Error("HTTP " + resp.status);
+      return resp.json();
+    })
     .then(function (snap) {
       if (!snap.running) { calibDone(snap); return; }
       var p = snap.progress || {};
