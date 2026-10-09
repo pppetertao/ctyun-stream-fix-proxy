@@ -6390,6 +6390,34 @@ class RelaySseV3Test(unittest.TestCase):
         self.assertEqual(spy.call_count, 0,
                          "空流路径不得产生任何 json.loads 调用")
 
+    def test_relay_sse_json_loads_null_line_not_collided(self) -> None:
+        """data:null 预解析值 None 不与"未传 parsed"撞码——每行恰 1 次 loads。
+
+        json.loads("null") 的合法结果 None 曾与 helper 的"未传 parsed=None"
+        撞码，导致毒行回退重复解析（预解析 1 + kind/usage/body-error/has_usage
+        各 1，实测 4 次）；_SSE_NO_PARSED sentinel 拆分后恰 1 次。"""
+        mod = self.mod
+        poison_line, terminator = SSE_POISON.splitlines(keepends=True)
+        lines = [poison_line, terminator]
+        raw = b"".join(lines)
+        data_line_count = 0
+        # 同常态流口径：data: 前缀且非 [DONE]；毒行计入（确实被预解析 1 次）
+        for l in raw.split(b"\n"):
+            s = l.rstrip(b"\r\n")
+            if (s.startswith(b"data:")
+                    and not mod.DONE_RE.match(s)):
+                data_line_count += 1
+        self.assertEqual(data_line_count, 1)
+        with mock.patch.object(mod.json, "loads",
+                               wraps=mod.json.loads) as spy:
+            (filtered, truncated), handler = self._drive(lines)
+        self.assertEqual(filtered, 1)
+        self.assertFalse(truncated)
+        self.assertEqual(spy.call_count, data_line_count,
+                         "data:null 行必须恰 1 次 json.loads（撞码时本流 4 次）")
+        # 行为等价：None 经 data=parsed 走非 dict 分支，毒 record 整条丢弃
+        self.assertNotIn(b"null", handler.wfile.getvalue())
+
     def test_calibrate_probe_dead_guard_removed(self) -> None:
         """F：_proxy_relay 的 _calibrate_probe 恒假守卫已删除。
 

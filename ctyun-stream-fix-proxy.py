@@ -249,7 +249,11 @@ def hist_percentile(buckets, edges, q):
     return float(edges[-1])  # 数学不可达（rank<=total 且末桶已 return）；防御性兜底
 
 
-def sse_data_line_kind(line: bytes, parsed=None) -> str:
+_SSE_NO_PARSED = object()  # sentinel：调用方未传预解析结果（与合法 None 值区分；
+# 定义须早于本模块所有 helper——默认参在 def 时求值
+
+
+def sse_data_line_kind(line: bytes, parsed=_SSE_NO_PARSED) -> str:
     """SSE data 行归类："done" / "content" / "finish" / "noise"。判定序：
     非 data: 前缀（注释行/event:/id:）→ noise；[DONE] → done；
     JSON 解析失败 → content（fail-open：宁可不重试，不误判合法流）；
@@ -257,8 +261,8 @@ def sse_data_line_kind(line: bytes, parsed=None) -> str:
     dict + choices 非空 list 时：delta.content 非空 str / delta.tool_calls 真值 →
     content；choice.finish_reason 非 None（且无前两者）→ finish；
     其余（reasoning-only、空 delta、choices 为空的 usage 帧、data:null、非 dict JSON）→ noise。
-    parsed 非 None 时复用调用方预解析结果跳过 json.loads（sentinel _SSE_PARSE_FAILED
-    等价解析失败 → content）；None（默认）保持原自行解析路径。"""
+    parsed 为 _SSE_NO_PARSED（默认）时保持原自行解析路径；显式传值（含 data:null 的 None）
+    直接复用，不重复 json.loads。sentinel _SSE_PARSE_FAILED 等价解析失败 → content。"""
     stripped = line.rstrip(b"\r\n")
     if not stripped.startswith(b"data:"):
         return "noise"
@@ -266,7 +270,7 @@ def sse_data_line_kind(line: bytes, parsed=None) -> str:
         return "done"
     if parsed is _SSE_PARSE_FAILED:
         return "content"
-    if parsed is None:
+    if parsed is _SSE_NO_PARSED:
         try:
             data = json.loads(stripped[5:].strip().decode("utf-8", "replace"))
         except ValueError:
@@ -293,7 +297,7 @@ def sse_data_line_kind(line: bytes, parsed=None) -> str:
     return "noise"
 
 
-_SSE_PARSE_FAILED = object()  # sentinel：_relay_sse 预解析失败的行（区别于未传 parsed=None）
+_SSE_PARSE_FAILED = object()  # sentinel：_relay_sse 预解析失败的行（区别于未传 parsed）
 
 
 def body_has_error(parsed) -> bool:
@@ -307,16 +311,17 @@ def body_has_error(parsed) -> bool:
     return isinstance(error_val, dict)
 
 
-def sse_line_has_usage(line: bytes, parsed=None) -> bool:
+def sse_line_has_usage(line: bytes, parsed=_SSE_NO_PARSED) -> bool:
     """判 SSE data 行是否携带非空 usage 帧（独立 usage 帧 choices=[] 与 ride-on finish
     帧都覆盖）；DONE/非 JSON/非 data 行 → False。
-    parsed 非 None 时复用预解析结果跳过 json.loads；sentinel/None+解析失败 → False。"""
+    _SSE_NO_PARSED（默认）自行解析；显式传值（含 None）复用跳过 json.loads；
+    sentinel/解析失败 → False。"""
     stripped = line.rstrip(b"\r\n")
     if not stripped.startswith(b"data:") or DONE_RE.match(stripped):
         return False
     if parsed is _SSE_PARSE_FAILED:
         return False
-    if parsed is None:
+    if parsed is _SSE_NO_PARSED:
         try:
             data = json.loads(stripped[5:].strip().decode("utf-8", "replace"))
         except ValueError:
@@ -329,20 +334,21 @@ def sse_line_has_usage(line: bytes, parsed=None) -> bool:
     return isinstance(usage, dict) and bool(usage)
 
 
-def sse_line_usage(line: bytes, parsed=None):
+def sse_line_usage(line: bytes, parsed=_SSE_NO_PARSED):
     """返回 SSE data 行中的 usage dict，无 usage 帧返回 None。
 
     解析逻辑与 sse_line_has_usage 同序：非 data: 前缀/[DONE]/非 JSON/非 dict →
     None；usage 非空 dict → 返回该 dict；其余 → None。
     独立 usage 帧（choices=[]）与 ride-on finish 帧均覆盖。
-    parsed 非 None 时复用预解析结果跳过 json.loads；sentinel → None（同解析失败）。
+    _SSE_NO_PARSED（默认）自行解析；显式传值（含 None）复用跳过 json.loads；
+    sentinel → None（同解析失败）。
     """
     stripped = line.rstrip(b"\r\n")
     if not stripped.startswith(b"data:") or DONE_RE.match(stripped):
         return None
     if parsed is _SSE_PARSE_FAILED:
         return None
-    if parsed is None:
+    if parsed is _SSE_NO_PARSED:
         try:
             data = json.loads(stripped[5:].strip().decode("utf-8", "replace"))
         except ValueError:
@@ -417,16 +423,16 @@ def sse_line_extract_usage(line: bytes):
     return usage_dict_tokens(usage)
 
 
-def sse_line_body_error(line: bytes, parsed=None) -> bool:
+def sse_line_body_error(line: bytes, parsed=_SSE_NO_PARSED) -> bool:
     """判 SSE data 行是否为 body error 帧。rstrip → 非 data: 前缀或 [DONE] →
     False；json.loads ValueError → False（fail-open 同 sse_line_has_usage）；
     否则 return body_has_error(data)。
-    parsed 非 None 时复用预解析结果跳过 json.loads；sentinel 经 body_has_error
-    非 dict 判定 → False（与原 ValueError→False 一致）。"""
+    _SSE_NO_PARSED（默认）自行解析；显式传值（含 None）复用跳过 json.loads；
+    sentinel 经 body_has_error 非 dict 判定 → False（与原 ValueError→False 一致）。"""
     stripped = line.rstrip(b"\r\n")
     if not stripped.startswith(b"data:") or DONE_RE.match(stripped):
         return False
-    if parsed is None:
+    if parsed is _SSE_NO_PARSED:
         try:
             data = json.loads(stripped[5:].strip().decode("utf-8", "replace"))
         except ValueError:
