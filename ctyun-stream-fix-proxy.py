@@ -2330,6 +2330,20 @@ def write_allowed(peer_ip: str, token_header: str, token_env: str) -> bool:
     return hmac.compare_digest(token_header.encode("utf-8"), token_env.encode("utf-8"))
 
 
+def read_allowed(peer_ip: str, token_header: str, token_env: str) -> bool:
+    """非 loopback 来源的 GET 读门禁。
+
+    语义：loopback 无条件放行；非 loopback 在 CTYUN_ADMIN_TOKEN 已配置时要求
+    X-Admin-Token 头匹配，未配置时保持放行（可选加固——启动日志会显式警告暴露面）。
+    与 write_allowed 的差别：token_env 为空时 write_allowed 拒绝，read_allowed 放行。
+    """
+    if peer_ip in ("127.0.0.1", "::1"):
+        return True
+    if not token_env:  # 未配 token：保持 LAN 明文读（可选加固），启动日志已警告
+        return True
+    return hmac.compare_digest(token_header.encode("utf-8"), token_env.encode("utf-8"))
+
+
 def set_upstream_base(base: str) -> None:
     global UPSTREAM_BASE, _upstream_source
     with _CFG_LOCK:

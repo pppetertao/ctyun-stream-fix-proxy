@@ -772,6 +772,22 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         self.assertTrue(f("192.168.1.5", "tok", "tok"))
         self.assertFalse(f("192.168.1.5", "wrong", "tok"))
 
+    def test_read_allowed_matrix(self) -> None:
+        """E3 读门禁矩阵：loopback 无条件放行；未配 token 非 loopback 放行（与
+        write_allowed 的关键差异，write_allowed 同参 False）；已配 token 按
+        X-Admin-Token 精确匹配。"""
+        f = self.mod.read_allowed
+        # loopback 直通（IPv4/IPv6）
+        self.assertTrue(f("127.0.0.1", "", ""))
+        self.assertTrue(f("::1", "", ""))
+        # 未配 token：非 loopback 放行（E3 关键差异）
+        self.assertTrue(f("192.168.1.5", "", ""))
+        self.assertTrue(f("192.168.1.5", "tok", ""))
+        self.assertTrue(f("192.168.1.5", "wrong", ""))
+        # 已配 token：精确匹配判定
+        self.assertTrue(f("192.168.1.5", "tok", "tok"))
+        self.assertFalse(f("192.168.1.5", "wrong", "tok"))
+
     def test_extract_model(self) -> None:
         f = self.mod.extract_model
         self.assertEqual(f(b'{"model":"deepseek-v4-pro-0813-oc","stream":true}'),
