@@ -2638,6 +2638,11 @@ def stats_snapshot() -> dict:
                            for m, ring in STATS["tpm_settle_ratio_by_model"].items()}
         stalls_by_model = dict(STATS["stalls_by_model"])
         rates = dict(STATS["rates"])
+        snap["ttfb_hist"] = ttfb_hist
+        snap["phase_ms"] = phase_hist
+        snap["phase_ms_by_model"] = phase_by_model
+        snap["stalls_by_model"] = stalls_by_model
+        snap["rates"] = rates
         stalls_total = STATS["stalls_total"]
         recent_len = len(RECENT_REQUESTS)
         recent_stream = sum(1 for r in RECENT_REQUESTS if r.get("stream"))
