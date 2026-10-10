@@ -6872,9 +6872,13 @@ class PersistSnapshotOrderTest(unittest.TestCase):
             t_b = threading.Thread(target=thread_b, daemon=True)
             t_b.start()
             t_b.join(30)
-            self.assertFalse(t_b.is_alive(), "B 30s 未结束：疑似死锁")
-            gate.release.set()
-            t_a.join(30)
+            try:
+                # 断言必须在 finally 之外先判活：失败时也要走 finally 放行 gate，
+                # 否则 A 卡在 release.wait(30) 空等 30s（清理 gate 泄漏）。
+                self.assertFalse(t_b.is_alive(), "B 30s 未结束：疑似死锁")
+            finally:
+                gate.release.set()
+                t_a.join(30)
             self.assertFalse(t_a.is_alive(), "A 30s 未结束：疑似死锁")
             self.assertEqual(errors, [])                                  # 无 FileNotFoundError
             with open(path, encoding="utf-8") as fh:
