@@ -3484,6 +3484,18 @@ class DashboardV2SkeletonTest(unittest.TestCase):
                       "校准失败文案必须 textContent 赋值，不得走 innerHTML")
 
 
+    def test_calib_done_credential_error_display(self) -> None:
+        """F2：credential_error 上 UI 展示"校准中止"文案，经共享 textContent
+        赋值（XSS 门禁，同 test_calib_done_error_display 句式）。"""
+        js = self.mod._DASH_JS_V2
+        self.assertIn('res.outcome === "credential_error"', js,
+                      "calibDone 缺 credential_error 判定分支")
+        self.assertIn('校准中止：上游凭证无效（HTTP ', js,
+                      "credential_error 中止需带 HTTP 状态")
+        self.assertIn('$("tpm-cali-status-text").textContent = txt;', js,
+                      "校准中止文案必须经 textContent 赋值，不得走 innerHTML")
+
+
 class DashboardV3CardsTest(unittest.TestCase):
     """v3 卡 7/8：新卡容器/函数/接线模块级断言（join 与 innerHTML 门禁沿用 6 段）。"""
 
@@ -8778,7 +8790,9 @@ class TpmCalibrateStateTest(unittest.TestCase):
             with mod.CALIBRATE_LOCK:
                 mod._CALIBRATE_STATE["running"] = False
             mod._CALIBRATE_TOKEN = None
+            mod._CALIBRATE_STOP.clear()  # 闸门清位 → 循环当轮退出，join(2) 真正回收线程
             thread.join(2)
+            mod._CALIBRATE_STOP.set()  # 恢复恒置位生产语义，供后续用例
         self.addCleanup(stop_loop)
 
         status, _ = mod.calibrate_start("m-x", token="Bearer t")
@@ -8830,7 +8844,9 @@ class TpmCalibrateStateTest(unittest.TestCase):
             with mod.CALIBRATE_LOCK:
                 mod._CALIBRATE_STATE["running"] = False
             mod._CALIBRATE_TOKEN = None
+            mod._CALIBRATE_STOP.clear()  # 闸门清位 → 循环当轮退出，join(2) 真正回收线程
             thread.join(2)
+            mod._CALIBRATE_STOP.set()  # 恢复恒置位生产语义，供后续用例
         self.addCleanup(stop_loop)
 
         status, _ = mod.calibrate_start("m-x", token="Bearer t")
@@ -8889,7 +8905,9 @@ class TpmCalibrateStateTest(unittest.TestCase):
             with mod.CALIBRATE_LOCK:
                 mod._CALIBRATE_STATE["running"] = False
             mod._CALIBRATE_TOKEN = None
+            mod._CALIBRATE_STOP.clear()  # 闸门清位 → 循环当轮退出，join(2) 真正回收线程
             thread.join(2)
+            mod._CALIBRATE_STOP.set()  # 恢复恒置位生产语义，供后续用例
         self.addCleanup(stop_loop)
 
         status, _ = mod.calibrate_start("m-probe-timeout", token="Bearer t")
@@ -8954,7 +8972,9 @@ class TpmCalibrateStateTest(unittest.TestCase):
             with mod.CALIBRATE_LOCK:
                 mod._CALIBRATE_STATE["running"] = False
             mod._CALIBRATE_TOKEN = None
+            mod._CALIBRATE_STOP.clear()  # 闸门清位 → 循环当轮退出，join(2) 真正回收线程
             thread.join(2)
+            mod._CALIBRATE_STOP.set()  # 恢复恒置位生产语义，供后续用例
         self.addCleanup(stop_loop)
 
         status, _ = mod.calibrate_start("m-cred", token="Bearer t")
@@ -9023,7 +9043,9 @@ class TpmCalibrateStateTest(unittest.TestCase):
             with mod.CALIBRATE_LOCK:
                 mod._CALIBRATE_STATE["running"] = False
             mod._CALIBRATE_TOKEN = None
+            mod._CALIBRATE_STOP.clear()  # 闸门清位 → 循环当轮退出，join(2) 真正回收线程
             thread.join(2)
+            mod._CALIBRATE_STOP.set()  # 恢复恒置位生产语义，供后续用例
         self.addCleanup(stop_loop)
 
         status, _ = mod.calibrate_start("m-probe-cap", token="Bearer t")
@@ -9123,7 +9145,9 @@ class TpmCalibrateStateTest(unittest.TestCase):
             with mod.CALIBRATE_LOCK:
                 mod._CALIBRATE_STATE["running"] = False
             mod._CALIBRATE_TOKEN = None
+            mod._CALIBRATE_STOP.clear()  # 闸门清位 → 循环当轮退出，join(2) 真正回收线程
             thread.join(2)
+            mod._CALIBRATE_STOP.set()  # 恢复恒置位生产语义，供后续用例
         self.addCleanup(stop_loop)
 
         t_start = time.time()
@@ -9194,7 +9218,9 @@ class TpmCalibrateStateTest(unittest.TestCase):
             with mod.CALIBRATE_LOCK:
                 mod._CALIBRATE_STATE["running"] = False
             mod._CALIBRATE_TOKEN = None
+            mod._CALIBRATE_STOP.clear()  # 闸门清位 → 循环当轮退出，join(2) 真正回收线程
             thread.join(2)
+            mod._CALIBRATE_STOP.set()  # 恢复恒置位生产语义，供后续用例
         self.addCleanup(stop_loop)
 
         t_start = time.time()
@@ -9218,6 +9244,19 @@ class TpmCalibrateStateTest(unittest.TestCase):
         delay = first_call_ts[0] - t_start
         self.assertLess(delay, 0.5,
                         "无 ok 流量应不等待，首调 %.3fs < 0.5s" % delay)
+
+    def test_calibrate_loop_stop_event_recycles_thread(self) -> None:
+        """F2 Task 3：_CALIBRATE_STOP 清除后 _calibrate_loop 线程应退出——
+        修复 daemon 线程跨用例泄漏、并发消费校准任务（calls=[1,1] != [1]）。"""
+        mod = self.mod
+        thread = threading.Thread(target=mod._calibrate_loop, daemon=True)
+        thread.start()
+        try:
+            mod._CALIBRATE_STOP.clear()
+            thread.join(3)
+            self.assertFalse(thread.is_alive(), "stop 事件应让循环线程退出")
+        finally:
+            mod._CALIBRATE_STOP.set()
 
 
 class CalibrateSendTest(unittest.TestCase):

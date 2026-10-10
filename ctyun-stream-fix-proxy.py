@@ -1394,6 +1394,10 @@ def _calibrate_settle_wait(model: str, task_id: str) -> bool:
         time.sleep(min(1.0, remaining))
 
 
+_CALIBRATE_STOP = threading.Event()
+_CALIBRATE_STOP.set()  # 生产路径恒置位：daemon 与进程同生命周期；测试可 clear 以可控回收循环线程
+
+
 def _calibrate_loop() -> None:
     """校准 daemon 线程（main() 恒启动一次；无待跑任务时轮询空转）。
 
@@ -1407,7 +1411,7 @@ def _calibrate_loop() -> None:
     running=False——不静默吞掉（R6），供 Dashboard 展示。
     """
     global _CALIBRATE_TOKEN
-    while True:
+    while _CALIBRATE_STOP.is_set():
         time.sleep(1)
         with CALIBRATE_LOCK:
             if not _CALIBRATE_STATE["running"]:
@@ -5632,6 +5636,10 @@ function calibDone(snap) {
            Math.floor(res.threshold * 0.9 / 1000) * 1000 + "）";
   }
   txt += "。";
+  if (res.outcome === "credential_error") {
+    txt = "校准中止：上游凭证无效（HTTP " + (res.status || "401/403") +
+          "），请检查 API Key 后重试。";
+  }
   $("tpm-cali-status-text").textContent = txt;
   $("tpm-cali-abort").style.display = "none";
   loadTpmSettings();  // 刷新 recommend.probe / enabled_advice / 一键应用按钮
