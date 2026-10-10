@@ -5,9 +5,9 @@
 - **Spec**: `docs/superpowers/specs/2026-10-10-calibrate-4xx-classification-design.md`（worktree 分支 commit 00d66a2）
 - **Worktree**: `.worktrees/calibrate-4xx-classification`，分支 `fix/calibrate-4xx-classification`，merge-base = ea3fbbc
 - **Baseline**: `/usr/bin/python3 ctyun-stream-fix-proxy.test.py` 389 全绿（ea3fbbc）。本机无 `python`，一律 `/usr/bin/python3`
-- **规模**: 2 实现卡 + whole-branch 收尾节（≤4 卡小计划，单次 dispatch 执行）
+- **规模**: 3 实现卡 + whole-branch 收尾节（≤4 卡小计划，单次 dispatch 执行；Task 3 为 2026-10-10 修正新增，见 Self-Review 修正记录 2）
 - **Tier 路由**: 全卡 B → executor（代码已写死到哨兵/分支级，转写 + 跑测试 + commit；无 C 档留白判据命中——无真机验证、无运行时数据依赖、无 DI 实测，所有 seam 已注入）
-- **改动范围**: 仅 2 文件——`ctyun-stream-fix-proxy.py` + `ctyun-stream-fix-proxy.test.py`。新增测试 6 个，全量预期 389 + 6 = **395**
+- **改动范围**: 仅 2 文件——`ctyun-stream-fix-proxy.py` + `ctyun-stream-fix-proxy.test.py`。新增测试 7 个，全量预期 389 + 7 = **396**（Task 1 五 + Task 2 一 + Task 3 一；原 395 为 Task 3 新增前口径，已随修正 2 更新）
 - **命名澄清（spec 措辞 vs 实测）**: 哨兵类别常量 = `CLASS_CREDENTIAL_FAILURE = "credential_failure"`（engine 内部）；对外 result 字符串 = `outcome: "credential_error"`（spec 定名）。两者**不同值**，卡内代码已按此写死，不得混用
 
 ## Global Constraints（全卡硬约束）
@@ -44,10 +44,18 @@
 | test JS 断言先例 ：3476-3484 | `DashboardV2SkeletonTest`（:3401 起，setUp 已有 `load_proxy_module`）✓ |
 | test runner 尾部 | `unittest.main(verbosity=2)` ✓ |
 | 类内现有计数 | `TpmCalibrateEngineTest`+`TpmCalibrateStateTest` = 30 绿；`DashboardV2SkeletonTest` = 7 绿 ✓ |
+| `def _calibrate_loop` :1397（Task 1 落盘后实测） | def grep=1；`global _CALIBRATE_TOKEN`+`while True:`+`time.sleep(1)` 三行块 count=1 唯一（裸 `while True:` 全文件 7 处）✓ |
+| `threading` import :27 | 生产侧 `threading.Event` 可直接用，无需新 import ✓ |
+| test stop_loop 六行块（Task 1 落盘后实测） | :8772 / :8824 / :8883 / :8948 / :9017 / :9117 / :9188 恰 7 处逐字相同（count=7，replace_all 一次替换）✓ |
+| test StateTest 班尾锚 | settle_skips 末断言（`"无 ok 流量应不等待，首调 %.3fs < 0.5s"`）+ `class CalibrateSendTest`（:9218）块唯一 ✓ |
+| 类内计数（Task 1/2 落盘后实测） | EngineTest 22 + StateTest 13 = 35；全文件 `def test_` = 395；Task 3 后 StateTest 14 / 全量 396 ✓ |
+| Task 2 矛盾实证 | test :3493 实跑 `AssertionError: '"校准中止：上游凭证无效"' not found`；修正断言子串 `校准中止：上游凭证无效（HTTP ` 实测 js 含（HIT）✓ |
 
 ---
 
 ## Task 1（tier B）：calibrate_engine 401/403 → credential_error + loop 天然排除锁定
+
+> **执行状态**：本卡已完成并 commit（7b346b2）。其新增的 `test_calibrate_loop_401_skips_probe_results` 泄漏 daemon 线程问题由 Task 3 修复（同根因，见该节根因说明）。
 
 **文件**：`ctyun-stream-fix-proxy.py` + `ctyun-stream-fix-proxy.test.py`
 **TDD 顺序**：步骤 1 写 5 个测试实跑红（4 红 + 1 常绿）→ 步骤 2 实现 6 处 Edit → 步骤 3 绿 → commit。
@@ -343,6 +351,8 @@ $ git commit -m "fix(calibrate): 401/403 凭证失败分类 credential_error 立
 
 ## Task 2（tier B）：dashboard calibDone credential_error 中止文案（textContent 门禁）
 
+> **执行状态（修正 1）**：本卡曾落盘后被 executor STOP——Edit 2.1 原第 2 条断言 `'"校准中止：上游凭证无效"'` 与 Edit 2.2 实现文案 `"校准中止：上游凭证无效（HTTP ...）"` 逐字转写不可同时满足（实测红证据：`AssertionError: '"校准中止：上游凭证无效"' not found in ...`，test :3493）。裁定：**保留实现文案，修测试断言**（下方 Edit 2.1 已修正），重新派发执行；工作树现存 Edit 2.2 实现未提交，重新执行时按本卡 TDD 顺序自测即可。
+
 **文件**：`ctyun-stream-fix-proxy.py`（`_DASH_JS_V2`）+ `ctyun-stream-fix-proxy.test.py`
 **TDD 顺序**：步骤 1 写 1 个测试实跑红 → 步骤 2 实现 1 处 Edit → 步骤 3 绿 → commit。
 
@@ -363,8 +373,8 @@ new_string:
         js = self.mod._DASH_JS_V2
         self.assertIn('res.outcome === "credential_error"', js,
                       "calibDone 缺 credential_error 判定分支")
-        self.assertIn('"校准中止：上游凭证无效"', js,
-                      "calibDone 缺校准中止文案")
+        self.assertIn('校准中止：上游凭证无效（HTTP ', js,
+                      "credential_error 中止需带 HTTP 状态")
         self.assertIn('$("tpm-cali-status-text").textContent = txt;', js,
                       "校准中止文案必须经 textContent 赋值，不得走 innerHTML")
 
@@ -406,7 +416,7 @@ $ /usr/bin/python3 ctyun-stream-fix-proxy.test.py DashboardV2SkeletonTest
 Ran 8 tests in ...s
 OK
 ```
-（7 现有 + 1 新增。）
+（7 现有 + 1 新增。修正 1 后断言与 Edit 2.2 文案逐字匹配——已实测 `_DASH_JS_V2` 含 `校准中止：上游凭证无效（HTTP ` 子串，绿态可达。）
 
 ```
 $ git add ctyun-stream-fix-proxy.py ctyun-stream-fix-proxy.test.py
@@ -415,16 +425,154 @@ $ git commit -m "fix(dashboard): 校准 credential_error 展示中止文案（te
 
 ---
 
-## Whole-Branch 收尾节（Task 2 执行者同 dispatch 收尾，或主代理单独 dispatch）
+## Task 3（tier B）：_calibrate_loop 停止闸门（daemon 线程可控回收，修 Task 1 验收同根因阻塞）
+
+> **执行状态**：本卡为 2026-10-10 修正新增（tracer 已定位根因，主代理裁定方案=生产侧最小停止闸门）。
+
+**文件**：`ctyun-stream-fix-proxy.py` + `ctyun-stream-fix-proxy.test.py`
+**根因（tracer 实测）**：`_calibrate_loop`（py:1397，循环 `while True:` 在 py:1410）无退出路径；`TpmCalibrateStateTest` 7 个用例各起一个 `_calibrate_loop` daemon 线程，`stop_loop` 的 `thread.join(2)` 必超时、线程永生。Task 1 新增的 `test_calibrate_loop_401_skips_probe_results` 泄漏的线程在 `test_calibrate_loop_capped_skips_probe_results`（test :8984 区域）并发消费同一任务 → `calls=[1,1] != [1]`——这是 Task 1 验收（整班绿）的同根因阻塞，必须修。
+**方案**：生产侧最小停止闸门——`threading.Event` 生产恒置位（daemon 与进程同生命周期，生产行为不变），测试 clear 以可控回收循环线程。
+**TDD 顺序**：步骤 1 写 1 个测试实跑红（无闸门现状线程永生）→ 步骤 2 实现 2 处生产 Edit + 1 处测试 Edit（7 处 stop_loop）→ 步骤 3 绿 → commit。
+
+### 步骤 1（红）：先写失败测试
+
+**Edit 3.1** — `ctyun-stream-fix-proxy.test.py`，`TpmCalibrateStateTest` 班尾（`test_calibrate_loop_settle_skips_when_no_recent_ok` 末断言之后、`class CalibrateSendTest` 之前插入）。锚点（唯一）：
+
+old_string:
+```
+        delay = first_call_ts[0] - t_start
+        self.assertLess(delay, 0.5,
+                        "无 ok 流量应不等待，首调 %.3fs < 0.5s" % delay)
+
+
+class CalibrateSendTest(unittest.TestCase):
+```
+
+new_string:
+```python
+        delay = first_call_ts[0] - t_start
+        self.assertLess(delay, 0.5,
+                        "无 ok 流量应不等待，首调 %.3fs < 0.5s" % delay)
+
+    def test_calibrate_loop_stop_event_recycles_thread(self) -> None:
+        """F2 Task 3：_CALIBRATE_STOP 清除后 _calibrate_loop 线程应退出——
+        修复 daemon 线程跨用例泄漏、并发消费校准任务（calls=[1,1] != [1]）。"""
+        mod = self.mod
+        thread = threading.Thread(target=mod._calibrate_loop, daemon=True)
+        thread.start()
+        try:
+            mod._CALIBRATE_STOP.clear()
+            thread.join(3)
+            self.assertFalse(thread.is_alive(), "stop 事件应让循环线程退出")
+        finally:
+            mod._CALIBRATE_STOP.set()
+
+
+class CalibrateSendTest(unittest.TestCase):
+```
+
+**红验证**（预期 FAILED——现状 `while True` 无退出路径，clear 无效，join(3) 超时后线程仍存活）：
+
+```
+$ /usr/bin/python3 ctyun-stream-fix-proxy.test.py \
+    TpmCalibrateStateTest.test_calibrate_loop_stop_event_recycles_thread
+Ran 1 test in ...s
+FAILED (failures=1)
+```
+
+### 步骤 2（绿）：实现
+
+**Edit 3.2** — `ctyun-stream-fix-proxy.py`，`_calibrate_loop` 定义前新增停止闸门（`threading` 已 import :27）。锚点（唯一，grep=1）：
+
+old_string:
+```
+def _calibrate_loop() -> None:
+```
+
+new_string:
+```
+_CALIBRATE_STOP = threading.Event()
+_CALIBRATE_STOP.set()  # 生产路径恒置位：daemon 与进程同生命周期；测试可 clear 以可控回收循环线程
+
+
+def _calibrate_loop() -> None:
+```
+
+**Edit 3.3** — `_calibrate_loop` 循环条件（py:1410；裸 `while True:` 全文件 7 处，用三行块锚定唯一，grep=1）。循环体所有 continue/逻辑不动，事件每轮开头查。
+
+old_string:
+```
+    global _CALIBRATE_TOKEN
+    while True:
+        time.sleep(1)
+```
+
+new_string:
+```
+    global _CALIBRATE_TOKEN
+    while _CALIBRATE_STOP.is_set():
+        time.sleep(1)
+```
+
+**Edit 3.4** — `ctyun-stream-fix-proxy.test.py`，`TpmCalibrateStateTest` 7 处 stop_loop 同款六行块（实测 :8772 / :8824 / :8883 / :8948 / :9017 / :9117 / :9188 逐字相同，count=7）→ **replace_all 一次替换 7 处**：join 前 clear 闸门，stop_loop 本身即该班 addCleanup 惯例，末尾 set() 恢复生产语义。
+
+old_string（replace_all=true，实测恰 7 处逐字相同）:
+```
+        def stop_loop():
+            with mod.CALIBRATE_LOCK:
+                mod._CALIBRATE_STATE["running"] = False
+            mod._CALIBRATE_TOKEN = None
+            thread.join(2)
+        self.addCleanup(stop_loop)
+```
+
+new_string:
+```
+        def stop_loop():
+            with mod.CALIBRATE_LOCK:
+                mod._CALIBRATE_STATE["running"] = False
+            mod._CALIBRATE_TOKEN = None
+            mod._CALIBRATE_STOP.clear()  # 闸门清位 → 循环当轮退出，join(2) 真正回收线程
+            thread.join(2)
+            mod._CALIBRATE_STOP.set()  # 恢复恒置位生产语义，供后续用例
+        self.addCleanup(stop_loop)
+```
+
+### 步骤 3（验证 + commit）
+
+```
+$ /usr/bin/python3 ctyun-stream-fix-proxy.test.py TpmCalibrateStateTest
+Ran 14 tests in ...s
+OK
+```
+（13 现有——含 Task 1 的 401 用例与既有 capped 用例——+ 1 新增；闸门修复后 401 泄漏线程不再并发消费 capped 用例任务。）
+
+```
+$ /usr/bin/python3 ctyun-stream-fix-proxy.test.py
+Ran 396 tests in ...s
+OK
+```
+（389 baseline + Task 1 五 + Task 2 一 + Task 3 一 = 396；无新增红。）
+
+```
+$ git add ctyun-stream-fix-proxy.py ctyun-stream-fix-proxy.test.py
+$ git commit -m "fix(calibrate): _calibrate_loop 停止闸门——测试 daemon 线程可控回收，修跨用例泄漏并发消费任务"
+```
+
+**验收**：`TpmCalibrateStateTest` 整班全绿（含 capped 与 401 两用例）+ 全量 396 无新增红。
+
+---
+
+## Whole-Branch 收尾节（Task 3 执行者同 dispatch 收尾，或主代理单独 dispatch）
 
 1. 全量回归：
 
 ```
 $ /usr/bin/python3 ctyun-stream-fix-proxy.test.py
-Ran 395 tests in ...s
+Ran 396 tests in ...s
 OK
 ```
-（389 baseline + 6 新增；零 failed / 零 error。）
+（389 baseline + 7 新增——Task 1 五 + Task 2 一 + Task 3 一；零 failed / 零 error。）
 
 2. Scope 核验（merge-base..HEAD 只允许 spec/PLAN/两源文件）：
 
@@ -436,11 +584,13 @@ $ git diff --stat ea3fbbc..HEAD
 
 | AC | 证据 |
 |---|---|
-| AC1 全量绿（389+6=395） | 收尾节第 1 步 stdout |
+| AC1 全量绿（389+7=396） | 收尾节第 1 步 stdout |
 | AC2 401/403 → credential_error/threshold None/不重试；429 → rejected+est | Task 1 步骤 3（`test_calibrate_engine_401_stops_credential_error` / `test_calibrate_engine_401_on_retry_after_503_aborts` / `test_calibrate_engine_429_still_rejected_regression`） |
 | AC3 PROBE_RESULTS 无新条目 + REQ 行 `outcome=credential_error -> 401/403` | Task 1 `test_calibrate_loop_401_skips_probe_results`（PROBE_RESULTS/recommend.source/error 三断言）；REQ 行由 `_calibrate_log` :1313-1321 现状自动产出（`outcome=%s`/`-> %s` 直取 result），无新测试（spec 测试清单未列） |
 | AC4 磁盘 schema 零变化 | Task 1 步骤 3 grep=0 + 收尾节 diff scope 核验 |
 | AC5 dashboard credential_error 中文文案经 textContent | Task 2 步骤 3（`test_calib_done_credential_error_display`） |
+
+> 补充（Task 3，spec 外同根因修复，主代理 2026-10-10 裁定）：daemon 线程泄漏不新增 spec AC，验收=Task 3 步骤 3 整班 14 绿 + 全量 396，计入 AC1 证据链。
 
 ---
 
@@ -450,4 +600,11 @@ $ git diff --stat ea3fbbc..HEAD
 2. **placeholder scan**：全部 Edit 为完整 old/new 文本，无 `...`/TODO/“仿照既有”指令；测试与实现代码块可直接转写。0 命中。
 3. **type consistency**：`_result("credential_error", None, status:int)` 与 ：1120-1124 签名一致（batches 默认闭包 batch——401 首批=1、503→401=1、403 爬坡第 3 批=3，与断言吻合）；哨兵 `"credential_failure"`（category）vs `"credential_error"`（outcome 字符串）已显式区分；JS `(res.status || "401/403")` 字符串拼接合法；测试消费键与 result dict 六键（threshold/batches/consumed/outcome/status/ts）一致。
 4. **可落盘性**：所有 old_string 实测文件内唯一（grep=1 或异缩进多行块互斥）；测试插入锚为唯一 def/class 行；targeted 验证命令已实跑打通（30 tests OK / 7 tests OK / 单方法 OK）；红态预期可判定（4 failures=4 / 1 failure=1）。
-5. **锚点实测**：≥3 达标（共 17 项，见「锚点实测记录」表，全部现场 grep/read 回显，非 spec 转抄）。
+5. **锚点实测**：≥3 达标（共 17 项 + 修正 2 追加 6 项 = 23 项，见「锚点实测记录」表，全部现场 grep/read 回显，非 spec 转抄）。
+
+---
+
+## Self-Review 修正记录（2026-10-10 第二次修订）
+
+1. **修正 1（Task 2 测试/实现自相矛盾）**：Edit 2.1 第 2 条断言原为 `'"校准中止：上游凭证无效"'`，与 Edit 2.2 实现文案 `"校准中止：上游凭证无效（HTTP " + (res.status || "401/403") + ...` 逐字转写不可同时满足（实测红证据：`AssertionError: '"校准中止：上游凭证无效"' not found`，test :3493；实现侧 js 含 `校准中止：上游凭证无效（HTTP ` 子串实测 HIT、旧断言子串 MISS）。裁定：**保留实现文案，修测试断言**——Edit 2.1 第 2 条断言改为 `self.assertIn('校准中止：上游凭证无效（HTTP ', js, "credential_error 中止需带 HTTP 状态")`，Task 2 步骤 3 绿态描述同步；第 1 条 `res.outcome === "credential_error"` 断言与 Edit 2.2 文案不动。
+2. **修正 2（新增 Task 3：daemon 停止闸门）**：tracer 定位 Task 1 验收同根因阻塞——`_calibrate_loop`（py:1397，`while True:` :1410）无退出路径，`TpmCalibrateStateTest` 7 处 stop_loop（test :8772/8824/8883/8948/9017/9117/9188）`thread.join(2)` 恒超时、daemon 线程永生，401 用例（Task 1 新增）泄漏线程在 capped 用例（test :8984 区域）并发消费同一任务 → `calls=[1,1] != [1]`。方案（主代理裁定，生产侧最小停止闸门）：`_CALIBRATE_STOP = threading.Event()` 恒置位（Edit 3.2）+ 循环条件改 `while _CALIBRATE_STOP.is_set():`（Edit 3.3，生产行为不变）；测试侧 7 处 stop_loop join 前 clear、末尾 set 恢复（Edit 3.4，replace_all）+ 新增 `test_calibrate_loop_stop_event_recycles_thread`（Edit 3.1，红→绿锁定闸门）。**全量预期由 395 修正为 396**（389 + 7：Task 1 五 + Task 2 一 + Task 3 一）——原「全量 395」口径未计入 Task 3 新增测试，Header/收尾节/AC1 已同步更新。
