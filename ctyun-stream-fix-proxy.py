@@ -3427,6 +3427,16 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 class AdminHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
+    def _read_gate(self) -> bool:
+        """do_GET 读端点统一读门禁：read_allowed 通过返回 True；拒绝时已发送
+        403（文案与原 9 处逐字一致）并返回 False。调用方：`if not self._read_gate(): return`。"""
+        if read_allowed(self.client_address[0],
+                        self.headers.get("X-Admin-Token") or "",
+                        os.environ.get("CTYUN_ADMIN_TOKEN", "")):
+            return True
+        self._send_json(403, {"error": "read requires X-Admin-Token"})
+        return False
+
     def do_GET(self) -> None:
         path = urllib.parse.urlsplit(self.path).path
         if path == "/":
@@ -3434,38 +3444,23 @@ class AdminHandler(http.server.BaseHTTPRequestHandler):
         elif path == "/favicon.ico":
             self._send(200, "image/x-icon", FAVICON_ICO)
         elif path == "/api/stats":
-            if not read_allowed(self.client_address[0],
-                                self.headers.get("X-Admin-Token") or "",
-                                os.environ.get("CTYUN_ADMIN_TOKEN", "")):
-                self._send_json(403, {"error": "read requires X-Admin-Token"})
+            if not self._read_gate():
                 return
             self._send_json(200, stats_snapshot())
         elif path == "/api/tpm_stats":
-            if not read_allowed(self.client_address[0],
-                                self.headers.get("X-Admin-Token") or "",
-                                os.environ.get("CTYUN_ADMIN_TOKEN", "")):
-                self._send_json(403, {"error": "read requires X-Admin-Token"})
+            if not self._read_gate():
                 return
             self._send_json(200, tpm_snapshot())
         elif path == "/api/tpm_settings":
-            if not read_allowed(self.client_address[0],
-                                self.headers.get("X-Admin-Token") or "",
-                                os.environ.get("CTYUN_ADMIN_TOKEN", "")):
-                self._send_json(403, {"error": "read requires X-Admin-Token"})
+            if not self._read_gate():
                 return
             self._send_json(200, tpm_settings_snapshot())
         elif path == "/api/tpm_calibrate":
-            if not read_allowed(self.client_address[0],
-                                self.headers.get("X-Admin-Token") or "",
-                                os.environ.get("CTYUN_ADMIN_TOKEN", "")):
-                self._send_json(403, {"error": "read requires X-Admin-Token"})
+            if not self._read_gate():
                 return
             self._send_json(200, calibrate_state_snapshot())
         elif path == "/api/config":
-            if not read_allowed(self.client_address[0],
-                                self.headers.get("X-Admin-Token") or "",
-                                os.environ.get("CTYUN_ADMIN_TOKEN", "")):
-                self._send_json(403, {"error": "read requires X-Admin-Token"})
+            if not self._read_gate():
                 return
             with _CFG_LOCK:
                 payload = {"upstream_base": UPSTREAM_BASE, "source": _upstream_source,
@@ -3474,17 +3469,11 @@ class AdminHandler(http.server.BaseHTTPRequestHandler):
                            "tpm_model_budgets": dict(TPM_MODEL_BUDGETS)}
             self._send_json(200, payload)
         elif path == "/api/health":
-            if not read_allowed(self.client_address[0],
-                                self.headers.get("X-Admin-Token") or "",
-                                os.environ.get("CTYUN_ADMIN_TOKEN", "")):
-                self._send_json(403, {"error": "read requires X-Admin-Token"})
+            if not self._read_gate():
                 return
             self._send_json(200, {"upstream": probe_state_snapshot()})
         elif path == "/api/probe_history":
-            if not read_allowed(self.client_address[0],
-                                self.headers.get("X-Admin-Token") or "",
-                                os.environ.get("CTYUN_ADMIN_TOKEN", "")):
-                self._send_json(403, {"error": "read requires X-Admin-Token"})
+            if not self._read_gate():
                 return
             self._send_json(200, probe_history_snapshot())
         elif path == "/api/errors":
@@ -3514,10 +3503,7 @@ class AdminHandler(http.server.BaseHTTPRequestHandler):
                     self._send_json(200, match)
             else:
                 # 列表（不含 body/response）：挂 read_allowed 读门禁（详情分支维持 write_allowed）
-                if not read_allowed(self.client_address[0],
-                                    self.headers.get("X-Admin-Token") or "",
-                                    os.environ.get("CTYUN_ADMIN_TOKEN", "")):
-                    self._send_json(403, {"error": "read requires X-Admin-Token"})
+                if not self._read_gate():
                     return
                 with ERROR_LOCK:
                     events = [{"id": e["id"], "ts": e["ts"], "kind": e["kind"],
@@ -3535,10 +3521,7 @@ class AdminHandler(http.server.BaseHTTPRequestHandler):
                                       "count": len(events),
                                       "events": events})
         elif path == "/api/logs":
-            if not read_allowed(self.client_address[0],
-                                self.headers.get("X-Admin-Token") or "",
-                                os.environ.get("CTYUN_ADMIN_TOKEN", "")):
-                self._send_json(403, {"error": "read requires X-Admin-Token"})
+            if not self._read_gate():
                 return
             qs = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
             cursor = qs.get("cursor", [None])[0]
