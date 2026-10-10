@@ -646,8 +646,8 @@ def load_proxy_module():
 TPM_RATIO = load_proxy_module().TPM_TOKEN_RATIO
 
 
-def admin_get(port: int, path: str, headers: dict = None):
-    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+def admin_get(port: int, path: str, headers: dict = None, host: str = "127.0.0.1"):
+    conn = http.client.HTTPConnection(host, port, timeout=10)
     hdrs = {}
     if headers:
         hdrs.update(headers)
@@ -1779,7 +1779,7 @@ class ProxyDashboardUnitTest(unittest.TestCase):
             mod.TPM_MODEL_BUDGETS.update(orig)
             shutil.rmtree(os.path.dirname(path), ignore_errors=True)
 
-    def test_persist_upstream_carries_tpm_model_budgets(self) -> None:
+    def test_set_tpm_model_budgets_persists_full_schema(self) -> None:
         # E1-A 回归守卫（修复前后均绿）：persist_upstream 已删，窄出口改走
         # set_tpm_model_budgets → save_stats_counters 全量 schema；预算读回相等 +
         # 文件含 stats 键，防止再引入窄 schema 中间态落盘（崩溃窗口回归）。
@@ -4103,6 +4103,59 @@ class AdminIntegrationTest(unittest.TestCase):
         # loopback 无 token → 200（admin_get 固定连 127.0.0.1，读门禁直通）
         status, _, _ = admin_get(self.proc.admin_port, "/api/stats")
         self.assertEqual(status, 200)
+
+    def test_admin_read_gate_matrix_all_endpoints(self) -> None:
+        """F4 characterization pin：9 个 GET 读端点 × 4 形态行为矩阵。提取 _read_gate
+        前后均须绿（行为守卫网）；red 由 AdminReadGateStructureTest 承担。
+        /api/errors 不带 id 参数——命中列表分支（read_allowed 门禁）；带 id 会误入
+        write_allowed 详情分支（403 文案不同，不属本矩阵）。"""
+        stop_proxy(self.proc)  # setUp 默认 127.0.0.1 绑定；本测需 0.0.0.0 + token，重建
+        stop_fake_upstreams()
+        upstream_port = make_fake_upstream(False)
+        self.proc = start_proxy(self.upstream_port, free_port(),
+                                extra_env={"CTYUN_ADMIN_HOST": "0.0.0.0",
+                                           "CTYUN_ADMIN_TOKEN": "sekret"})
+        # 本机候选地址枚举与过滤沿用 test_admin_get_read_gate_non_loopback（:4045-4069）：
+        # ① 127.0.0.0/8；② 169.254.0.0/16；③ 198.18.0.0/15 VPN/TUN 黑洞段显式排除。
+        try:
+            candidates = list(socket.gethostbyname_ex(socket.gethostname())[2])
+        except socket.gaierror:
+            candidates = []
+        candidates = [ip for ip in candidates
+                      if not ip.startswith("127.")
+                      and not ip.startswith("169.254.")
+                      and not (ip.startswith("198.18.") or ip.startswith("198.19."))]
+        lan_ip = None
+        for ip in candidates:  # 优先取私网段第一个：192.168/16、10/8、172.16/12
+            if (ip.startswith("192.168.") or ip.startswith("10.")
+                    or (ip.startswith("172.") and 16 <= int(ip.split(".")[1]) <= 31)):
+                lan_ip = ip
+                break
+        if lan_ip is None:
+            self.skipTest("no routable LAN IP in sandbox")
+        forbidden = b'{"error": "read requires X-Admin-Token"}'
+        endpoints = ["/api/stats", "/api/tpm_stats", "/api/tpm_settings",
+                     "/api/tpm_calibrate", "/api/config", "/api/health",
+                     "/api/probe_history", "/api/errors", "/api/logs"]
+        for path in endpoints:
+            with self.subTest(endpoint=path, leg="lan-no-token"):
+                status, body, _ = admin_get(self.proc.admin_port, path, host=lan_ip)
+                self.assertEqual(status, 403)
+                self.assertEqual(body, forbidden)
+            with self.subTest(endpoint=path, leg="lan-wrong-token"):
+                status, body, _ = admin_get(self.proc.admin_port, path,
+                                            headers={"X-Admin-Token": "wrong"},
+                                            host=lan_ip)
+                self.assertEqual(status, 403)
+                self.assertEqual(body, forbidden)
+            with self.subTest(endpoint=path, leg="lan-right-token"):
+                status, _, _ = admin_get(self.proc.admin_port, path,
+                                         headers={"X-Admin-Token": "sekret"},
+                                         host=lan_ip)
+                self.assertEqual(status, 200)
+            with self.subTest(endpoint=path, leg="loopback-no-token"):
+                status, _, _ = admin_get(self.proc.admin_port, path)
+                self.assertEqual(status, 200)
 
     def test_admin_get_read_allowed_no_token_env(self) -> None:
         """E3：未配 CTYUN_ADMIN_TOKEN 时读端点保持开放（loopback 200，不受门禁影响）。
