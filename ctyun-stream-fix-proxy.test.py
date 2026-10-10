@@ -7125,7 +7125,7 @@ class TpmRateLimitTest(unittest.TestCase):
 
     复用 make_scripted_upstream / start_proxy / post_sse / get_plain / admin_get /
     post_sse_auth（卡 4）/ stderr_text / stop_fake_upstreams；env seam 把 60s 窗口、
-    120s 超时压缩到秒级。唯一时间断言（窗口滚过 ≥1s、settle 放行 <1s、超时 ~2s）
+    120s 超时压缩到秒级。唯一时间断言（窗口滚过 ≥1s、settle 放行 <5s、超时 ~2s）
     全部由 1s 粒度轮询 + seam 余量保证，无 sleep 猜测依赖。
     """
 
@@ -7287,9 +7287,9 @@ class TpmRateLimitTest(unittest.TestCase):
         elapsed = time.time() - t0
         self.assertEqual(status2, 200,
                          "second request must be admitted after settle, got %d" % status2)
-        # 满载下端到端耗时（TCP 连接 + 线程调度）可 >1s（spec R31-S2 墙钟竞态）；
-        # 放宽到 5s 仍远小于本测试窗口 10s（WINDOW_S=10），排队等待路径必然 >5s，
-        # "settle 后无窗口等待即放行"语义不变——断言强度不低于现状。
+        # 满载下端到端耗时（TCP 连接 + 线程调度）可 >1s（spec R31-S2 墙钟竞态），
+        # 故阈值放宽到 5s。注意本用例 est 87+10=97 < LIMIT 200，第二请求不可能排队，
+        # 本断言只防极端 stall；settle 语义由下方 tpm=2 计数与 bucket used==4 守护。
         self.assertLess(elapsed, 5.0,
                         "settle must release budget immediately (no window wait), got %.2fs"
                         % elapsed)
