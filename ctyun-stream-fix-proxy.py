@@ -1394,8 +1394,9 @@ def _calibrate_settle_wait(model: str, task_id: str) -> bool:
         time.sleep(min(1.0, remaining))
 
 
-_CALIBRATE_STOP = threading.Event()
-_CALIBRATE_STOP.set()  # 生产路径恒置位：daemon 与进程同生命周期；测试可 clear 以可控回收循环线程
+_CALIBRATE_RUN = threading.Event()
+# 语义：生产路径恒置位 = 运行中（daemon 与进程同生命周期）；测试 clear 让循环当轮退出。
+_CALIBRATE_RUN.set()
 
 
 def _calibrate_loop() -> None:
@@ -1411,7 +1412,7 @@ def _calibrate_loop() -> None:
     running=False——不静默吞掉（R6），供 Dashboard 展示。
     """
     global _CALIBRATE_TOKEN
-    while _CALIBRATE_STOP.is_set():
+    while _CALIBRATE_RUN.is_set():
         time.sleep(1)
         with CALIBRATE_LOCK:
             if not _CALIBRATE_STATE["running"]:
@@ -1460,7 +1461,10 @@ def _calibrate_loop() -> None:
             _CALIBRATE_STATE["progress"] = {"batch": result["batches"],
                                              "consumed": result["consumed"]}
             _CALIBRATE_STATE["running"] = False
-            _CALIBRATE_STATE["last_probe_ts"][model] = result["ts"]
+            # 凭证失败不占冷却：写 last_probe_ts 会让 calibrate_start 的最小间隔
+            # 闸门（429）拒掉用户修好 key 后的立即重试。
+            if result["outcome"] != "credential_error":
+                _CALIBRATE_STATE["last_probe_ts"][model] = result["ts"]
         # F2：credential_error（401/403 凭证失败）outcome≠"rejected" 且 threshold=None，
         # 天然不进本分支——凭证失败不写 PROBE_RESULTS，recommend.source 不变 probe。
         if result["outcome"] == "rejected" and result["threshold"] is not None:
