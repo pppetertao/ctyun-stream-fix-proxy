@@ -47,11 +47,15 @@
 class AdminReadGateStructureTest(unittest.TestCase):
     def test_read_gate_helper_converges_nine_inline_blocks(self) -> None:
         mod = load_proxy_module()          # :637 既有基建
-        src = inspect.getsource(mod.AdminHandler)
-        self.assertIn("def _read_gate(self) -> bool:", src)
-        self.assertEqual(src.count('"read requires X-Admin-Token"'), 1)   # 提取前 9 → red
-        self.assertGreaterEqual(src.count("self._read_gate()"), 9)
-        self.assertEqual(src.count("read_allowed("), 1)                   # 仅 helper 内一处
+        src = inspect.getsource(mod.AdminHandler.do_GET)
+        self.assertEqual(src.count("self._read_gate()"), 9,
+                         "9 个读端点应统一走 _read_gate helper")
+        self.assertEqual(src.count("read_allowed("), 0,
+                         "do_GET 不应再内联 read_allowed")
+        self.assertNotIn('"read requires X-Admin-Token"', src,
+                         "403 文案应收敛到 helper 内")
+        self.assertTrue(hasattr(mod.AdminHandler, "_read_gate"),
+                        "AdminHandler 必须有 _read_gate helper")
 ```
 
 - **TpmCalibrateEngineTest（:8340）新增 pin 测试** `test_tpm_probe_charges_budget_stays_disposed`：`self.assertFalse(hasattr(mod, "tpm_probe_charges_budget"))`（mod 经 load_proxy_module）。生而绿——该函数从未存在于代码（见 R31 证据 3），无 red 可言；此断言钉死弃用决策，防僵尸半实现。
