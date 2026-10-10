@@ -1503,12 +1503,15 @@ STRIP_HEADERS = HOP_HEADERS | {"host", "content-length", "accept-encoding"}
 _CFG_LOCK = threading.Lock()
 PROBE_LOCK = threading.Lock()
 STATS_LOCK = threading.Lock()
-# E1-A 持久化单写者锁。RLock 为防御选型：_on_signal 在 main 线程执行，而信号可在
-# 任意字节码边界打断 main 线程；当前 main 线程注册信号后只进 serve_forever（:5608），
-# 同线程重入暂无现实路径，但 main 线程一旦新增 save_stats_counters 调用路径，普通
-# Lock 会自死锁挂死退出路径，RLock 则同线程重入安全（跨线程互斥语义不变）。
-# 锁序纪律：_PERSIST_LOCK 只包写段；持锁块内禁取 STATS_LOCK/_CFG_LOCK/TPM_LOCK；
-# copy 阶段两段锁不并入本锁。
+# E1-A 持久化单写者锁（F3 外扩为快照+写盘整体临界区）。RLock 为防御选型：
+# _on_signal 在 main 线程执行，信号可在任意字节码边界打断 main 线程；当前 main
+# 线程注册信号（:5725）后只进 serve_forever（:5765），同线程重入暂无现实路径，
+# 但 main 线程一旦新增 save_stats_counters 调用路径，普通 Lock 会自死锁挂死退出
+# 路径，RLock 同线程重入安全（跨线程互斥语义不变）。
+# 锁序纪律（F3 起）：_PERSIST_LOCK 包住 copy+write 全程，内部按固定顺序 STATS_LOCK
+# → _CFG_LOCK 两段短持（两段互不嵌套）。全库锁序：_PERSIST_LOCK → {STATS_LOCK,
+# _CFG_LOCK}；TPM_LOCK → STATS_LOCK（tpm_settle，与 _PERSIST_LOCK 无共享路径，不成环）。
+# 禁止在持有 STATS/_CFG/TPM/PROBE 锁时调用 save_stats_counters（同线程死锁或成环）。
 _PERSIST_LOCK = threading.RLock()
 STATS = {"requests_total": 0, "filtered_total": 0, "errors_total": 0,
          "empty_retries_total": 0, "eof_without_done_total": 0,
@@ -1782,32 +1785,36 @@ def _prune_probe_results(results: dict) -> None:
 
 
 def save_stats_counters(path: str) -> None:
-    """把累计计数、按天分桶与当前上游端点全量写入持久化文件（SIGTERM / set_upstream_base 共用）。"""
-    with STATS_LOCK:
-        counters = {k: STATS[k] for k in ("requests_total", "filtered_total", "errors_total",
-                                          "empty_retries_total", "eof_without_done_total",
-                                          "finish_retries_total", "header_retries_total")}
-        _prune_daily(STATS["daily"])           # 内存态原地 prune（副本 prune 修不了内存增长）
-        _prune_daily(STATS["daily_by_model"])  # 内存态原地 prune（副本 prune 修不了内存增长）
-        _prune_daily(STATS["daily_by_key"])    # v3 T1：value-agnostic prune 复用
-        daily = {k: dict(v) for k, v in STATS["daily"].items()}  # prune 后拷贝：磁盘与内存一致
-        daily_by_model = {d: {m: dict(v) for m, v in models.items()}
-                          for d, models in STATS["daily_by_model"].items()}
-        daily_by_key = {d: {k: dict(v) for k, v in keys.items()}
-                        for d, keys in STATS["daily_by_key"].items()}
-        events = [dict(e) for e in EVENTS]  # 逐条浅拷贝：磁盘与内存一致（≤100 条）
-    with _CFG_LOCK:
-        base = UPSTREAM_BASE
-        capture_enabled = CAPTURE_ERRORS
-        probe_enabled = PROBE_ENABLED
-        budgets = dict(TPM_MODEL_BUDGETS)
-        _prune_body_err_samples(PERSISTED_BODY_ERR_SAMPLES)   # 内存态原地 prune（R7，同 _prune_daily）
-        _prune_probe_results(PROBE_RESULTS)
-        body_err_samples = {m: [dict(s) for s in items]
-                            for m, items in PERSISTED_BODY_ERR_SAMPLES.items()}
-        probe_results = {m: [dict(r) for r in items]
-                         for m, items in PROBE_RESULTS.items()}
+    """把累计计数、按天分桶与当前上游端点全量写入持久化文件（SIGTERM / set_* / flush 共用）。
+
+    F3：copy 两段并入 _PERSIST_LOCK——快照与写盘同一临界区，旧快照无法覆盖
+    新落盘值（乱序回退根因见 spec 2026-10-10-persist-atomic-snapshot）。
+    """
     with _PERSIST_LOCK:
+        with STATS_LOCK:
+            counters = {k: STATS[k] for k in ("requests_total", "filtered_total", "errors_total",
+                                              "empty_retries_total", "eof_without_done_total",
+                                              "finish_retries_total", "header_retries_total")}
+            _prune_daily(STATS["daily"])           # 内存态原地 prune（副本 prune 修不了内存增长）
+            _prune_daily(STATS["daily_by_model"])  # 内存态原地 prune（副本 prune 修不了内存增长）
+            _prune_daily(STATS["daily_by_key"])    # v3 T1：value-agnostic prune 复用
+            daily = {k: dict(v) for k, v in STATS["daily"].items()}  # prune 后拷贝：磁盘与内存一致
+            daily_by_model = {d: {m: dict(v) for m, v in models.items()}
+                              for d, models in STATS["daily_by_model"].items()}
+            daily_by_key = {d: {k: dict(v) for k, v in keys.items()}
+                            for d, keys in STATS["daily_by_key"].items()}
+            events = [dict(e) for e in EVENTS]  # 逐条浅拷贝：磁盘与内存一致（≤100 条）
+        with _CFG_LOCK:
+            base = UPSTREAM_BASE
+            capture_enabled = CAPTURE_ERRORS
+            probe_enabled = PROBE_ENABLED
+            budgets = dict(TPM_MODEL_BUDGETS)
+            _prune_body_err_samples(PERSISTED_BODY_ERR_SAMPLES)   # 内存态原地 prune（R7，同 _prune_daily）
+            _prune_probe_results(PROBE_RESULTS)
+            body_err_samples = {m: [dict(s) for s in items]
+                                for m, items in PERSISTED_BODY_ERR_SAMPLES.items()}
+            probe_results = {m: [dict(r) for r in items]
+                             for m, items in PROBE_RESULTS.items()}
         directory = os.path.dirname(path)
         if directory:
             os.makedirs(directory, exist_ok=True)
