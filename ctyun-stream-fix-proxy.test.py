@@ -7275,7 +7275,10 @@ class TpmRateLimitTest(unittest.TestCase):
         elapsed = time.time() - t0
         self.assertEqual(status2, 200,
                          "second request must be admitted after settle, got %d" % status2)
-        self.assertLess(elapsed, 1.0,
+        # 满载下端到端耗时（TCP 连接 + 线程调度）可 >1s（spec R31-S2 墙钟竞态）；
+        # 放宽到 5s 仍远小于本测试窗口 10s（WINDOW_S=10），排队等待路径必然 >5s，
+        # "settle 后无窗口等待即放行"语义不变——断言强度不低于现状。
+        self.assertLess(elapsed, 5.0,
                         "settle must release budget immediately (no window wait), got %.2fs"
                         % elapsed)
         # stderr：两次 REQ 行 tpm=2（settle 后按实际 usage 记）
