@@ -15,6 +15,7 @@ import contextlib
 import glob
 import http.client
 import importlib.util
+import inspect
 import io
 import json
 import os
@@ -5414,6 +5415,25 @@ class AdminIntegrationTest(unittest.TestCase):
         self.assertIsNone(rec["probe"])
 
 
+class AdminReadGateStructureTest(unittest.TestCase):
+    """F4 结构测试：_read_gate 收敛后 do_GET 内 9 处门禁统一走 helper、
+    read_allowed( 与 403 文案零内联。提炼前 do_GET 内 self._read_gate() 计数 0 != 9 → red；
+    提炼后 9 处统一 helper、read_allowed(/403 文案零内联；hasattr 钉 helper 存在
+    （TDD red 由本测试承担；行为等价由 AdminIntegrationTest 矩阵测试守卫）。"""
+
+    def test_read_gate_helper_converges_nine_inline_blocks(self) -> None:
+        mod = load_proxy_module()          # :637 既有基建
+        src = inspect.getsource(mod.AdminHandler.do_GET)
+        self.assertEqual(src.count("self._read_gate()"), 9,
+                         "9 个读端点应统一走 _read_gate helper")
+        self.assertEqual(src.count("read_allowed("), 0,
+                         "do_GET 不应再内联 read_allowed")
+        self.assertNotIn('"read requires X-Admin-Token"', src,
+                         "403 文案应收敛到 helper 内")
+        self.assertTrue(hasattr(mod.AdminHandler, "_read_gate"),
+                        "AdminHandler 必须有 _read_gate helper")
+
+
 class BodyErrorTest(unittest.TestCase):
     """body error observability 集成测试（SSE error 帧 + 非流式 error JSON）。
     对齐 AdminIntegrationTest 模式：每用例独立假上游 + 代理子进程。"""
@@ -8506,6 +8526,12 @@ class TpmCalibrateEngineTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.mod = load_proxy_module()
+
+    def test_tpm_probe_charges_budget_stays_disposed(self) -> None:
+        """F4 弃用 pin：tpm_probe_charges_budget 从未实现（spec R31 证据 3），决策为
+        弃用（2026-10-01 spec :30 声明句删除）。生而绿——无 red 可言，此断言钉死
+        弃用决策，防僵尸半实现回归。"""
+        self.assertFalse(hasattr(self.mod, "tpm_probe_charges_budget"))
 
     def _scripted(self, responses):
         """按调用序号依次返回 responses，越界重复最后一项。"""

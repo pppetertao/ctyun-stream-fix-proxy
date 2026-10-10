@@ -173,21 +173,30 @@ new:
 
 
 class AdminReadGateStructureTest(unittest.TestCase):
-    """F4 结构测试：_read_gate 收敛后 AdminHandler 内 403 文案 literal 唯一、
-    门禁调用点 ≥9、read_allowed( 仅 helper 一处。提取前 literal 计数 9≠1 → red
+    """F4 结构测试：_read_gate 收敛后 do_GET 内 9 处门禁统一走 helper、
+    read_allowed( 与 403 文案零内联。提炼前 do_GET 内 self._read_gate() 计数 0 != 9 → red；
+    提炼后 9 处统一 helper、read_allowed(/403 文案零内联；hasattr 钉 helper 存在
     （TDD red 由本测试承担；行为等价由 AdminIntegrationTest 矩阵测试守卫）。"""
 
     def test_read_gate_helper_converges_nine_inline_blocks(self) -> None:
         mod = load_proxy_module()          # :637 既有基建
-        src = inspect.getsource(mod.AdminHandler)
-        self.assertIn("def _read_gate(self) -> bool:", src)
-        self.assertEqual(src.count('"read requires X-Admin-Token"'), 1)   # 提取前 9 → red
-        self.assertGreaterEqual(src.count("self._read_gate()"), 9)
-        self.assertEqual(src.count("read_allowed("), 1)                   # 仅 helper 内一处
+        src = inspect.getsource(mod.AdminHandler.do_GET)
+        self.assertEqual(src.count("self._read_gate()"), 9,
+                         "9 个读端点应统一走 _read_gate helper")
+        self.assertEqual(src.count("read_allowed("), 0,
+                         "do_GET 不应再内联 read_allowed")
+        self.assertNotIn('"read requires X-Admin-Token"', src,
+                         "403 文案应收敛到 helper 内")
+        self.assertTrue(hasattr(mod.AdminHandler, "_read_gate"),
+                        "AdminHandler 必须有 _read_gate helper")
 
 
 class BodyErrorTest(unittest.TestCase):
 ```
+
+**修正（首轮 STOP 后由主代理裁定）**：原 E2 块用 `inspect.getsource(mod.AdminHandler)`（class 级），在 `load_proxy_module()` 样板下恒抛 `TypeError: <class 'ctyun_stream_fix_proxy.AdminHandler'> is a built-in class`——`spec_from_file_location` + `exec_module` 不写 `sys.modules`，class 级 `getsource` 依赖 `sys.modules.get(obj.__module__)` 反查文件。函数级 `getsource` 走 `__code__.co_filename`，无此依赖（既有 `RelaySseV3Test.test_calibrate_probe_dead_guard_removed` :6496 即函数级先例，10 OK）。故断言口径改为取 `mod.AdminHandler.do_GET` 函数级，断言内容=do_GET 内联门禁块收敛；red 形态由 TypeError(error) 改为 `AssertionError: 0 != 9`(failure)，符合本卡 gate「red 由计数不等承担、非意外错误」。
+
+**修正二（同坑复发，第四行改 hasattr）**：上一轮只把前三断言迁到函数级 `getsource`，第四行仍留 class 级 `inspect.getsource(mod.AdminHandler)`，红态下虽被前三断言短路、不实际触发，但一旦卡3 提炼完成即会命中同一 `TypeError`。第四行断言的语义只是「helper 存在」，不需要源码文本，故改用 `self.assertTrue(hasattr(mod.AdminHandler, "_read_gate"), ...)`——不依赖 `getsource`，也不读文件。
 
 ### E3: TpmCalibrateEngineTest（:8340）内加 pin 测试（setUpClass 之后、`def _scripted` 之前；复用 `cls.mod = load_proxy_module()`）
 
