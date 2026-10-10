@@ -8420,6 +8420,58 @@ class TpmCalibrateEngineTest(unittest.TestCase):
                              for b in range(1, 9)))
         self.assertEqual(result["status"], 429)
 
+    def test_calibrate_engine_401_stops_credential_error(self) -> None:
+        """F2：首批 401 → credential_error 立即中止；threshold=None、不重试、
+        不把该批 est 当阈值。"""
+        mod = self.mod
+        sender, calls = self._scripted([(401, False)])
+        result = mod.calibrate_engine("m", sender, sleep=lambda _: None)
+        self.assertEqual(result["outcome"], "credential_error")
+        self.assertIsNone(result["threshold"])
+        self.assertEqual(result["status"], 401)
+        self.assertEqual(result["batches"], 1)
+        self.assertEqual(result["consumed"],
+                         mod.calibrate_est_for_batch("m", 1))
+        self.assertEqual(calls["n"], 1, "401 不得重试（同凭证重试必然再败）")
+
+    def test_calibrate_engine_403_mid_ramp_aborts(self) -> None:
+        """F2：爬坡中途 403 → credential_error 立即中止，不继续加压。"""
+        mod = self.mod
+        sender, calls = self._scripted([(200, False)] * 2 + [(403, False)])
+        result = mod.calibrate_engine("m", sender, sleep=lambda _: None)
+        self.assertEqual(result["outcome"], "credential_error")
+        self.assertIsNone(result["threshold"])
+        self.assertEqual(result["status"], 403)
+        self.assertEqual(result["batches"], 3)
+        self.assertEqual(calls["n"], 3)
+
+    def test_calibrate_engine_429_still_rejected_regression(self) -> None:
+        """F2 回归锚：429 判定逐字保持 ramp_first_reject_stops 现状
+        （rejected + threshold=本批 est）——守卫只拦 401/403，429 语义零变化。"""
+        mod = self.mod
+        sender, calls = self._scripted([(200, False)] * 7 + [(429, False)])
+        result = mod.calibrate_engine("m", sender, sleep=lambda _: None)
+        self.assertEqual(calls["n"], 8, "first reject must stop, no confirm batch")
+        self.assertEqual(result["outcome"], "rejected")
+        self.assertEqual(result["batches"], 8)
+        self.assertEqual(result["threshold"], mod.calibrate_est_for_batch("m", 8))
+        self.assertEqual(result["consumed"],
+                         sum(mod.calibrate_est_for_batch("m", b)
+                             for b in range(1, 9)))
+        self.assertEqual(result["status"], 429)
+
+    def test_calibrate_engine_401_on_retry_after_503_aborts(self) -> None:
+        """F2 对称守卫：503 重试一次遇 401 → credential_error 立即中止，
+        不得落 last_ok_est 继续加压（漏插重试分支守卫即回归本测试）。"""
+        mod = self.mod
+        sender, calls = self._scripted([(503, False), (401, False)])
+        result = mod.calibrate_engine("m", sender, sleep=lambda _: None)
+        self.assertEqual(result["outcome"], "credential_error")
+        self.assertIsNone(result["threshold"])
+        self.assertEqual(result["status"], 401)
+        self.assertEqual(result["batches"], 1)
+        self.assertEqual(calls["n"], 2, "503 重试一次后 401 必须立即中止")
+
     def test_calibrate_engine_ramp_small_start_and_monotonic(self) -> None:
         """AC3：首批 est ≤ START×1.1（≈4.4k，不再 60k）；前 8 批严格单调递增。"""
         mod = self.mod
@@ -8864,6 +8916,74 @@ class TpmCalibrateStateTest(unittest.TestCase):
         rec = by_name["m-probe-timeout"]["recommend"]
         self.assertEqual(rec["source"], "none",
                          "无拒绝证据 → 推荐源不得因本次探测变为 probe")
+        self.assertIsNone(rec["probe"])
+
+    def test_calibrate_loop_401_skips_probe_results(self) -> None:
+        """F2：daemon 收 credential_error 不写 PROBE_RESULTS、不走异常兜底，
+        快照推荐源保持 none（recommend.source 不因凭证失败变 probe）。"""
+        mod = self.mod
+        orig_gap = mod.TPM_CALIBRATE_BATCH_GAP_S
+        orig_interval = mod.TPM_CALIBRATE_MIN_INTERVAL_S
+        mod.TPM_CALIBRATE_BATCH_GAP_S = 0.05
+        mod.TPM_CALIBRATE_MIN_INTERVAL_S = 0
+        self.addCleanup(setattr, mod, "TPM_CALIBRATE_BATCH_GAP_S", orig_gap)
+        self.addCleanup(setattr, mod, "TPM_CALIBRATE_MIN_INTERVAL_S", orig_interval)
+        orig_probe = {m: list(v) for m, v in mod.PROBE_RESULTS.items()}
+        orig_recent = list(mod.RECENT_REQUESTS)
+
+        def restore():
+            mod.PROBE_RESULTS.clear()
+            mod.PROBE_RESULTS.update(orig_probe)
+            mod.RECENT_REQUESTS.clear()
+            mod.RECENT_REQUESTS.extend(orig_recent)
+        self.addCleanup(restore)
+        mod.PROBE_RESULTS.clear()
+        mod.RECENT_REQUESTS.append({"model": "m-cred"})
+
+        def fake_send(model, batch, est, auth_token):
+            return 401, False
+
+        orig_send = mod._calibrate_send
+        mod._calibrate_send = fake_send
+        self.addCleanup(setattr, mod, "_calibrate_send", orig_send)
+
+        thread = threading.Thread(target=mod._calibrate_loop, daemon=True)
+        thread.start()
+
+        def stop_loop():
+            with mod.CALIBRATE_LOCK:
+                mod._CALIBRATE_STATE["running"] = False
+            mod._CALIBRATE_TOKEN = None
+            thread.join(2)
+        self.addCleanup(stop_loop)
+
+        status, _ = mod.calibrate_start("m-cred", token="Bearer t")
+        self.assertEqual(status, 200)
+
+        result = None
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            with mod.CALIBRATE_LOCK:
+                result = mod._CALIBRATE_STATE["result"]
+            if result is not None:
+                break
+            time.sleep(0.05)
+        self.assertIsNotNone(
+            result, "daemon 10s 内未产出 result（error=%r）"
+            % mod._CALIBRATE_STATE["error"])
+        self.assertEqual(result["outcome"], "credential_error")
+        self.assertIsNone(result["threshold"])
+        self.assertEqual(result["status"], 401)
+        with mod.CALIBRATE_LOCK:
+            self.assertIsNone(mod._CALIBRATE_STATE["error"],
+                              "credential_error 是正常终止，不得走异常兜底")
+        self.assertNotIn("m-cred", mod.PROBE_RESULTS,
+                         "凭证失败不得写 PROBE_RESULTS")
+        snap = mod.tpm_settings_snapshot()
+        by_name = {m["name"]: m for m in snap["models"]}
+        rec = by_name["m-cred"]["recommend"]
+        self.assertEqual(rec["source"], "none",
+                         "凭证失败 → 推荐源不得因本次探测变为 probe")
         self.assertIsNone(rec["probe"])
 
     def test_calibrate_loop_capped_skips_probe_results(self) -> None:

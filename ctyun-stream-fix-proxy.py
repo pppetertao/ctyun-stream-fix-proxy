@@ -208,6 +208,9 @@ ERR_KIND_TPM_QUEUE_TIMEOUT = "tpm_queue_timeout"
 
 CLASS_BODY_ERROR = "body_error"
 ERR_KIND_BODY_ERROR = "body_error"
+# F2：校准凭证失败哨兵——仅 calibrate_engine 内部使用；不进 classify_outcome 词表、
+# 不进 _KIND_CATEGORY 映射（relay 侧 401/403 仍按 R5 口径走 CLASS_REQUEST_FAULT）。
+CLASS_CREDENTIAL_FAILURE = "credential_failure"
 
 _KIND_CATEGORY = {
     ERR_KIND_POISON: CLASS_POISON_FIXED,
@@ -1101,6 +1104,8 @@ def calibrate_engine(model, send_one, should_abort=None, sleep=None):
     → 中止标 upstream_error（不把上游故障误判为阈值，R5）；
     send_one 返回 CALIBRATE_STATUS_TIMEOUT（读超时哨兵）→ probe_timeout，
     不重试、不翻倍（同批大请求是读挂上游的根因，R3）。
+    401/403（凭证失败）→ credential_error 立即中止、threshold=None、
+    不重试（F2）。
     首拒即停（不追加确认批次）。安全阀：下一批 est 将超过
     TPM_CALIBRATE_HARD_CAP_TOKENS 或超 TPM_CALIBRATE_MAX_PROBE_TOKENS
     → capped 且不超发，batches 记已成功发送的批次数（被判超顶那一批未发送，
@@ -1131,6 +1136,9 @@ def calibrate_engine(model, send_one, should_abort=None, sleep=None):
             return CLASS_UPSTREAM_FAULT, None
         if status == CALIBRATE_STATUS_TIMEOUT:
             return CALIBRATE_STATUS_TIMEOUT, status
+        if status in (401, 403):
+            # F2：凭证失败优先于 body_error——带 error JSON 的 401/403 仍是凭证问题
+            return CLASS_CREDENTIAL_FAILURE, status
         return classify_outcome(status=status, body_error=body_error).category, status
 
     while True:
@@ -1151,6 +1159,9 @@ def calibrate_engine(model, send_one, should_abort=None, sleep=None):
         if category == CALIBRATE_STATUS_TIMEOUT:
             # 读超时单独分类（R3）：不重试、不翻倍（同批大请求是读挂上游的根因）
             return _result("probe_timeout", last_ok_est, None)
+        if category == CLASS_CREDENTIAL_FAILURE:
+            # F2：凭证失效不是限流信号——立即中止不重试（同凭证重试必然再败）
+            return _result("credential_error", None, status)
         if category in (CLASS_BODY_ERROR, CLASS_REQUEST_FAULT):
             return _result("rejected", est, status)
         if category == CLASS_UPSTREAM_FAULT:
@@ -1162,6 +1173,9 @@ def calibrate_engine(model, send_one, should_abort=None, sleep=None):
             consumed += est
             if category == CALIBRATE_STATUS_TIMEOUT:
                 return _result("probe_timeout", last_ok_est, None)
+            if category == CLASS_CREDENTIAL_FAILURE:
+                # F2：503 重试遇 401/403 同样立即中止——漏判会落 last_ok_est 继续加压
+                return _result("credential_error", None, status)
             if category in (CLASS_BODY_ERROR, CLASS_REQUEST_FAULT):
                 return _result("rejected", est, status)
             if category == CLASS_UPSTREAM_FAULT:
@@ -1443,6 +1457,8 @@ def _calibrate_loop() -> None:
                                              "consumed": result["consumed"]}
             _CALIBRATE_STATE["running"] = False
             _CALIBRATE_STATE["last_probe_ts"][model] = result["ts"]
+        # F2：credential_error（401/403 凭证失败）outcome≠"rejected" 且 threshold=None，
+        # 天然不进本分支——凭证失败不写 PROBE_RESULTS，recommend.source 不变 probe。
         if result["outcome"] == "rejected" and result["threshold"] is not None:
             record_tpm_probe_result(model, {
                 "threshold": result["threshold"],
