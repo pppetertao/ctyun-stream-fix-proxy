@@ -7281,8 +7281,15 @@ class TpmRateLimitTest(unittest.TestCase):
         self.assertLess(elapsed, 5.0,
                         "settle must release budget immediately (no window wait), got %.2fs"
                         % elapsed)
-        # stderr：两次 REQ 行 tpm=2（settle 后按实际 usage 记）
+        # stderr：两次 REQ 行 tpm=2（settle 后按实际 usage 记）。满载下 drain 线程调度
+        # 可能滞后于 HTTP 响应返回（spec R31-S2 竞态，同 queue-timeout 用例）：
+        # 有界轮询 3s/50ms 等两行齐（同 wait_port 的 deadline+50ms 惯例），
+        # 轮询不到则由下方 assert 兜底失败——断言强度不降。
+        deadline = time.time() + 3.0
         stderr = stderr_text(self.proc)
+        while stderr.count("tpm=2") < 2 and time.time() < deadline:
+            time.sleep(0.05)
+            stderr = stderr_text(self.proc)
         self.assertGreaterEqual(stderr.count("tpm=2"), 2,
                                 "both REQ lines must carry tpm=2, stderr:\n" + stderr)
         # tpm_stats：两次 settle 后 bucket used == 2+2 = 4（与 est 无关的稳健断言）
