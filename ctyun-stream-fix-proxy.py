@@ -1505,7 +1505,7 @@ PROBE_LOCK = threading.Lock()
 STATS_LOCK = threading.Lock()
 # E1-A 持久化单写者锁（F3 外扩为快照+写盘整体临界区）。RLock 为防御选型：
 # _on_signal 在 main 线程执行，信号可在任意字节码边界打断 main 线程；当前 main
-# 线程注册信号（:5725）后只进 serve_forever（:5765），同线程重入暂无现实路径，
+# 线程注册信号（:5732）后只进 serve_forever（:5772），同线程重入暂无现实路径，
 # 但 main 线程一旦新增 save_stats_counters 调用路径，普通 Lock 会自死锁挂死退出
 # 路径，RLock 同线程重入安全（跨线程互斥语义不变）。
 # 锁序纪律（F3 起）：_PERSIST_LOCK 包住 copy+write 全程，内部按固定顺序 STATS_LOCK
