@@ -6,3 +6,5 @@ ctyun-stream-fix-proxy.test.py TpmRateLimitTest.test_usage_settle_releases_budge
 ctyun-stream-fix-proxy.py:1747-1748 快照-写入乱序覆盖（E1 OCR #2） | save_stats_counters 快照在 STATS_LOCK/_CFG_LOCK 取、_PERSIST_LOCK 只包写段：线程 A 旧快照可覆盖线程 B 新值（内存新、磁盘旧，重启回退）。既有问题被 E1 收窄而非新引入；spec 锁序纪律（持锁内禁取其它锁）限定本 episode 不改 | 后续 episode 评估锁范围重构（_PERSIST_LOCK 置最外层需连带信号重入防御分析，OCR 核实无死锁风险）
 ctyun-stream-fix-proxy.test.py:1634 用例名引用已删函数（E1 OCR #6） | test_persist_upstream_carries_tpm_model_budgets 名中的 persist_upstream 已随 E1 删除，误导维护者 | 顺手改名为 test_set_tpm_model_budgets_persists_full_schema（低价值维护项，不阻塞）
 ctyun-stream-fix-proxy.py:3357-3458 do_GET 读门禁 5 行块逐字复制 9 处（E3 OCR #3） | 纯 maintainability：新增 GET 端点时漏挂风险真实 | 独立 episode 提 AdminHandler._read_gate() helper 收敛 9 处（行为等价零风险，但交付前不宜动安全 gate 位）
+ctyun-stream-fix-proxy.test.py:7290 墙钟放宽注释依据 | 原注释"排队路径必然 >5s"论证错误（env QUEUE_TIMEOUT_S=5，排队实际 ~5s 收 429）；已重写为准（est 97<200 不可能排队+真守卫是 tpm=2/used==4） | 已修复
+ctyun-stream-fix-proxy.test.py:7210-7214/:7288-7292 deadline-poll 模式 | 全文件 10+ 处同模式复制（F1 新增 2 处）；提取 wait_stderr helper 收益低且失败语义分歧（:699/:4120 while/else+fail vs F1 兜底 assert），F1 spec Exclusions 已记录不提取决策 | 若未来再增同类轮询再评估统一 helper
