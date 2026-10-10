@@ -3667,6 +3667,37 @@ class AdminIntegrationTest(unittest.TestCase):
         stop_proxy(self.proc)
         stop_fake_upstreams()
 
+    def _lan_ip(self) -> str:
+        """返回一个可路由的本机 LAN 地址；无可用地址则 skipTest（供非 loopback 用例复用）。
+
+        本机候选地址枚举（gethostbyname_ex 不发包、不依赖默认路由——弃用 UDP
+        connect 探测：VPN 全流量代理会把默认路由压在 TUN 段，取到的是黑洞地址），
+        按序过滤丢弃：
+          ① 127.0.0.0/8 loopback；② 169.254.0.0/16 链路本地；
+          ③ 198.18.0.0/15 —— VPN/TUN 默认路由基准段（RFC 2544 benchmarking 段），
+            对 0.0.0.0 监听是 TCP 黑洞：SYN 进 TUN 有去无回、只超时不拒绝，
+            连上它相关用例恒红且无法 SkipTest（本卡执行期实测坑），必须显式排除。
+        """
+        try:
+            candidates = list(socket.gethostbyname_ex(socket.gethostname())[2])
+        except socket.gaierror:
+            # 吞 socket.gaierror（沙箱/离线机本机主机名不可解析）：枚举失败等价于
+            # 无候选、走末尾 skipTest；单测环境内无其他主机名解析路径可达。
+            candidates = []
+        candidates = [ip for ip in candidates
+                      if not ip.startswith("127.")
+                      and not ip.startswith("169.254.")
+                      and not (ip.startswith("198.18.") or ip.startswith("198.19."))]
+        lan_ip = None
+        for ip in candidates:  # 优先取私网段第一个（按枚举序）：192.168/16、10/8、172.16/12
+            if (ip.startswith("192.168.") or ip.startswith("10.")
+                    or (ip.startswith("172.") and 16 <= int(ip.split(".")[1]) <= 31)):
+                lan_ip = ip
+                break
+        if lan_ip is None:
+            self.skipTest("no routable LAN IP in sandbox")
+        return lan_ip
+
     def test_dashboard_and_stats_served(self) -> None:
         status, body, ctype = admin_get(self.proc.admin_port, "/")
         self.assertEqual(status, 200)
@@ -4055,31 +4086,9 @@ class AdminIntegrationTest(unittest.TestCase):
         self.proc = start_proxy(self.upstream_port, free_port(),
                                 extra_env={"CTYUN_ADMIN_HOST": "0.0.0.0",
                                            "CTYUN_ADMIN_TOKEN": "sekret"})
-        # 本机候选地址枚举（gethostbyname_ex 不发包、不依赖默认路由——弃用 UDP
-        # connect 探测：VPN 全流量代理会把默认路由压在 TUN 段，取到的是黑洞地址），
-        # 按序过滤丢弃：
-        #   ① 127.0.0.0/8 loopback；② 169.254.0.0/16 链路本地；
-        #   ③ 198.18.0.0/15 —— VPN/TUN 默认路由基准段（RFC 2544 benchmarking 段），
-        #     对 0.0.0.0 监听是 TCP 黑洞：SYN 进 TUN 有去无回、只超时不拒绝，
-        #     连上它本用例恒红且无法 SkipTest（本卡执行期实测坑），必须显式排除。
-        try:
-            candidates = list(socket.gethostbyname_ex(socket.gethostname())[2])
-        except socket.gaierror:
-            # 吞 socket.gaierror（沙箱/离线机本机主机名不可解析）：枚举失败等价于
-            # 无候选、走末尾 skipTest；单测环境内无其他主机名解析路径可达。
-            candidates = []
-        candidates = [ip for ip in candidates
-                      if not ip.startswith("127.")
-                      and not ip.startswith("169.254.")
-                      and not (ip.startswith("198.18.") or ip.startswith("198.19."))]
-        lan_ip = None
-        for ip in candidates:  # 优先取私网段第一个（按枚举序）：192.168/16、10/8、172.16/12
-            if (ip.startswith("192.168.") or ip.startswith("10.")
-                    or (ip.startswith("172.") and 16 <= int(ip.split(".")[1]) <= 31)):
-                lan_ip = ip
-                break
-        if lan_ip is None:
-            self.skipTest("no routable LAN IP in sandbox")
+        # 本机候选地址枚举与过滤（127/8、169.254/16、198.18/15 黑洞段排除 + 私网优先）
+        # 收敛在 self._lan_ip() helper 内，两处非 loopback 用例共用同一份逻辑。
+        lan_ip = self._lan_ip()
         # 无 token → 403
         conn = http.client.HTTPConnection(lan_ip, self.proc.admin_port, timeout=10)
         conn.request("GET", "/api/stats")
@@ -4113,27 +4122,14 @@ class AdminIntegrationTest(unittest.TestCase):
         stop_proxy(self.proc)  # setUp 默认 127.0.0.1 绑定；本测需 0.0.0.0 + token，重建
         stop_fake_upstreams()
         upstream_port = make_fake_upstream(False)
-        self.proc = start_proxy(self.upstream_port, free_port(),
+        # 200 legs 全走 admin server 不碰上游，但端口须指向 stop_fake_upstreams() 之后
+        # 新建的活上游（用 self.upstream_port 会喂已停服务的旧端口）
+        self.proc = start_proxy(upstream_port, free_port(),
                                 extra_env={"CTYUN_ADMIN_HOST": "0.0.0.0",
                                            "CTYUN_ADMIN_TOKEN": "sekret"})
-        # 本机候选地址枚举与过滤沿用 test_admin_get_read_gate_non_loopback（:4045-4069）：
-        # ① 127.0.0.0/8；② 169.254.0.0/16；③ 198.18.0.0/15 VPN/TUN 黑洞段显式排除。
-        try:
-            candidates = list(socket.gethostbyname_ex(socket.gethostname())[2])
-        except socket.gaierror:
-            candidates = []
-        candidates = [ip for ip in candidates
-                      if not ip.startswith("127.")
-                      and not ip.startswith("169.254.")
-                      and not (ip.startswith("198.18.") or ip.startswith("198.19."))]
-        lan_ip = None
-        for ip in candidates:  # 优先取私网段第一个：192.168/16、10/8、172.16/12
-            if (ip.startswith("192.168.") or ip.startswith("10.")
-                    or (ip.startswith("172.") and 16 <= int(ip.split(".")[1]) <= 31)):
-                lan_ip = ip
-                break
-        if lan_ip is None:
-            self.skipTest("no routable LAN IP in sandbox")
+        # 本机候选地址枚举与过滤（127/8、169.254/16、198.18/15 黑洞段排除 + 私网优先）
+        # 收敛在 self._lan_ip() helper 内，与 test_admin_get_read_gate_non_loopback 共用。
+        lan_ip = self._lan_ip()
         forbidden = b'{"error": "read requires X-Admin-Token"}'
         endpoints = ["/api/stats", "/api/tpm_stats", "/api/tpm_settings",
                      "/api/tpm_calibrate", "/api/config", "/api/health",
