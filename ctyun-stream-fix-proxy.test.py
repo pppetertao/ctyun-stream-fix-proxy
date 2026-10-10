@@ -6812,6 +6812,83 @@ class PersistSingleWriterTest(unittest.TestCase):
         self.assertEqual(mod.load_stats_counters(path), zeros)  # 损坏 JSON
 
 
+class PersistSnapshotOrderTest(unittest.TestCase):
+    """F3（followups:6）：快照-写入乱序。thread A 停在 copy 与写段之间（GateLock），
+    thread B 完整 set_upstream_base（mutate+save），放行 A 后断言终态磁盘 == B 的
+    新值 == 内存。修复前确定性 FAIL（旧快照覆盖新值），修复后 PASS。"""
+
+    def setUp(self) -> None:
+        self.mod = load_proxy_module()
+
+    def test_stale_snapshot_cannot_overwrite_newer_writer(self) -> None:
+        mod = self.mod
+        tmpdir = tempfile.mkdtemp(prefix="ctyun-f3-")
+        self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
+        path = os.path.join(tmpdir, "settings.json")
+        orig_path, orig_lock = mod.PERSIST_PATH, mod._PERSIST_LOCK
+        orig_base, orig_source = mod.UPSTREAM_BASE, mod._upstream_source
+        old_base, new_base = "http://127.0.0.1:9/", "http://127.0.0.1:1/"
+
+        class GateLock:
+            def __init__(self, real):
+                self._real, self._first = real, True
+                self._guard = threading.Lock()
+                self.copied = threading.Event()
+                self.release = threading.Event()
+
+            def __enter__(self):
+                with self._guard:
+                    first, self._first = self._first, False
+                if first:  # 仅首个进入者停车：老代码=copy 后写段前；新代码=copy 前
+                    self.copied.set()
+                    assert self.release.wait(30), "gate never released"
+                return self._real.__enter__()
+
+            def __exit__(self, *exc):
+                return self._real.__exit__(*exc)
+
+        errors = []
+        try:
+            mod.PERSIST_PATH = path
+            mod.set_upstream_base(old_base)   # gate 未装：旧值普通落盘
+            gate = GateLock(orig_lock)
+            mod._PERSIST_LOCK = gate
+
+            def thread_a():  # flush/SIGTERM 替身：旧快照持有者
+                try:
+                    mod.save_stats_counters(path)
+                except Exception as exc:  # FileNotFoundError 等在此暴露
+                    errors.append(exc)
+
+            def thread_b():  # admin POST 替身：新值写入者
+                try:
+                    mod.set_upstream_base(new_base)  # mutate + 完整 save
+                except Exception as exc:
+                    errors.append(exc)
+
+            t_a = threading.Thread(target=thread_a, daemon=True)
+            t_a.start()
+            self.assertTrue(gate.copied.wait(30), "A 未到达 gate")
+            t_b = threading.Thread(target=thread_b, daemon=True)
+            t_b.start()
+            t_b.join(30)
+            self.assertFalse(t_b.is_alive(), "B 30s 未结束：疑似死锁")
+            gate.release.set()
+            t_a.join(30)
+            self.assertFalse(t_a.is_alive(), "A 30s 未结束：疑似死锁")
+            self.assertEqual(errors, [])                                  # 无 FileNotFoundError
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)                                      # 无损坏 JSON
+            self.assertEqual(data["upstream_base"], new_base)             # 终态==最后写入者
+            self.assertEqual(data["upstream_base"], mod.UPSTREAM_BASE)    # 盘==内存
+            self.assertEqual([n for n in os.listdir(tmpdir) if ".tmp" in n], [])
+        finally:
+            mod._PERSIST_LOCK = orig_lock
+            mod.PERSIST_PATH = orig_path
+            mod.UPSTREAM_BASE = orig_base
+            mod._upstream_source = orig_source
+
+
 class SnapshotV3Test(unittest.TestCase):
     """v3 stats_snapshot perf 新键 + daily_by_key 深拷 + percentile 推广（决策 6）。"""
 
