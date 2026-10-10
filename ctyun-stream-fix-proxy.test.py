@@ -7203,8 +7203,15 @@ class TpmRateLimitTest(unittest.TestCase):
                          "429 body must be the fixed JSON, got %r" % data2[:200])
         parsed = json.loads(data2.decode("utf-8"))
         self.assertEqual(parsed["error"]["code"], "model_tpm_limit")
-        # REQ 行 result=tpm-queue-timeout；超时请求不触上游（calls 仅首发 1 次）
+        # REQ 行 result=tpm-queue-timeout；超时请求不触上游（calls 仅首发 1 次）。
+        # 满载下 drain 线程调度可能滞后于 HTTP 响应返回（spec R31-S2 竞态）：
+        # 有界轮询 3s/50ms 等该行进入 drain 缓冲（同 wait_port 的 deadline+50ms 惯例），
+        # 轮询不到则由下方 assertIn 兜底失败——断言强度不降。
+        deadline = time.time() + 3.0
         stderr = stderr_text(self.proc)
+        while "result=tpm-queue-timeout" not in stderr and time.time() < deadline:
+            time.sleep(0.05)
+            stderr = stderr_text(self.proc)
         self.assertIn("result=tpm-queue-timeout", stderr,
                       "REQ line must carry result=tpm-queue-timeout, stderr:\n" + stderr)
         self.assertEqual(len(calls), 1,
