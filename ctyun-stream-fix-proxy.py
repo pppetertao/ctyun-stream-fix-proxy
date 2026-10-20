@@ -4,7 +4,7 @@
 数据流: SSE 客户端 -> http://127.0.0.1:7920 (本代理, 剥行) -> UPSTREAM_BASE (原 path prepend)。
 旁路:   http://<ADMIN_HOST>:7921 (admin/dashboard：只读统计 + 受限写上游端点)。
 纯 stdlib（http.server + http.client + re），全阻塞，Python >= 3.9。
-生产默认: UPSTREAM_BASE=https://eaichat.ctyun.cn/ai/platform/v2/cp, 端口 7920;
+生产默认: UPSTREAM_BASE=https://eaichat.ctyun.cn/ai/platform/v2/cp/anthropic, 端口 7920;
 CTYUN_UPSTREAM_BASE / CTYUN_LISTEN_PORT / CTYUN_ADMIN_HOST / CTYUN_ADMIN_PORT /
 CTYUN_PERSIST_PATH / CTYUN_ADMIN_TOKEN 环境变量为测试与部署 seam。
 """
@@ -29,7 +29,7 @@ import time
 import urllib.parse
 import uuid
 
-DEFAULT_UPSTREAM_BASE = "https://eaichat.ctyun.cn/ai/platform/v2/cp"
+DEFAULT_UPSTREAM_BASE = "https://eaichat.ctyun.cn/ai/platform/v2/cp/anthropic"
 UPSTREAM_BASE = DEFAULT_UPSTREAM_BASE  # 运行时可变：main() 启动解析 / POST /api/config 热切换
 _upstream_source = "default"           # "env" | "file" | "default" | "api"
 LISTEN_HOST = os.environ.get("CTYUN_LISTEN_HOST", "127.0.0.1")
@@ -515,19 +515,21 @@ _tpm_rejected: dict = {}               # (key_id, model) -> queue-full 拒绝计
 _tpm_timeouts: dict = {}               # (key_id, model) -> queue-timeout 计数（快照用）
 
 
-def tpm_key_id(auth_header):
-    """从 Authorization 头提取 per-key 标识。
+def tpm_key_id(auth_header, api_key_header=None):
+    """从 x-api-key / Authorization 头提取 per-key 标识（x-api-key 优先）。
 
-    无头 / 非 "Bearer " 前缀 / 空 token → None（= 不限流直通）；
-    否则返回 token 的 sha256 hex 全位（内部桶键用全位防碰撞，
+    x-api-key 为非空 str（strip 后非空）→ 对该值取 sha256；
+    否则 Authorization "Bearer <token>" → token 的 sha256；
+    两者皆无 → None（= 不限流直通）。返回 sha256 hex 全位（内部桶键用全位防碰撞，
     快照对外只显前 12 位脱敏）。
+    优先级依据：x-api-key 是 Anthropic 原生计费凭证；网关 Bearer 可能多客户端共享，
+    优先 Bearer 会让不同 x-api-key 撞同桶。空/非 str x-api-key 回落 Bearer。
     """
-    if not auth_header:
-        return None
-    parts = auth_header.split(None, 1)
-    if len(parts) != 2 or parts[0].lower() != "bearer":
-        return None
-    token = parts[1].strip()
+    token = api_key_header.strip() if isinstance(api_key_header, str) else ""
+    if not token and auth_header:
+        parts = auth_header.split(None, 1)
+        if len(parts) == 2 and parts[0].lower() == "bearer":
+            token = parts[1].strip()
     if not token:
         return None
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
@@ -2889,7 +2891,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 _LAST_AUTH = auth_header
 
         # --- TPM 准入 hook（_open_upstream 之前；重试复用本次准入不重复 charge）---
-        tpm_key = tpm_key_id(self.headers.get("Authorization"))
+        tpm_key = tpm_key_id(self.headers.get("Authorization"),
+                             self.headers.get("x-api-key"))
         tpm_est = 0
         tpm_qwait_ms = None
         tpm_final_used = None
@@ -3817,7 +3820,7 @@ _DASH_SECTIONS_STATIC = """<main>
     <div class="upstream-url dimmed" id="upstream-base">读取中……</div>
     <form id="upstream-form">
       <input id="upstream-input" type="text" autocomplete="off" spellcheck="false"
-             placeholder="https://eaichat.ctyun.cn/ai/platform/v2/cp" aria-label="新的上游端点 URL">
+             placeholder="https://eaichat.ctyun.cn/ai/platform/v2/cp/anthropic" aria-label="新的上游端点 URL">
       <button type="submit">保存上游端点</button>
     </form>
     <p class="msg" id="upstream-msg" role="status"></p>

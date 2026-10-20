@@ -763,6 +763,13 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         self.assertEqual(mod.resolve_upstream_base("", invalid),
                          (mod.DEFAULT_UPSTREAM_BASE, "default"))
 
+    def test_default_upstream_base_anthropic(self) -> None:
+        """默认 base 已切 Anthropic 端点；resolve 优先级 env > file > default 由
+        test_resolve_upstream_base_precedence 以 mod.DEFAULT_UPSTREAM_BASE 符号断言，不受值变更影响。"""
+        self.assertEqual(
+            self.mod.DEFAULT_UPSTREAM_BASE,
+            "https://eaichat.ctyun.cn/ai/platform/v2/cp/anthropic")
+
     def test_write_allowed_matrix(self) -> None:
         f = self.mod.write_allowed
         self.assertTrue(f("127.0.0.1", "", ""))
@@ -1153,6 +1160,25 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         self.assertEqual(f("Bearer test-key-1"), kid1)  # 确定性
         self.assertEqual(f("bearer test-key-1"), kid1)  # scheme 大小写不敏感
         self.assertNotEqual(f("Bearer test-key-2"), kid1)
+        # --- x-api-key 双头（Anthropic 原生计费凭证）：确定性、优先级、空值回落 ---
+        kid_api = f(None, "k")  # 仅 x-api-key
+        self.assertIsInstance(kid_api, str)
+        self.assertEqual(len(kid_api), 64)
+        self.assertEqual(f(None, "k"), kid_api)      # x-api-key 确定性
+        # 双头优先级：x-api-key > Bearer（同 x-api-key 不同 Bearer 同桶）
+        self.assertEqual(f("Bearer b", "k"), kid_api)
+        self.assertNotEqual(f("Bearer b"), kid_api)  # 无 x-api-key 回落 Bearer → 不同桶
+        # 空/None/非 str/纯空白 x-api-key → 回落 Bearer
+        self.assertEqual(f("Bearer b", ""), f("Bearer b"))
+        self.assertEqual(f("Bearer b", None), f("Bearer b"))
+        self.assertEqual(f("Bearer b", 42), f("Bearer b"))
+        self.assertEqual(f("Bearer b", "   "), f("Bearer b"))
+        # 双双缺失 / 非 Bearer Authorization → None
+        self.assertIsNone(f(None, None))
+        self.assertIsNone(f("", ""))
+        self.assertIsNone(f("Basic dXNlcjpwYXNz", None))
+        # x-api-key 空白 token + 无 Bearer → None
+        self.assertIsNone(f(None, "   "))
 
     def test_estimate_request_tokens(self) -> None:
         f = self.mod.estimate_request_tokens
