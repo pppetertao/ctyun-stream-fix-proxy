@@ -6634,6 +6634,140 @@ class RelaySseV3Test(unittest.TestCase):
                          "_calibrate_probe 死守卫必须保持删除（不可达代码）")
 
 
+class AnthropicSseTest(unittest.TestCase):
+    """Anthropic Messages SSE（spec 方案 A 边界归一化）。
+
+    进程内：事件表归类 → message_start 首帧 priming flush 实时性举证（探针在
+    第 4 次 readline 入口采样 wfile——此时首 record 含终结空行已处理完毕）+
+    usage 分帧按键合并归一（message_start 10 + message_delta 7 → 17）。
+    集成：body_override 全链路字节逐字节透传 + calls == 1（message_stop→done
+    不触发 empty-retry）+ daily per-key usage 入桶（x-api-key → sha256[:12]）。
+    复用 RelaySseV3Test._StubHandler/_FakeSseResp。"""
+
+    ANTHROPIC_STREAM = (
+        b'event: message_start\n'
+        b'data: {"type":"message_start","message":{"id":"msg_1","role":"assistant",'
+        b'"usage":{"input_tokens":10,"output_tokens":1}}}\n'
+        b'\n'
+        b'event: content_block_start\n'
+        b'data: {"type":"content_block_start","index":0,'
+        b'"content_block":{"type":"text","text":""}}\n'
+        b'\n'
+        b'event: content_block_delta\n'
+        b'data: {"type":"content_block_delta","index":0,'
+        b'"delta":{"type":"text_delta","text":"Hi"}}\n'
+        b'\n'
+        b'event: content_block_stop\n'
+        b'data: {"type":"content_block_stop","index":0}\n'
+        b'\n'
+        b'event: message_delta\n'
+        b'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},'
+        b'"usage":{"output_tokens":7}}\n'
+        b'\n'
+        b'event: message_stop\n'
+        b'data: {"type":"message_stop"}\n'
+        b'\n')
+
+    def setUp(self) -> None:
+        self.mod = load_proxy_module()
+
+    def _drive(self, resp, handler):
+        """STALL_THRESHOLD_S=0.0 下进程内直驱 _relay_sse，返回 (filtered, truncated)。"""
+        mod = self.mod
+        orig = mod.STALL_THRESHOLD_S
+        try:
+            mod.STALL_THRESHOLD_S = 0.0
+            return mod.ProxyHandler._relay_sse(handler, resp, final=True,
+                                               model="claude-x")
+        finally:
+            mod.STALL_THRESHOLD_S = orig
+
+    def test_message_start_flushes_before_next_read(self) -> None:
+        """flush 实时性：第 4 次 readline 入口（首 record 三行已喂入、终结空行已
+        处理）采样 wfile——必已含 message_start 字节，证明未缓冲到 EOF。"""
+        mod = self.mod
+        probe = {"wfile": None}
+
+        class _ProbeResp(RelaySseV3Test._FakeSseResp):
+            def readline(self_inner):
+                if self_inner._i == 3 and probe["wfile"] is None:
+                    probe["wfile"] = handler.wfile.getvalue()
+                return RelaySseV3Test._FakeSseResp.readline(self_inner)
+
+        handler = RelaySseV3Test._StubHandler()
+        resp = _ProbeResp(self.ANTHROPIC_STREAM.splitlines(keepends=True))
+        filtered, truncated = self._drive(resp, handler)
+        self.assertIsNotNone(probe["wfile"], "探针必须已采样（流未提前耗尽）")
+        self.assertIn(b'"type":"message_start"', probe["wfile"],
+                      "下一 record 读取前 message_start 必须已 flush（未缓冲到 EOF），"
+                      "got %r" % probe["wfile"])
+        self.assertEqual((filtered, truncated), (0, False))
+
+    def test_anthropic_usage_merged_across_frames(self) -> None:
+        """message_start(input=10/output=1) + message_delta(output=7) → 按键合并
+        {prompt_tokens:10, completion_tokens:7}；五元组 (10,7,17,0,0)；
+        settle 表达式 tokens[2] == 17。"""
+        mod = self.mod
+        handler = RelaySseV3Test._StubHandler()
+        resp = RelaySseV3Test._FakeSseResp(
+            self.ANTHROPIC_STREAM.splitlines(keepends=True))
+        filtered, truncated = self._drive(resp, handler)
+        self.assertEqual((filtered, truncated), (0, False))
+        self.assertEqual(handler._tpm_usage,
+                         {"prompt_tokens": 10, "completion_tokens": 7})
+        self.assertEqual(handler._p3_usage_tokens, (10, 7, 17, 0, 0))
+        tokens = (mod.usage_dict_tokens(handler._tpm_usage)
+                  if handler._tpm_usage is not None else None)
+        self.assertIsNotNone(tokens)
+        self.assertEqual(tokens[2], 17)  # tpm_settle(tpm_key, tpm_est, tokens[2], model)
+
+    def test_integration_byte_identical_single_call(self) -> None:
+        """集成：Anthropic 流逐字节透传，calls == 1（message_stop→done 不触发
+        empty-retry）。fake upstream 正常路径恒回 text/event-stream，必走流式分支。"""
+        upstream_port, calls = make_scripted_upstream(
+            body_override=self.ANTHROPIC_STREAM)
+        self.addCleanup(stop_fake_upstreams)
+        proc = start_proxy(upstream_port, free_port())
+        self.addCleanup(stop_proxy, proc)
+        data = post_sse(proc.proxy_port,
+                        payload=b'{"model":"claude-x","stream":true,'
+                                b'"max_tokens":64,"messages":[]}')
+        self.assertEqual(data, self.ANTHROPIC_STREAM,
+                         "Anthropic 流必须逐字节透传，got %r" % data)
+        self.assertEqual(len(calls), 1,
+                         "message_stop→done 不得触发 empty-retry, calls=%d"
+                         % len(calls))
+
+    def test_integration_usage_daily_by_key(self) -> None:
+        """集成：带 x-api-key 的 Anthropic 流式请求 → /api/stats
+        daily_by_key[sha256("itest-key")[:12]] tokens_prompt=10 / completion=7。"""
+        upstream_port, calls = make_scripted_upstream(
+            body_override=self.ANTHROPIC_STREAM)
+        self.addCleanup(stop_fake_upstreams)
+        proc = start_proxy(upstream_port, free_port())
+        self.addCleanup(stop_proxy, proc)
+        conn = http.client.HTTPConnection("127.0.0.1", proc.proxy_port, timeout=30)
+        conn.request("POST", "/v1/chat/completions",
+                     body=b'{"model":"claude-x","stream":true,'
+                          b'"max_tokens":64,"messages":[]}',
+                     headers={"Content-Type": "application/json",
+                              "x-api-key": "itest-key"})
+        resp = conn.getresponse()
+        self.assertEqual(resp.status, 200)
+        data = resp.read()
+        conn.close()
+        self.assertEqual(data, self.ANTHROPIC_STREAM)
+        _, body, _ = admin_get(proc.admin_port, "/api/stats")
+        snap = json.loads(body.decode("utf-8"))
+        days = snap["daily_by_key"]
+        self.assertEqual(len(days), 1, "只有今天一个 day 桶，got %r" % days)
+        kid12 = hashlib.sha256(b"itest-key").hexdigest()[:12]
+        entry = next(iter(days.values())).get(kid12)
+        self.assertIsNotNone(entry, "x-api-key 派生 key_id12 必须入 daily 桶")
+        self.assertEqual(entry["tokens_prompt"], 10)
+        self.assertEqual(entry["tokens_completion"], 7)
+
+
 class SettlePersistV3Test(unittest.TestCase):
     """v3 tpm_settle 比率 + daily_by_key save/load roundtrip（决策 2/4）。"""
 
