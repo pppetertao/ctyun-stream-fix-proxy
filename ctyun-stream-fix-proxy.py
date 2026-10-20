@@ -255,6 +255,18 @@ def hist_percentile(buckets, edges, q):
 _SSE_NO_PARSED = object()  # sentinel：调用方未传预解析结果（与合法 None 值区分；
 # 定义须早于本模块所有 helper——默认参在 def 时求值
 
+# Anthropic Messages API 事件类型 → SSE 归类（spec 方案 A 边界归一化）：
+# message_start/content_block_start/content_block_delta → content（首帧即 priming flush）；
+# message_delta → finish（尾帧带 usage，走 finish_hold 缓冲判 usage——仅 priming 期生效）；
+# message_stop → done（saw_done 判定，避免空流重试）；error → content（body error 同语义）；
+# content_block_stop / ping → noise。
+_ANTHROPIC_EVENT_KIND = {
+    "message_start": "content", "content_block_start": "content",
+    "content_block_delta": "content", "content_block_stop": "noise",
+    "message_delta": "finish", "message_stop": "done",
+    "error": "content", "ping": "noise",
+}
+
 
 def sse_data_line_kind(line: bytes, parsed=_SSE_NO_PARSED) -> str:
     """SSE data 行归类："done" / "content" / "finish" / "noise"。判定序：
@@ -263,6 +275,9 @@ def sse_data_line_kind(line: bytes, parsed=_SSE_NO_PARSED) -> str:
     dict 且顶层 error 对象 → content（body error 帧视为 content，触发 priming flush 不重试）；
     dict + choices 非空 list 时：delta.content 非空 str / delta.tool_calls 真值 →
     content；choice.finish_reason 非 None（且无前两者）→ finish；
+    choices 缺失/为空且 type 命中 _ANTHROPIC_EVENT_KIND → 查表归类
+    （message_start/content_block_start/content_block_delta/error → content；
+    message_delta → finish；message_stop → done；content_block_stop/ping → noise）；
     其余（reasoning-only、空 delta、choices 为空的 usage 帧、data:null、非 dict JSON）→ noise。
     parsed 为 _SSE_NO_PARSED（默认）时保持原自行解析路径；显式传值（含 data:null 的 None）
     直接复用，不重复 json.loads。sentinel _SSE_PARSE_FAILED 等价解析失败 → content。"""
@@ -285,18 +300,21 @@ def sse_data_line_kind(line: bytes, parsed=_SSE_NO_PARSED) -> str:
     if body_has_error(data):
         return "content"
     choices = data.get("choices")
-    if not isinstance(choices, list) or not choices:
+    if isinstance(choices, list) and choices:
+        choice = choices[0] if isinstance(choices[0], dict) else {}
+        delta = choice.get("delta")
+        delta = delta if isinstance(delta, dict) else {}
+        content = delta.get("content")
+        if isinstance(content, str) and content:
+            return "content"
+        if delta.get("tool_calls"):
+            return "content"
+        if choice.get("finish_reason") is not None:
+            return "finish"
         return "noise"
-    choice = choices[0] if isinstance(choices[0], dict) else {}
-    delta = choice.get("delta")
-    delta = delta if isinstance(delta, dict) else {}
-    content = delta.get("content")
-    if isinstance(content, str) and content:
-        return "content"
-    if delta.get("tool_calls"):
-        return "content"
-    if choice.get("finish_reason") is not None:
-        return "finish"
+    etype = data.get("type")
+    if isinstance(etype, str) and etype in _ANTHROPIC_EVENT_KIND:
+        return _ANTHROPIC_EVENT_KIND[etype]
     return "noise"
 
 
@@ -314,9 +332,44 @@ def body_has_error(parsed) -> bool:
     return isinstance(error_val, dict)
 
 
+def anthropic_usage_dict(data):
+    """从 Anthropic Messages SSE 帧提取 usage 并归一为 OpenAI 键。
+
+    type == "message_start" → data["message"]["usage"]；type == "message_delta" →
+    data["usage"]；其余 type / 非 dict → None。usage 非空 dict 才继续。
+    归一映射：input_tokens → prompt_tokens；output_tokens → completion_tokens；
+    cache_read_input_tokens 原名保留（usage_dict_tokens 既有第二别名直认）。
+    值须 int ≥0 且非 bool 才收录；收录结果为空 → None。
+    零 IO 零 parse：入参须为 json.loads 已产出的 dict。
+    """
+    if not isinstance(data, dict):
+        return None
+    etype = data.get("type")
+    if etype == "message_start":
+        message = data.get("message")
+        usage = message.get("usage") if isinstance(message, dict) else None
+    elif etype == "message_delta":
+        usage = data.get("usage")
+    else:
+        return None
+    if not isinstance(usage, dict) or not usage:
+        return None
+    out = {}
+    for src, dst in (("input_tokens", "prompt_tokens"),
+                     ("output_tokens", "completion_tokens")):
+        value = usage.get(src)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            out[dst] = value
+    cache_read = usage.get("cache_read_input_tokens")
+    if isinstance(cache_read, int) and not isinstance(cache_read, bool) and cache_read >= 0:
+        out["cache_read_input_tokens"] = cache_read
+    return out or None
+
+
 def sse_line_has_usage(line: bytes, parsed=_SSE_NO_PARSED) -> bool:
     """判 SSE data 行是否携带非空 usage 帧（独立 usage 帧 choices=[] 与 ride-on finish
-    帧都覆盖）；DONE/非 JSON/非 data 行 → False。
+    帧都覆盖；Anthropic message_start/message_delta 帧经 anthropic_usage_dict 归一判定）；
+    DONE/非 JSON/非 data 行 → False。
     _SSE_NO_PARSED（默认）自行解析；显式传值（含 None）复用跳过 json.loads；
     sentinel/解析失败 → False。"""
     stripped = line.rstrip(b"\r\n")
@@ -333,6 +386,8 @@ def sse_line_has_usage(line: bytes, parsed=_SSE_NO_PARSED) -> bool:
         data = parsed
     if not isinstance(data, dict):
         return False
+    if anthropic_usage_dict(data) is not None:
+        return True
     usage = data.get("usage")
     return isinstance(usage, dict) and bool(usage)
 
@@ -341,7 +396,10 @@ def sse_line_usage(line: bytes, parsed=_SSE_NO_PARSED):
     """返回 SSE data 行中的 usage dict，无 usage 帧返回 None。
 
     解析逻辑与 sse_line_has_usage 同序：非 data: 前缀/[DONE]/非 JSON/非 dict →
-    None；usage 非空 dict → 返回该 dict；其余 → None。
+    None；Anthropic message_start/message_delta 帧先经 anthropic_usage_dict 归一
+    （须先于顶层 usage 分支，否则 Anthropic 原生键原样漏出）；其余顶层 usage
+    非空 dict → 返回该 dict（非流式 Anthropic body 的顶层 usage 由此分支兜底，
+    数值化靠 usage_dict_tokens 的 input/output 别名）；其余 → None。
     独立 usage 帧（choices=[]）与 ride-on finish 帧均覆盖。
     _SSE_NO_PARSED（默认）自行解析；显式传值（含 None）复用跳过 json.loads；
     sentinel → None（同解析失败）。
@@ -360,6 +418,9 @@ def sse_line_usage(line: bytes, parsed=_SSE_NO_PARSED):
         data = parsed
     if not isinstance(data, dict):
         return None
+    anth = anthropic_usage_dict(data)
+    if anth is not None:
+        return anth
     usage = data.get("usage")
     return usage if isinstance(usage, dict) and usage else None
 
@@ -376,6 +437,9 @@ def usage_dict_tokens(usage) -> tuple:
       → prompt_tokens_details.cached_tokens
     reasoning 两级：completion_tokens_details.reasoning_tokens → reasoning_tokens（顶层）。
     cache_write 本次不解析（Exclusions：待上游实证字段形态后另开 episode）。
+
+    Anthropic 别名：input_tokens/output_tokens 作 prompt/completion 的次级别名
+    （OpenAI 键优先）；total_tokens 缺失时兜底 prompt+completion（Anthropic 无 total）。
     """
     if not isinstance(usage, dict):
         return None
@@ -408,8 +472,23 @@ def usage_dict_tokens(usage) -> tuple:
     if reasoning == 0:
         reasoning = _int_field("reasoning_tokens")
 
-    return (_int_field("prompt_tokens"), _int_field("completion_tokens"),
-            _int_field("total_tokens"), cache_read, reasoning)
+    prompt = _int_field("prompt_tokens") or _int_field("input_tokens")
+    completion = _int_field("completion_tokens") or _int_field("output_tokens")
+    total = _int_field("total_tokens")
+    if total == 0 and (prompt or completion):
+        total = prompt + completion
+    return (prompt, completion, total, cache_read, reasoning)
+
+
+def usage_merge(acc, new):
+    """usage 按键合并：Anthropic 的 message_start 只带 input、message_delta 只带
+    output，分帧到达须合并累积；OpenAI 单 usage 帧 last-wins 语义等价（键冲突新值胜）。
+    new 非空 dict 才合并；acc 非 dict 视为空表；恒返回新 dict，不改入参。"""
+    if not isinstance(new, dict) or not new:
+        return acc
+    merged = dict(acc) if isinstance(acc, dict) else {}
+    merged.update(new)
+    return merged
 
 
 def sse_line_extract_usage(line: bytes):
@@ -3062,13 +3141,13 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                                                     if resp.status >= 400 else None),
                                    body=body, filtered=filtered,
                                    response=self._body_err_line if body_error else None)
-            # TPM settle：用上游实际 usage 校正窗口占用（无 usage 帧不校正）
+            # TPM settle：用归一五元组的 total（含 prompt+completion 兜底）校正
+            # 窗口占用；无 usage 帧（_tpm_usage None）不校正
             tpm_final_used = tpm_est if tpm_key is not None else None
-            if tpm_key is not None and self._tpm_usage is not None:
-                total = self._tpm_usage.get("total_tokens")
-                if isinstance(total, int) and total >= 0:
-                    tpm_settle(tpm_key, tpm_est, total, model)
-                    tpm_final_used = total
+            tokens = usage_dict_tokens(self._tpm_usage) if self._tpm_usage is not None else None
+            if tpm_key is not None and tokens is not None:
+                tpm_settle(tpm_key, tpm_est, tokens[2], model)
+                tpm_final_used = tokens[2]
             # 持久化 body-err 实证样本（同非流式分支；body_error 由 _body_err_line 判定）
             if body_error and model:
                 record_tpm_body_err_sample(model, tpm_final_used, time.time())
@@ -3121,8 +3200,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                         usage = parsed.get("usage")
                         if isinstance(usage, dict):
                             p3_buf_tokens = usage_dict_tokens(usage)
-                            if tpm_key is not None:
-                                total = usage.get("total_tokens")
+                            if tpm_key is not None and p3_buf_tokens is not None:
+                                total = p3_buf_tokens[2]
                                 if isinstance(total, int) and total >= 0:
                                     tpm_settle(tpm_key, tpm_est, total, model)
                                     tpm_final_used = total
@@ -3255,13 +3334,15 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     kinds = [sse_data_line_kind(buf_line, parsed=pre_parsed[i])
                              for i, buf_line in enumerate(pending)]
                     saw_done = saw_done or ("done" in kinds)
-                    # TPM usage 捕获：本 record 内所有行取最后非空 usage 帧；
-                    # 复用预解析 dict（D）——全程每 data 行恰 1 次 json.loads（R1）
+                    # TPM usage 捕获：按键合并累积（Anthropic message_start 带
+                    # input、message_delta 带 output，分帧合两为一）；OpenAI 单帧
+                    # last-wins 语义不变。复用预解析 dict（D）——全程每 data 行
+                    # 恰 1 次 json.loads（R1）
                     for i, buf_line in enumerate(pending):
                         usage_hit = sse_line_usage(buf_line, parsed=pre_parsed[i])
                         if usage_hit is not None:
-                            self._tpm_usage = usage_hit
-                            self._p3_usage_tokens = usage_dict_tokens(usage_hit)
+                            self._tpm_usage = usage_merge(self._tpm_usage, usage_hit)
+                            self._p3_usage_tokens = usage_dict_tokens(self._tpm_usage)
                     if self._body_err_line is None:
                         hit = next((l for i, l in enumerate(pending)
                                     if sse_line_body_error(l, parsed=pre_parsed[i])),

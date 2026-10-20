@@ -936,6 +936,31 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         self.assertEqual(
             f(b'data: {"error":{"message":"model x not found"}}\r\n'),
             "content")
+        # --- Anthropic Messages 事件类型表（8 type + event: 行 + 未知 type）---
+        self.assertEqual(
+            f(b'data: {"type":"message_start","message":{"usage":{}}}\n'), "content")
+        self.assertEqual(
+            f(b'data: {"type":"content_block_start","index":0}\n'), "content")
+        self.assertEqual(
+            f(b'data: {"type":"content_block_delta",'
+              b'"delta":{"type":"text_delta","text":"Hi"}}\n'), "content")
+        self.assertEqual(
+            f(b'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}\n'),
+            "finish")
+        self.assertEqual(f(b'data: {"type":"message_stop"}\n'), "done")
+        self.assertEqual(f(b'data: {"type":"content_block_stop","index":0}\n'), "noise")
+        self.assertEqual(f(b'data: {"type":"ping"}\n'), "noise")
+        # Anthropic error 帧（type=error 且 error 为 dict）→ body_has_error 最优先 → content
+        self.assertEqual(
+            f(b'data: {"type":"error","error":{"type":"overloaded_error",'
+              b'"message":"Overloaded"}}\n'), "content")
+        # event: 前缀行（Anthropic 流每 record 自带）→ 仍 noise
+        self.assertEqual(f(b"event: content_block_delta\n"), "noise")
+        # 未知 type 且无 choices → noise
+        self.assertEqual(f(b'data: {"type":"unknown_event"}\n'), "noise")
+        # choices 非空时 OpenAI 路径完全不变（type 键共存不抢判定）
+        self.assertEqual(
+            f(b'data: {"type":"x","choices":[{"delta":{"content":"A"}}]}\n'), "content")
 
     def test_sse_line_has_usage_matrix(self) -> None:
         f = self.mod.sse_line_has_usage
@@ -959,6 +984,14 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         self.assertFalse(f(b"data:\n"))
         # 假：usage 非 dict（如列表）
         self.assertFalse(f(b'data: {"usage":[1,2,3],"choices":[]}\n'))
+        # --- Anthropic 归一布尔判定 ---
+        self.assertTrue(f(b'data: {"type":"message_start","message":'
+                          b'{"usage":{"input_tokens":10}}}\n'))
+        self.assertTrue(f(b'data: {"type":"message_delta","usage":{"output_tokens":7}}\n'))
+        self.assertFalse(f(b'data: {"type":"message_start","message":{"usage":{}}}\n'))
+        self.assertFalse(f(b'data: {"type":"message_delta","usage":{}}\n'))
+        self.assertFalse(f(b'data: {"type":"ping"}\n'))
+        self.assertFalse(f(b'data: {"type":"message_stop"}\n'))
 
     def test_body_has_error_matrix(self) -> None:
         f = self.mod.body_has_error
@@ -1036,6 +1069,35 @@ class ProxyDashboardUnitTest(unittest.TestCase):
         self.assertIsNone(f(b'data: {"usage":[1,2,3],"choices":[]}\n'))
         # 普通 content 帧 → None
         self.assertIsNone(f(b'data: {"choices":[{"delta":{"content":"hi"}}]}\n'))
+        # --- Anthropic 归一：message_start（嵌套 message.usage）→ OpenAI 键 ---
+        result3 = f(b'data: {"type":"message_start","message":{'
+                    b'"id":"msg_1","usage":{"input_tokens":10,'
+                    b'"output_tokens":1}}}\n')
+        self.assertEqual(result3, {"prompt_tokens": 10, "completion_tokens": 1})
+        # message_delta（顶层 usage，Anthropic 原生键）→ 归一（不得原样漏出 output_tokens）
+        result4 = f(b'data: {"type":"message_delta",'
+                    b'"delta":{"stop_reason":"end_turn"},'
+                    b'"usage":{"output_tokens":7}}\n')
+        self.assertEqual(result4, {"completion_tokens": 7})
+        # cache_read_input_tokens 原名保留
+        result5 = f(b'data: {"type":"message_delta","usage":'
+                    b'{"output_tokens":7,"cache_read_input_tokens":40}}\n')
+        self.assertEqual(result5,
+                         {"completion_tokens": 7, "cache_read_input_tokens": 40})
+        # 空 usage → None（两帧型各一）
+        self.assertIsNone(
+            f(b'data: {"type":"message_start","message":{"usage":{}}}\n'))
+        self.assertIsNone(f(b'data: {"type":"message_delta","usage":{}}\n'))
+        # message 非 dict → None
+        self.assertIsNone(f(b'data: {"type":"message_start","message":"oops"}\n'))
+        # 非用法事件 type 带顶层 usage → 走既有顶层分支原样返回（语义不变）
+        self.assertEqual(
+            f(b'data: {"type":"content_block_delta","usage":{"input_tokens":3}}\n'),
+            {"input_tokens": 3})
+        # OpenAI 帧（choices + 顶层 usage）语义不变
+        self.assertEqual(
+            f(b'data: {"choices":[],"usage":{"prompt_tokens":1}}\n'),
+            {"prompt_tokens": 1})
 
     def test_tpm_constants_load(self) -> None:
         """TPM 常量通过 load_proxy_module 可见且取值正确。"""
@@ -5730,6 +5792,41 @@ class UsageExtractTest(unittest.TestCase):
         line = (b'data: {"usage":{"prompt_tokens":1,"completion_tokens":2,'
                 b'"total_tokens":3,"prompt_tokens_details":"oops"}}\n\n')
         self.assertEqual(self.extract(line), (1, 2, 3, 0, 0))
+
+    # ---- Anthropic 别名：input_tokens/output_tokens + total 兜底 ----
+
+    def test_anthropic_input_output_tokens_alias(self) -> None:
+        line = b'data: {"usage":{"input_tokens":10,"output_tokens":7}}\n\n'
+        self.assertEqual(self.extract(line), (10, 7, 17, 0, 0))
+
+    def test_anthropic_alias_with_cache_read(self) -> None:
+        line = (b'data: {"usage":{"input_tokens":10,"output_tokens":7,'
+                b'"cache_read_input_tokens":40}}\n\n')
+        self.assertEqual(self.extract(line), (10, 7, 17, 40, 0))
+
+    def test_explicit_total_wins_over_fallback(self) -> None:
+        line = (b'data: {"usage":{"input_tokens":10,"output_tokens":7,'
+                b'"total_tokens":99}}\n\n')
+        self.assertEqual(self.extract(line), (10, 7, 99, 0, 0))
+
+    def test_openai_keys_win_over_anthropic_alias(self) -> None:
+        line = (b'data: {"usage":{"prompt_tokens":3,"input_tokens":10,'
+                b'"completion_tokens":2,"output_tokens":7}}\n\n')
+        self.assertEqual(self.extract(line), (3, 2, 5, 0, 0))
+
+    def test_total_fallback_only_when_tokens_present(self) -> None:
+        # 无任何 token 计数 → total 保持 0（不产出假总数）
+        line = b'data: {"usage":{"reasoning_tokens":5}}\n\n'
+        self.assertEqual(self.extract(line), (0, 0, 0, 0, 5))
+
+    def test_anthropic_message_start_end_to_end(self) -> None:
+        """端到端：Anthropic SSE 帧经 sse_line_usage 归一 + usage_dict_tokens 数值化。"""
+        mod = load_proxy_module()
+        line = (b'data: {"type":"message_start","message":'
+                b'{"usage":{"input_tokens":10,"output_tokens":1}}}\n\n')
+        usage = mod.sse_line_usage(line)
+        self.assertEqual(usage, {"prompt_tokens": 10, "completion_tokens": 1})
+        self.assertEqual(mod.usage_dict_tokens(usage), (10, 1, 11, 0, 0))
 
 
 class TokenRelayTest(unittest.TestCase):
