@@ -57,6 +57,7 @@ class FakeUpstreamHandler(BaseHTTPRequestHandler):
     big = False     # True → 1.2MB 大 SSE 流，供 client-abort 测试把代理写缓冲打穿
     fail_500 = False  # True → do_POST 回 500 JSON（上游 5xx 透传计数测试用）
     fail_200_error = False  # True -> do_POST 回 200 + JSON error body（非流式 body error 测试用）
+    json_override = None  # 非 None → do_POST 回 200 + application/json + 该 body（非流式透传/settle 测试用）
     empty_stream = False  # True → 每次 POST 回空流（reasoning 后 EOF，无 [DONE]）
     empty_stream_calls = ()  # 1-based 呼叫序号元组：命中则回空流（同 empty_stream 形态）
     blank_stream = False  # True → 空流形态为零字节 body（200 + SSE 头 + 立即 EOF）
@@ -122,6 +123,16 @@ class FakeUpstreamHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+            self.close_connection = True
+            return
+        if self.json_override is not None:
+            # 非流式 JSON 响应（fail_200_error 同款响应形态、body 可指定）：
+            # 先于空流/ fault 分支短路——JSON 上游是确定的非 SSE 响应者
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(self.json_override)))
+            self.end_headers()
+            self.wfile.write(self.json_override)
             self.close_connection = True
             return
         if self.fail_500:
@@ -288,6 +299,7 @@ def make_fake_upstream(poison: bool, tag: str = "/plain", big: bool = False,
                        sleep_stall_seconds: float = 3.0,
                        rst_all: bool = False, rst_calls: tuple = (),
                        fail_200_error: bool = False,
+                       json_override=None,
                        latency_s: float = 0.0,
                        stall_mid_stream_s: float = 0.0,
                        tail_delay_after_done_s: float = 0.0,
@@ -298,6 +310,7 @@ def make_fake_upstream(poison: bool, tag: str = "/plain", big: bool = False,
              "body_override": body_override,
              "fault_finish_first": fault_finish_first,
              "fault_finish_stream": fault_finish_stream,
+             "json_override": json_override,
              "stall_all": stall_all,
              "stall_calls": stall_calls,
              "sleep_stall_all": sleep_stall_all,
@@ -335,7 +348,7 @@ def make_fake_upstream(poison: bool, tag: str = "/plain", big: bool = False,
 
 def make_scripted_upstream(**kwargs) -> tuple:
     """带调用计数的假上游：返回 (port, calls)；calls 按上游被请求次数 append。
-    kwargs 透传 empty_stream / blank_stream / body_override /
+    kwargs 透传 empty_stream / blank_stream / body_override / json_override /
     fault_finish_first / fault_finish_stream（勿传 scripted/poison）。"""
     port = make_fake_upstream(False, scripted=True, **kwargs)
     return port, FAKE_SERVERS[-1].RequestHandlerClass.calls
@@ -6766,6 +6779,94 @@ class AnthropicSseTest(unittest.TestCase):
         self.assertIsNotNone(entry, "x-api-key 派生 key_id12 必须入 daily 桶")
         self.assertEqual(entry["tokens_prompt"], 10)
         self.assertEqual(entry["tokens_completion"], 7)
+
+    ANTHROPIC_NONSTREAM_BODY = (
+        b'{"id":"msg_1","type":"message","role":"assistant","model":"claude-x",'
+        b'"content":[{"type":"text","text":"Hi"}],'
+        b'"usage":{"input_tokens":10,"output_tokens":7}}')
+
+    def test_integration_nonstream_json_usage_stats(self) -> None:
+        """集成（reviewer 覆盖缺口 ①）：非流式 Anthropic 路径——上游回
+        application/json（非 SSE）且 body 带顶层 usage → 走 _relay_buffered +
+        p3_buf_tokens settle 分支。断言 ①响应字节与 Content-Length 与上游完全
+        一致（Content-Type application/json 透传）；② /api/stats 的 daily 与
+        daily_by_model 中 tokens_prompt=10 / tokens_completion=7 入桶
+        （usage_dict_tokens 别名归一：input/output_tokens → 五元组 total=17）。"""
+        upstream_port, calls = make_scripted_upstream(
+            json_override=self.ANTHROPIC_NONSTREAM_BODY)
+        self.addCleanup(stop_fake_upstreams)
+        proc = start_proxy(upstream_port, free_port())
+        self.addCleanup(stop_proxy, proc)
+        conn = http.client.HTTPConnection("127.0.0.1", proc.proxy_port, timeout=30)
+        conn.request("POST", "/v1/chat/completions",
+                     body=b'{"model":"claude-x","max_tokens":64,"messages":[]}',
+                     headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(resp.getheader("Content-Type"), "application/json",
+                         "非流式分支必须透传上游 Content-Type")
+        self.assertEqual(resp.getheader("Content-Length"),
+                         str(len(self.ANTHROPIC_NONSTREAM_BODY)),
+                         "Content-Length 必须与上游 body 字节数一致")
+        data = resp.read()
+        conn.close()
+        self.assertEqual(data, self.ANTHROPIC_NONSTREAM_BODY,
+                         "非流式 body 必须逐字节透传，got %r" % data)
+        self.assertEqual(len(calls), 1, "非流式响应不得触发重试, calls=%d"
+                         % len(calls))
+        _, body, _ = admin_get(proc.admin_port, "/api/stats")
+        snap = json.loads(body.decode("utf-8"))
+        self.assertEqual(len(snap["daily"]), 1, "只有今天一个 day 桶，got %r"
+                         % snap["daily"])
+        day_entry = next(iter(snap["daily"].values()))
+        self.assertEqual(day_entry["requests"], 1)
+        self.assertEqual(day_entry["tokens_prompt"], 10)
+        self.assertEqual(day_entry["tokens_completion"], 7)
+        models = snap["daily_by_model"]
+        self.assertEqual(len(models), 1, "只有今天一个 day 桶，got %r" % models)
+        model_entry = next(iter(models.values())).get("claude-x")
+        self.assertIsNotNone(model_entry, "claude-x 必须入 daily_by_model 桶")
+        self.assertEqual(model_entry["tokens_prompt"], 10)
+        self.assertEqual(model_entry["tokens_completion"], 7)
+
+    def test_integration_tpm_settle_receives_merged_total(self) -> None:
+        """集成（reviewer 覆盖缺口 ②）：tpm_settle 实收分帧合并后的 total=17——
+        非表达式重算，走真代理进程全链路。启用 claude-x 预算（seed persist）后
+        发流式请求（message_start 10/1 + message_delta 7），断言：
+        ① stderr REQ 行 tpm=17（settle 与 _log 共用 tpm_final_used=tokens[2]）；
+        ② /api/tpm_stats 桶 used==17（admit 计 est、settle 以 actual=17 校正，
+        桶态是 tpm_settle 实收值的存储级证据）。"""
+        upstream_port, calls = make_scripted_upstream(
+            body_override=self.ANTHROPIC_STREAM)
+        self.addCleanup(stop_fake_upstreams)
+        proc = start_proxy(upstream_port, free_port(),
+                           seed_persist={"tpm_model_budgets": {"claude-x": 100000}})
+        self.addCleanup(stop_proxy, proc)
+        conn = http.client.HTTPConnection("127.0.0.1", proc.proxy_port, timeout=30)
+        conn.request("POST", "/v1/chat/completions",
+                     body=b'{"model":"claude-x","stream":true,'
+                          b'"max_tokens":64,"messages":[]}',
+                     headers={"Content-Type": "application/json",
+                              "x-api-key": "settle-key"})
+        resp = conn.getresponse()
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(resp.read(), self.ANTHROPIC_STREAM)
+        conn.close()
+        self.assertEqual(len(calls), 1)
+        stderr = stderr_text(proc)
+        req_line = next((l for l in stderr.splitlines()
+                         if l.startswith("REQ POST") and "stream=1" in l), None)
+        self.assertIsNotNone(req_line, "必须落一条流式 REQ 行，stderr:\n" + stderr)
+        self.assertRegex(req_line, r"\btpm=17\b",
+                         "REQ 行 tpm= 必须是分帧合并后的 total=17，line: " + req_line)
+        _, body, _ = admin_get(proc.admin_port, "/api/tpm_stats")
+        snap = json.loads(body.decode("utf-8"))
+        bucket = next((b for b in snap["buckets"]
+                       if b["model"] == "claude-x"), None)
+        self.assertIsNotNone(bucket, "claude-x 桶必须存在，snap:\n%r" % snap)
+        self.assertEqual(bucket["used"], 17,
+                         "admit 计 est 后 settle 必须校正为实收 total=17，"
+                         "bucket:\n%r" % bucket)
 
 
 class SettlePersistV3Test(unittest.TestCase):
